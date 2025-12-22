@@ -1,0 +1,4 @@
+// crystal
+
+> cd source-code
+> crystal build src/main.cr --release
