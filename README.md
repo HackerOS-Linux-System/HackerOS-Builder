@@ -30,18 +30,17 @@ Wybierz preferowaną metodę instalacji:
 Jeśli chcesz mieć najnowszą wersję bezpośrednio z kodu:
 
 ```bash
-# Sklonuj repozytorium
-git clone [https://github.com/twoje-repo/HackerOS-Builder.git](https://github.com/twoje-repo/HackerOS-Builder.git)
+git clone https://github.com/HackerOS-Linux-System/HackerOS-Builder.git
 cd HackerOS-Builder
-```
 
-# Uruchom proces budowania
 hl run build.hacker
 
-# Zainstaluj binarkę w systemie
 cd source-code
+
 sudo mv main HackerOS-Builder
 sudo mv HackerOS-Builder /usr/bin/
+```
+
 
 ### 2. Szybka instalacja (Menedżer Hacker)
 Najprostszy sposób dla użytkowników środowiska Hacker:
