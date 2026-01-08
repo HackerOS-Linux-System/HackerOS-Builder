@@ -22,7 +22,7 @@ Podczas używania komendy `build`, możesz skorzystać z następujących flag:
 
 ---
 
-## 📦 Instalacja
+## Instalacja
 
 Wybierz preferowaną metodę instalacji:
 
@@ -33,6 +33,7 @@ Jeśli chcesz mieć najnowszą wersję bezpośrednio z kodu:
 # Sklonuj repozytorium
 git clone [https://github.com/twoje-repo/HackerOS-Builder.git](https://github.com/twoje-repo/HackerOS-Builder.git)
 cd HackerOS-Builder
+```
 
 # Uruchom proces budowania
 hl run build.hacker
@@ -42,7 +43,7 @@ cd source-code
 sudo mv main HackerOS-Builder
 sudo mv HackerOS-Builder /usr/bin/
 
-2. Szybka instalacja (Menedżer Hacker)
+### 2. Szybka instalacja (Menedżer Hacker)
 Najprostszy sposób dla użytkowników środowiska Hacker:
  * Instalacja:
    hacker unpack hackeros-builder
