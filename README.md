@@ -46,7 +46,11 @@ sudo mv HackerOS-Builder /usr/bin/
 ### 2. Szybka instalacja (Menedżer Hacker)
 Najprostszy sposób dla użytkowników środowiska Hacker:
  * Instalacja:
-   hacker unpack hackeros-builder
+```bash
+hacker unpack hackeros-builder
+```
 
  * Usuwanie (opcjonalne):
-   hacker pack hackeros-builder
+```bash
+hacker pack hackeros-builder
+```
