@@ -1,73 +1,173 @@
-import std/[os, json, strutils, terminal, osproc]
+import os
+import osproc
+import strutils
+import sequtils
+import parsecfg  # For parsing config files like /etc/xdg/kcm-about-distrorc and .hacker files
+import terminal  # For styled output
 
-proc determineDistribution(version: string): string =
-  let v = version.toLowerAscii()
-  case v
-  of "lts":
-    result = "trixie"
-  of "normal":
-    result = "forky"
+# Function to check if the system is Debian Forky or compatible HackerOS
+proc checkForkyCompatibility(): bool =
+  if fileExists("/etc/os-release"):
+    let content = readFile("/etc/os-release")
+    if content.contains("PRETTY_NAME=\"Debian GNU/Linux forky\"") or content.contains("VERSION_CODENAME=forky"):
+      return true
+  if fileExists("/etc/xdg/kcm-about-distrorc"):
+    let config = loadConfig("/etc/xdg/kcm-about-distrorc")
+    let variant = config.getSectionValue("", "Variant")
+    let allowedVariants = ["Official Edition", "Hydra Edition", "Gnome Edition", "Xfce Edition", "Gaming Edition"]
+    if variant in allowedVariants:
+      return true
+  return false
+
+# Function to check if the system is Debian Trixie or compatible HackerOS
+proc checkTrixieCompatibility(): bool =
+  if fileExists("/etc/os-release"):
+    let content = readFile("/etc/os-release")
+    if content.contains("PRETTY_NAME=\"Debian GNU/Linux trixie\"") or content.contains("VERSION_CODENAME=trixie"):
+      return true
+  if fileExists("/etc/xdg/kcm-about-distrorc"):
+    let config = loadConfig("/etc/xdg/kcm-about-distrorc")
+    let variant = config.getSectionValue("", "Variant")
+    let allowedVariants = ["LTS Edition", "Cybersecurity Edition"]
+    if variant in allowedVariants:
+      return true
+  return false
+
+# Function to execute a command and print output
+proc execCmd(cmd: string) =
+  styledEcho fgGreen, "Executing: ", fgWhite, cmd
+  let result = execCmdEx(cmd)
+  if result.exitCode != 0:
+    styledEcho fgRed, "Error: ", result.output
+    quit(1)
   else:
-    raise newException(ValueError, "Nieznana wersja: " & version & ". Obsługiwane: 'lts' lub 'normal'.")
+    styledEcho fgCyan, result.output
 
-proc main() =
-  styledEcho(styleBright, fgBlue, "Inicjowanie budowania HackerOS...")
+# Function to process .hacker profile files
+proc processHackerProfiles(buildDir: string) =
+  styledEcho fgYellow, "Processing .hacker profile files..."
+  for file in walkFiles(buildDir / "*.hacker"):
+    styledEcho fgCyan, "Found profile file: ", file
+    let config = loadConfig(file)
+    # Assuming .hacker files have sections like [packages], [hooks], etc.
+    # For each section, create corresponding live-build config files
+    
+    # Example: [packages] -> config/package-lists/<filename>.list.chroot
+    let profileName = file.extractFilename().changeFileExt("")
+    let packageListDir = buildDir / "config" / "package-lists"
+    createDir(packageListDir)
+    let packageFile = packageListDir / (profileName & ".list.chroot")
+    var packages: seq[string]
+    for key, value in config["packages"]:
+      if value.len > 0:
+        packages.add(value)
+    if packages.len > 0:
+      writeFile(packageFile, packages.join("\n"))
+      styledEcho fgGreen, "Created package list: ", packageFile
+    
+    # Example: [bootappend] -> add to lb config options
+    let bootappend = config.getSectionValue("bootappend", "parameters")
+    if bootappend.len > 0:
+      styledEcho fgYellow, "Found bootappend parameters: ", bootappend
+      # We can collect additional options here, but for now, note it (integrate later if needed)
+    
+    # Add more sections as needed, e.g., [includes], [hooks], etc.
+    # For [includes.chroot]: create config/includes.chroot/ and copy files
+    # But since not specified, keeping it basic for packages and example
 
-  let configFile = "config-hackeros.hacker"
-  let configDir = "config"
+    # Validate format: sections start with [ and end with ]
+    # parsecfg already handles ini format with [sections]
 
-  if not fileExists(configFile):
-    styledEcho(styleBright, fgRed, "Błąd: Plik konfiguracyjny '" & configFile & "' nie istnieje w bieżącym katalogu.")
+# Function to build in a specified directory
+proc buildInDir(buildDir: string, isStable: bool = false, isProfile: bool = false) =
+  let originalDir = getCurrentDir()
+  setCurrentDir(buildDir)
+  defer: setCurrentDir(originalDir)
+
+  # Clear screen
+  execCmd("clear")
+
+  # Clean previous builds
+  execCmd("sudo lb clean --purge")
+
+  if isProfile:
+    processHackerProfiles(buildDir)
+
+  # Config command
+  var configCmd = "lb config --architectures amd64 --apt-options \"--allow-unauthenticated --yes\" --firmware-chroot true"
+  if isStable:
+    configCmd = "lb config --distribution trixie " & configCmd
+  else:
+    configCmd = "lb config --distribution forky " & configCmd
+
+  # If additional options from profiles, append here
+  # For example, if bootappend collected, add "--bootappend-live \"" & bootappend & "\""
+
+  execCmd(configCmd)
+
+  # Build image
+  execCmd("sudo lb build")
+
+  # Ask for ISO move and rename
+  let isoFile = "live-image-amd64.hybrid.iso"  # Default name from lb build
+  if fileExists(isoFile):
+    styledEcho fgYellow, "Build complete. ISO file: ", isoFile
+    stdout.write "Enter new name for ISO (or press Enter to keep): "
+    let newName = readLine(stdin).strip()
+    var finalIso = isoFile
+    if newName != "":
+      finalIso = newName & ".iso"
+      moveFile(isoFile, finalIso)
+    
+    stdout.write "Enter directory to move ISO to (or press Enter to keep here): "
+    let moveDir = readLine(stdin).strip()
+    if moveDir != "":
+      let destPath = moveDir / finalIso.extractFilename()
+      moveFile(finalIso, destPath)
+      styledEcho fgGreen, "Moved to: ", destPath
+  else:
+    styledEcho fgRed, "ISO file not found after build!"
+
+  # Clean after build
+  execCmd("sudo lb clean --purge")
+
+# Main CLI commands
+proc build(here: bool = false, stable: bool = false) =
+  if stable:
+    if not checkTrixieCompatibility():
+      styledEcho fgRed, "Error: Must be on Debian Trixie or compatible HackerOS edition."
+      quit(1)
+  else:
+    if not checkForkyCompatibility():
+      styledEcho fgRed, "Error: Must be on Debian Forky or compatible HackerOS edition."
+      quit(1)
+
+  var buildDir = getCurrentDir()
+  if not here:
+    stdout.write "Enter directory to build in: "
+    buildDir = readLine(stdin).strip()
+    if not dirExists(buildDir):
+      styledEcho fgRed, "Error: Directory does not exist."
+      quit(1)
+
+  buildInDir(buildDir, stable)
+
+proc profile() =
+  if not checkForkyCompatibility():
+    styledEcho fgRed, "Error: Must be on Debian Forky or compatible HackerOS edition."
     quit(1)
 
-  if not dirExists(configDir):
-    styledEcho(styleBright, fgRed, "Błąd: Folder konfiguracyjny '" & configDir & "' nie istnieje w bieżącym katalogu.")
+  stdout.write "Enter directory to build profile in: "
+  let buildDir = readLine(stdin).strip()
+  if not dirExists(buildDir):
+    styledEcho fgRed, "Error: Directory does not exist."
     quit(1)
 
-  let content = readFile(configFile).strip()
-
-  var configJson: JsonNode
-  try:
-    configJson = parseJson(content)
-  except JsonParsingError as e:
-    styledEcho(styleBright, fgRed, "Błąd parsowania pliku konfiguracyjnego: " & e.msg)
-    quit(1)
-
-  if configJson.kind != JArray or configJson.len < 1 or configJson[0].kind != JString:
-    styledEcho(styleBright, fgRed, "Nieprawidłowy format pliku konfiguracyjnego. Oczekiwano tablicy z co najmniej jednym ciągiem znaków, np. [\"lts\"].")
-    quit(1)
-
-  let version = configJson[0].getStr()
-
-  var dist: string
-  try:
-    dist = determineDistribution(version)
-  except ValueError as e:
-    styledEcho(styleBright, fgRed, "Błąd: " & e.msg)
-    quit(1)
-
-  styledEcho(styleBright, fgGreen, "Budowanie HackerOS na bazie Debiana (dystrybucja: " & dist & ")...")
-
-  styledEcho(styleDim, fgYellow, "Czyszczenie poprzednich buildów (lb clean)...")
-  let cleanResult = execCmdEx("lb clean")
-  if cleanResult.exitCode != 0:
-    styledEcho(styleBright, fgRed, "Błąd podczas czyszczenia: " & cleanResult.output)
-    quit(1)
-
-  styledEcho(styleDim, fgYellow, "Konfiguracja live-build (lb config --distribution " & dist & ")...")
-  let configCmd = "lb config --distribution " & dist
-  let configResult = execCmdEx(configCmd)
-  if configResult.exitCode != 0:
-    styledEcho(styleBright, fgRed, "Błąd podczas konfiguracji live-build: " & configResult.output)
-    quit(1)
-
-  styledEcho(styleDim, fgYellow, "Budowanie obrazu (lb build)...")
-  let buildResult = execCmdEx("lb build")
-  if buildResult.exitCode != 0:
-    styledEcho(styleBright, fgRed, "Błąd podczas budowania obrazu: " & buildResult.output)
-    quit(1)
-
-  styledEcho(styleBright, fgGreen, "Budowanie zakończone sukcesem. Obraz HackerOS powinien być dostępny w bieżącym katalogu.")
+  buildInDir(buildDir, isProfile = true)
 
 when isMainModule:
-  main()
+  import cligen
+  dispatchMulti(
+    [build, help = {"here": "Build in current directory", "stable": "Build stable version (Trixie)"}],
+    [profile]
+  )
