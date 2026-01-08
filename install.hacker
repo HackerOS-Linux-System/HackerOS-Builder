@@ -1,3 +1,4 @@
 // curl
 
->
+> sudo curl -L "https://github.com/HackerOS-Linux-System/HackerOS-Builder/releases/download/v0.2/HackerOS-Builder" -o /tmp/HackerOS-Builder
+> sudo mv /tmp/HackerOS-Builder /usr/bin/HackerOS-Builder && sudo chmod a+x /usr/bin/HackerOS-Builder
