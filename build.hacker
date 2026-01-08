@@ -1,9 +1,4 @@
-// crystal
-// cargo
+// nim
 
 > cd source-code
-> crystal build src/main.cr --release
-> cd ..
-
-> cd Installer
-> cargo build --release
+> nim compile main.nim
