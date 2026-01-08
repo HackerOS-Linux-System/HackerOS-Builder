@@ -2,8 +2,9 @@ import os
 import osproc
 import strutils
 import sequtils
-import parsecfg  # For parsing config files like /etc/xdg/kcm-about-distrorc and .hacker files
-import terminal  # For styled output
+import parsecfg # For parsing config files like /etc/xdg/kcm-about-distrorc and .hacker files
+import terminal # For styled output
+import tables
 
 # Function to check if the system is Debian Forky or compatible HackerOS
 proc checkForkyCompatibility(): bool =
@@ -51,30 +52,30 @@ proc processHackerProfiles(buildDir: string) =
     let config = loadConfig(file)
     # Assuming .hacker files have sections like [packages], [hooks], etc.
     # For each section, create corresponding live-build config files
-    
+   
     # Example: [packages] -> config/package-lists/<filename>.list.chroot
     let profileName = file.extractFilename().changeFileExt("")
     let packageListDir = buildDir / "config" / "package-lists"
     createDir(packageListDir)
     let packageFile = packageListDir / (profileName & ".list.chroot")
     var packages: seq[string]
-    for key, value in config["packages"]:
+    let packagesSection = config.getOrDefault("packages", newOrderedTable[string, string]())
+    for key, value in packagesSection.pairs:
       if value.len > 0:
         packages.add(value)
     if packages.len > 0:
       writeFile(packageFile, packages.join("\n"))
       styledEcho fgGreen, "Created package list: ", packageFile
-    
+   
     # Example: [bootappend] -> add to lb config options
     let bootappend = config.getSectionValue("bootappend", "parameters")
     if bootappend.len > 0:
       styledEcho fgYellow, "Found bootappend parameters: ", bootappend
       # We can collect additional options here, but for now, note it (integrate later if needed)
-    
+   
     # Add more sections as needed, e.g., [includes], [hooks], etc.
     # For [includes.chroot]: create config/includes.chroot/ and copy files
     # But since not specified, keeping it basic for packages and example
-
     # Validate format: sections start with [ and end with ]
     # parsecfg already handles ini format with [sections]
 
@@ -83,33 +84,25 @@ proc buildInDir(buildDir: string, isStable: bool = false, isProfile: bool = fals
   let originalDir = getCurrentDir()
   setCurrentDir(buildDir)
   defer: setCurrentDir(originalDir)
-
   # Clear screen
   execCmd("clear")
-
   # Clean previous builds
   execCmd("sudo lb clean --purge")
-
   if isProfile:
     processHackerProfiles(buildDir)
-
   # Config command
   var configCmd = "lb config --architectures amd64 --apt-options \"--allow-unauthenticated --yes\" --firmware-chroot true"
   if isStable:
     configCmd = "lb config --distribution trixie " & configCmd
   else:
     configCmd = "lb config --distribution forky " & configCmd
-
   # If additional options from profiles, append here
   # For example, if bootappend collected, add "--bootappend-live \"" & bootappend & "\""
-
   execCmd(configCmd)
-
   # Build image
   execCmd("sudo lb build")
-
   # Ask for ISO move and rename
-  let isoFile = "live-image-amd64.hybrid.iso"  # Default name from lb build
+  let isoFile = "live-image-amd64.hybrid.iso" # Default name from lb build
   if fileExists(isoFile):
     styledEcho fgYellow, "Build complete. ISO file: ", isoFile
     stdout.write "Enter new name for ISO (or press Enter to keep): "
@@ -118,7 +111,7 @@ proc buildInDir(buildDir: string, isStable: bool = false, isProfile: bool = fals
     if newName != "":
       finalIso = newName & ".iso"
       moveFile(isoFile, finalIso)
-    
+   
     stdout.write "Enter directory to move ISO to (or press Enter to keep here): "
     let moveDir = readLine(stdin).strip()
     if moveDir != "":
@@ -127,7 +120,6 @@ proc buildInDir(buildDir: string, isStable: bool = false, isProfile: bool = fals
       styledEcho fgGreen, "Moved to: ", destPath
   else:
     styledEcho fgRed, "ISO file not found after build!"
-
   # Clean after build
   execCmd("sudo lb clean --purge")
 
@@ -141,7 +133,6 @@ proc build(here: bool = false, stable: bool = false) =
     if not checkForkyCompatibility():
       styledEcho fgRed, "Error: Must be on Debian Forky or compatible HackerOS edition."
       quit(1)
-
   var buildDir = getCurrentDir()
   if not here:
     stdout.write "Enter directory to build in: "
@@ -149,20 +140,17 @@ proc build(here: bool = false, stable: bool = false) =
     if not dirExists(buildDir):
       styledEcho fgRed, "Error: Directory does not exist."
       quit(1)
-
   buildInDir(buildDir, stable)
 
 proc profile() =
   if not checkForkyCompatibility():
     styledEcho fgRed, "Error: Must be on Debian Forky or compatible HackerOS edition."
     quit(1)
-
   stdout.write "Enter directory to build profile in: "
   let buildDir = readLine(stdin).strip()
   if not dirExists(buildDir):
     styledEcho fgRed, "Error: Directory does not exist."
     quit(1)
-
   buildInDir(buildDir, isProfile = true)
 
 when isMainModule:
