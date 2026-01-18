@@ -1,1 +1,17 @@
-
+!/bin/hl
+> clear
+> cd /home/michal/Pobrane/hackeros-official/
+! Czyścimy poprzednie buildy
+> sudo lb clean --purge
+! Konfiguracja live-build z firmware i repo non-free-firmware
+> lb config \
+  --distribution forky \
+  --architectures amd64 \
+  --apt-options "--allow-unauthenticated --yes" \
+  --firmware-chroot true
+! Budowa obrazu
+> sudo lb build
+! Przenosimy gotowe ISO
+> sudo mv /home/michal/Pobrane/hackeros-official/live-image-amd64.hybrid.iso /home/michal/Pobrane/
+! Czyszczenie po buildzie
+> sudo lb clean --purge
