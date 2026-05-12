@@ -1,55 +1,71 @@
 # HackerOS Builder
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Przyjazne narzędzie CLI do budowania obrazów ISO HackerOS.  
+Działa jako nakładka na `live-build` lub całkowicie niezależnie (tryb standalone).
 
-**HackerOS Builder** to potężne i szybkie narzędzie CLI (Command Line Interface) zaprojektowane do automatyzacji procesu budowania obrazów typu **Live Build**. Pozwala na błyskawiczne generowanie systemów operacyjnych dostosowanych do Twoich potrzeb.
+## Kompilacja
 
----
-
-## Komendy
-
-Narzędzie jest proste w obsłudze dzięki intuicyjnym poleceniom:
-
-| Komenda | Opis |
-| :--- | :--- |
-| `HackerOS-Builder build` | Rozpoczyna proces budowania obrazu. |
-| `HackerOS-Builder profile` | Zarządza profilami konfiguracji obrazu. |
-
-### Flagi budowania
-Podczas używania komendy `build`, możesz skorzystać z następujących flag:
-* `-stable` – Buduje obraz w oparciu o stabilne pakiety.
-* `-here` – Wykonuje proces budowania w bieżącym katalogu roboczym.
-
----
+```bash
+make build
+# lub
+go build -o hackeros-builder ./cmd/hackeros-builder
+```
 
 ## Instalacja
 
-Wybierz preferowaną metodę instalacji:
-
-### 1. Budowanie ze źródeł (Manualnie)
-Jeśli chcesz mieć najnowszą wersję bezpośrednio z kodu:
-
 ```bash
-git clone https://github.com/HackerOS-Linux-System/HackerOS-Builder.git
-cd HackerOS-Builder
-
-hl run build.hacker
-
-cd source-code
-
-sudo mv main HackerOS-Builder
-sudo mv HackerOS-Builder /usr/bin/
+sudo make install
 ```
 
+## Szybki start
 
-### 2. Szybka instalacja (Menedżer Hacker)
-Najprostszy sposób dla użytkowników środowiska Hacker:
- * Instalacja:
 ```bash
-hacker unpack hackeros-builder
+# Nowy projekt
+hackeros-builder init moj-projekt
+cd moj-projekt
+
+# Edytuj konfigurację
+nano config/config.hk
+
+# Zainstaluj zależności (raz)
+sudo hackeros-builder setup
+
+# Zbuduj ISO
+hackeros-builder build
 ```
 
- * Usuwanie (opcjonalne):
-```bash
-hacker pack hackeros-builder
+## Komendy
+
+| Komenda | Opis |
+|---------|------|
+| `init [katalog]` | Nowy projekt |
+| `build [--release] [--standalone]` | Zbuduj ISO |
+| `clean [--purge] [--standalone]` | Wyczyść |
+| `setup [--release]` | Zainstaluj zależności |
+| `migration` | Migruj z live-build |
+| `info` | Informacje o projekcie |
+| `lb <args>` | Przekaż do live-build |
+
+## Tryby budowania
+
+W `config/config.hk`:
+
 ```
+-> mode => livebuild    # nakładka na live-build (domyślny)
+-> mode => standalone   # całkowicie niezależny
+```
+
+Lub przez flagę CLI:
+```bash
+hackeros-builder build --standalone
+```
+
+## Format konfiguracji .hk
+
+Dokumentacja: https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+
+## Obsługiwane wersje Debian
+
+- `bookworm` — Debian 12 (oldstable)
+- `trixie` — Debian 13 (stable)
+- `forky` — Debian 14 (testing)
