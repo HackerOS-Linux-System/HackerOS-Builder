@@ -1,4 +1,5 @@
-// nim
+// go
+// make
 
 > cd source-code
-> nim compile main.nim
+> make build
