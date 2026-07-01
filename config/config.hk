@@ -1,0 +1,24 @@
+! config/config.hk
+! Jedyny plik ktory odroznia projekt hackeros-builder od zwyklego projektu
+! live-build. Reszta struktury (hooks/, package-lists/, includes.chroot/...)
+! jest identyczna jak w live-build -- mozesz wkleic istniejacy projekt
+! live-build do tego katalogu i hackeros-builder zinterpretuje go tak samo.
+!
+! Format tego pliku to .hk -- dokumentacja:
+! https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+
+[account]
+! type: "user" -- obraz OCI trafia na konto uzytkownika w registry
+!       "organisation" -- obraz OCI trafia na konto organizacji
+-> type => user
+-> name => michal
+
+[auth]
+! token: token autoryzacyjny do push obrazu OCI (np. GitHub Personal Access
+! Token z uprawnieniem write:packages dla ghcr.io)
+-> token => ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[release]
+! name: wersja Debiana do zbudowania -- przekazywana do debootstrap jako SUITE
+! Wartosci znane: bookworm, trixie, forky, sid, unstable
+-> name => trixie
