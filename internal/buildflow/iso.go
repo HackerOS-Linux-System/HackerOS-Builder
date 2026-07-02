@@ -89,12 +89,20 @@ func BuildIso(opts IsoOptions) error {
 	volumeName := "HACKEROS"
 	isoWorkDir := filepath.Join(opts.WorkDir, "iso-build")
 
+	// SkipInstaller: true jezeli uzytkownik przekazal --no-installer CLI
+	// LUB jezeli [project] -> installer = none w config.hk.
+	skipInstaller := opts.SkipInstaller
+	if cfg != nil && !cfg.Project.UseBuiltinInstaller() {
+		skipInstaller = true
+		util.Infof("Instalator pominiety ([project] -> installer = none)")
+	}
+
 	if err := isobuild.Build(isobuild.BuildParams{
 		RootfsDir:     rootfsDir,
 		OutputISO:     opts.OutputISO,
 		WorkDir:       isoWorkDir,
 		VolumeName:    volumeName,
-		SkipInstaller: opts.SkipInstaller,
+		SkipInstaller: skipInstaller,
 	}); err != nil {
 		return fmt.Errorf("budowa ISO: %w", err)
 	}
