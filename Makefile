@@ -1,24 +1,3 @@
-# Makefile dla hackeros-builder
-# ============================================================
-# Szybki start (wszystkie tryby dzialaja BEZ internetu):
-#
-#   make              -- kompiluje ./hackeros-builder (domyslny cel)
-#   make build        -- to samo
-#   make install      -- kompiluje i kopiuje do /usr/local/bin/
-#   make clean        -- usuwa skompilowana binarka
-#   make test         -- uruchamia testy jednostkowe
-#
-# Opcje rzadziej uzywane:
-#   make fmt          -- formatuje kod (gofmt)
-#   make vet          -- uruchamia go vet
-#   make tidy         -- aktualizuje go.sum (WYMAGA INTERNETU)
-#   make vendor-sync  -- regeneruje vendor/ (WYMAGA INTERNETU)
-#
-# Zmienne:
-#   PREFIX   -- prefix instalacji (domyslnie /usr/local)
-#   DESTDIR  -- dla instalacji w staged root
-# ============================================================
-
 BINARY      := hackeros-builder
 PREFIX      ?= /usr/local
 INSTALL_DIR := $(DESTDIR)$(PREFIX)/bin
