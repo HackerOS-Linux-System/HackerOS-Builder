@@ -1,24 +1,77 @@
 ! config/config.hk
 ! Jedyny plik ktory odroznia projekt hackeros-builder od zwyklego projektu
-! live-build. Reszta struktury (hooks/, package-lists/, includes.chroot/...)
-! jest identyczna jak w live-build -- mozesz wkleic istniejacy projekt
-! live-build do tego katalogu i hackeros-builder zinterpretuje go tak samo.
+! live-build. Reszta struktury (hooks/, package-lists/, includes.chroot/)
+! jest identyczna jak w live-build.
 !
-! Format tego pliku to .hk -- dokumentacja:
-! https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+! Format: .hk  (dokumentacja: https://github.com/HackerOS-Linux-System)
 
 [account]
-! type: "user" -- obraz OCI trafia na konto uzytkownika w registry
+! type: "user"         -- obraz OCI trafia na konto uzytkownika w registry
 !       "organisation" -- obraz OCI trafia na konto organizacji
 -> type => user
 -> name => michal
 
 [auth]
-! token: token autoryzacyjny do push obrazu OCI (np. GitHub Personal Access
-! Token z uprawnieniem write:packages dla ghcr.io)
+! token: GitHub Personal Access Token z uprawnieniem write:packages (ghcr.io)
 -> token => ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 [release]
-! name: wersja Debiana do zbudowania -- przekazywana do debootstrap jako SUITE
-! Wartosci znane: bookworm, trixie, forky, sid, unstable
+! name: wersja Debiana -- przekazywana do debootstrap jako SUITE
+! Znane wartosci: bookworm, trixie, forky, sid, unstable
 -> name => trixie
+
+[project]
+! Sekcja [project] jest w CALOSCI OPCJONALNA -- brak sekcji nie jest bledem,
+! stosowane sa wartosci domyslne opisane ponizej.
+
+! name: nazwa obrazu OCI w registry.
+!       Wynikowa sciezka: ghcr.io/<account.name>/<project.name>:<project.tag>
+!       Domyslnie: nazwa katalogu projektu.
+-> name => moj-projekt
+
+! tag: wersja/tag obrazu OCI (np. "latest", "1.0.0", "nightly", "2025-07").
+!      Domyslnie: "latest"
+-> tag => latest
+
+! type: tryb pracy buildera.
+!
+!   (brak) / default / cybersecurity
+!       Pelny atomowy build: debootstrap -> OCI push -> deb-ostree.
+!       To jest GLOWNY tryb hackeros-builder, aktywnie rozwijany.
+!
+!   normal / official
+!       Zwykla nakladka na live-build -- bez OCI, bez deb-ostree, bez atomowosci.
+!       Builder deleguje caly build do "lb build". WYMAGA zainstalowanego
+!       live-build na hoscie (apt-get install live-build).
+!
+!   independent
+!       Alternatywa dla live-build dla projektow normal/official:
+!       uzywa wewnetrznego pipeline hackeros-builder (debootstrap + squashfs + iso)
+!       ale BEZ push OCI i BEZ deb-ostree. Nie wymaga live-build.
+!
+-> type => default
+
+! installer: instalator dolaczany do obrazu ISO.
+!
+!   (brak) / default / cybersecurity
+!       Wlasny instalator hackeros-builder (Calamares), uruchamiany OD RAZU
+!       przy starcie ISO (bez posredniego pulpitu live). Inspirowany trybem
+!       "Install" z Kubuntu -- uruchamiasz ISO i pierwsze co widzisz to
+!       kreator instalacji, nie pulpit z ikona "Zainstaluj".
+!
+!   none
+!       Brak instalatora. Builder nie wstrzykuje zadnego instalatora do ISO.
+!       Uzytkownik (deweloper) sam dba o instalator przez hooks/includes.chroot.
+!
+-> installer => default
+
+! selinux: system kontroli dostepu obowiazkowego (MAC).
+!
+!   false / (brak)  --> AppArmor (domyslny dla Debiana)
+!                        pakiety: apparmor, apparmor-profiles, apparmor-utils
+!
+!   true            --> SELinux zamiast AppArmor
+!                        pakiety: selinux-basics, selinux-policy-default,
+!                                 policycoreutils, auditd
+!
+-> selinux => false
