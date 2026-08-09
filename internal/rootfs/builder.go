@@ -1,6 +1,7 @@
 package rootfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,7 +26,7 @@ type Builder struct {
 	Project   *liveparse.Project
 	Config    *config.Config
 	RootfsDir string // katalog docelowy rootfs
-	WorkDir   string // katalog roboczy buildu (na toolchain-bin/ i inne temp)
+	WorkDir   string // katalog roboczy buildu (na toolchain/bin/ i inne temp)
 
 	// OriginRefspec to refspec obrazu OCI wpisywany do /etc/deb-ostree/deb-ostree.hk
 	OriginRefspec string
@@ -103,23 +104,23 @@ func (b *Builder) Build() error {
 	}
 
 	// --- toolchain: przygotuj narzedzia build-time ---
-	util.Infof("Krok 0/7: sprawdzanie/pobieranie narzedzi build-time...")
+	util.Infof("Krok 0/9: sprawdzanie/pobieranie narzedzi build-time...")
 	tc := toolchain.New(b.WorkDir)
 	if err := tc.PrepareAll(); err != nil {
 		return fmt.Errorf("toolchain: %w", err)
 	}
-	// Ustaw PATH tak by toolchain-bin/ byl pierwszy -- procesy potomne
+	// Ustaw PATH tak by toolchain/bin/ byl pierwszy -- procesy potomne
 	// (debootstrap, apt-get w sandbox) automatycznie znajda tymczasowe binarki.
 	if err := os.Setenv("PATH", tc.Env()[0][len("PATH="):]); err != nil {
 		return fmt.Errorf("ustawienie PATH toolchain: %w", err)
 	}
 
-	util.Infof("Krok 1/7: debootstrap (%s)...", b.Config.Release)
+	util.Infof("Krok 1/9: debootstrap (%s)...", b.Config.Release)
 	if err := b.runDebootstrap(); err != nil {
 		return fmt.Errorf("debootstrap: %w", err)
 	}
 
-	util.Infof("Krok 2/7: preseed debconf + sudo-stub...")
+	util.Infof("Krok 2/9: preseed debconf + sudo-stub...")
 	if err := b.seedDebconf(); err != nil {
 		return fmt.Errorf("preseed debconf: %w", err)
 	}
@@ -127,41 +128,58 @@ func (b *Builder) Build() error {
 		return fmt.Errorf("sudo stub: %w", err)
 	}
 
+	if b.Project.IncludesChrootBeforePackages != "" {
+		util.Infof("Krok 3/9: kopiowanie includes.chroot_before_packages...")
+		if err := b.copyDirToRootfs(b.Project.IncludesChrootBeforePackages); err != nil {
+			return fmt.Errorf("includes.chroot_before_packages: %w", err)
+		}
+	} else {
+		util.Infof("Krok 3/9: brak includes.chroot_before_packages -- pominieto")
+	}
+
 	if len(b.Project.ExtraSources) > 0 {
-		util.Infof("Krok 3/8: dodatkowe zrodla apt (%d)...", len(b.Project.ExtraSources))
+		util.Infof("Krok 4/9: dodatkowe zrodla apt (%d)...", len(b.Project.ExtraSources))
 		if err := b.applyExtraSources(); err != nil {
 			return fmt.Errorf("extra sources: %w", err)
 		}
 	} else {
-		util.Infof("Krok 3/8: brak dodatkowych zrodel apt -- pominieto")
+		util.Infof("Krok 4/9: brak dodatkowych zrodel apt -- pominieto")
 	}
 
-	util.Infof("Krok 4/8: instalacja systemu MAC ([project] -> selinux=%v)...",
+	util.Infof("Krok 5/9: instalacja systemu MAC ([project] -> selinux=%v)...",
 		b.Config.Project.MAC == config.MACSELinux)
 	if err := b.installMACPackages(); err != nil {
 		return fmt.Errorf("instalacja MAC: %w", err)
 	}
 
-	util.Infof("Krok 5/8: instalacja %d pakiet(ow)...", len(b.Project.Packages))
+	util.Infof("Krok 6/9: instalacja %d pakiet(ow)...", len(b.Project.Packages))
 	if err := b.installPackages(); err != nil {
 		return fmt.Errorf("instalacja pakietow: %w", err)
 	}
 
-	if b.Project.IncludesChroot != "" {
-		util.Infof("Krok 6/8: kopiowanie includes.chroot...")
-		if err := b.copyIncludesChroot(); err != nil {
-			return fmt.Errorf("includes.chroot: %w", err)
+	hasAfterIncludes := b.Project.IncludesChroot != "" || b.Project.IncludesChrootAfterPackages != ""
+	if hasAfterIncludes {
+		util.Infof("Krok 7/9: kopiowanie includes.chroot / includes.chroot_after_packages...")
+		if b.Project.IncludesChroot != "" {
+			if err := b.copyDirToRootfs(b.Project.IncludesChroot); err != nil {
+				return fmt.Errorf("includes.chroot: %w", err)
+			}
+		}
+		if b.Project.IncludesChrootAfterPackages != "" {
+			if err := b.copyDirToRootfs(b.Project.IncludesChrootAfterPackages); err != nil {
+				return fmt.Errorf("includes.chroot_after_packages: %w", err)
+			}
 		}
 	} else {
-		util.Infof("Krok 6/8: brak includes.chroot -- pominieto")
+		util.Infof("Krok 7/9: brak includes.chroot/includes.chroot_after_packages -- pominieto")
 	}
 
-	util.Infof("Krok 7/8: wykonywanie %d hook(ow)...", len(b.Project.Hooks))
+	util.Infof("Krok 8/9: wykonywanie %d hook(ow)...", len(b.Project.Hooks))
 	if err := b.runHooks(); err != nil {
 		return fmt.Errorf("hooks: %w", err)
 	}
 
-	util.Infof("Krok 8/8: wstrzykiwanie deb-ostree + generowanie deb-ostree.hk...")
+	util.Infof("Krok 9/9: wstrzykiwanie deb-ostree + generowanie deb-ostree.hk...")
 	if err := b.injectDebOstree(); err != nil {
 		return fmt.Errorf("deb-ostree injection: %w", err)
 	}
@@ -290,14 +308,15 @@ func (b *Builder) applyExtraSources() error {
 	return nil
 }
 
-// copyIncludesChroot kopiuje rekurencyjnie config/includes.chroot/* do
-// korzenia rootfs, zachowujac uprawnienia plikow (1:1 jak live-build).
-func (b *Builder) copyIncludesChroot() error {
-	return filepath.Walk(b.Project.IncludesChroot, func(path string, info os.FileInfo, err error) error {
+// copyDirToRootfs kopiuje rekurencyjnie srcDir do korzenia rootfs, zachowujac
+// uprawnienia plikow (1:1 jak live-build). Uzywana dla wszystkich trzech
+// wariantow includes.chroot* (before_packages / legacy / after_packages).
+func (b *Builder) copyDirToRootfs(srcDir string) error {
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(b.Project.IncludesChroot, path)
+		rel, err := filepath.Rel(srcDir, path)
 		if err != nil {
 			return err
 		}
@@ -322,6 +341,16 @@ func (b *Builder) copyIncludesChroot() error {
 // runHooks wykonuje kazdy skrypt hooks wewnatrz izolowanego kontenera nspawn.
 // Sudo-stub instalowany w kroku 2 jest USUWANY po wykonaniu WSZYSTKICH hookow
 // (patrz installSudoStub / removeSudoStub).
+//
+// Kazdy hook ma limit czasu (sandbox.DefaultHookTimeout, nadpisywalny
+// HACKEROS_HOOK_TIMEOUT_SECONDS) i dziala z DEBIAN_FRONTEND=noninteractive +
+// pelnym zestawem zmiennych tlumiacych interaktywne pytania (needrestart,
+// ucf, apt-listchanges -- patrz internal/sandbox/sandbox.go) oraz stdin
+// zawsze ustawionym na /dev/null. Jesli hook mimo to probuje o cos zapytac
+// (np. odpali whiptail bez terminala, albo czeka na wejscie ktore nigdy nie
+// nadejdzie), zostanie zabity po limicie czasu z jasnym komunikatem --
+// zamiast wisiec w nieskonczonosc albo przerwac build od razu z niejasnym
+// bledem niskiego poziomu.
 func (b *Builder) runHooks() error {
 	defer b.removeSudoStub()
 	for _, h := range b.Project.Hooks {
@@ -331,12 +360,22 @@ func (b *Builder) runHooks() error {
 		if err := copyFile(h.Path, destOnHost, 0o755); err != nil {
 			return fmt.Errorf("kopiowanie hooka %s: %w", h.Name, err)
 		}
-		if err := b.sandboxExec(tmpName); err != nil {
-			os.Remove(destOnHost)
+		err := sandbox.ExecHook(b.RootfsDir, tmpName)
+		os.Remove(destOnHost)
+		if err != nil {
+			var timeoutErr *sandbox.ExecTimeoutError
+			if errors.As(err, &timeoutErr) {
+				return fmt.Errorf(
+					"hook %s: %w -- hook prawdopodobnie czeka na interaktywna odpowiedz "+
+						"(np. whiptail/dialog/apt-get bez -y/'read' na cos co nigdy nie nadejdzie); "+
+						"nienadzorowany build ('hackeros-builder build ...') NIE MOZE dostarczyc takiej "+
+						"odpowiedzi -- popraw hook zeby dzialal w pelni bez interakcji "+
+						"(np. dopisz -y do apt-get/dpkg, ustaw DEBIAN_FRONTEND=noninteractive we wlasnych "+
+						"podprocesach hooka), albo podnies limit zmienna HACKEROS_HOOK_TIMEOUT_SECONDS "+
+						"jesli hook LEGALNIE potrzebuje wiecej czasu (kompilacja, duze pobieranie)",
+					h.Name, err)
+			}
 			return fmt.Errorf("wykonanie hooka %s: %w", h.Name, err)
-		}
-		if err := os.Remove(destOnHost); err != nil {
-			util.Warnf("Nie mozna usunac tymczasowego hooka %s: %v", destOnHost, err)
 		}
 	}
 	return nil
@@ -396,24 +435,11 @@ func (b *Builder) generateDebOstreeConfig() error {
 	return nil
 }
 
-// noninteractiveEnv to zmienne srodowiskowe wstrzykiwane do KAZDEGO procesu
-// uruchamianego wewnatrz chroot (apt-get, dpkg przez postinst, hooki).
-//
-// Bez DEBIAN_FRONTEND=noninteractive debconf wybiera dialog/whiptail jako
-// frontend gdy wykryje terminal (TUI tak jak na zrzucie ekranu z pytaniem
-// o "keyboard-configuration") i ZATRZYMUJE caly build czekajac na reczna
-// odpowiedz uzytkownika -- w nienadzorowanym buildzie ISO to jest blad, nie
-// funkcja. DEBCONF_NONINTERACTIVE_SEEN=true dodatkowo wycisza pytania o
-// priorytecie "high", ktore normalnie pokazuja sie nawet w trybie
-// noninteractive przy pierwszym uruchomieniu danego pakietu.
-var noninteractiveEnv = []string{
-	"DEBIAN_FRONTEND=noninteractive",
-	"DEBCONF_NONINTERACTIVE_SEEN=true",
-	"DEBCONF_NOWARNINGS=yes",
-	"LC_ALL=C",
-	"LANG=C",
-	"LANGUAGE=C",
-}
+// Uwaga: pelny zestaw zmiennych srodowiskowych tlumiacych interaktywne
+// pytania (DEBIAN_FRONTEND, needrestart, ucf, apt-listchanges, ...) jest
+// zdefiniowany w JEDNYM miejscu -- internal/sandbox/sandbox.go,
+// noninteractiveEnv -- i wstrzykiwany automatycznie do KAZDEGO wywolania
+// sandbox.Exec/ExecEnv/ExecWithStdin/ExecHook, w tym do kazdego hooka.
 
 // sandboxExec uruchamia komende wewnatrz rootfs w izolowanym srodowisku
 // (unshare + chroot) -- patrz internal/sandbox/sandbox.go.
