@@ -42,7 +42,7 @@ func printUsage() {
                         do instalacji -- boot startuje PROSTO w graficzny
                         instalator (Calamares), bez posredniego pulpitu live.
   build all              Wykonaj 'build cloud', nastepnie 'build iso'.
-  clean                  Usun katalog roboczy (rootfs/oci-push/iso-build/...).
+  clean                  Usun katalog roboczy (rootfs/oci/iso/...).
   clean --all             Jak 'clean', plus usun wynikowy plik .iso.
 
 %s
@@ -50,7 +50,7 @@ func printUsage() {
   -p, --project <dir>      Katalog projektu (musi zawierac 'config/config.hk').
                            Domyslnie: katalog biezacy.
   -w, --workdir <dir>      Katalog roboczy na pliki tymczasowe.
-                           Domyslnie: ./hackeros-build-work
+                           Domyslnie: ./build
                            UWAGA: rownolegle buildy MUSZA uzywac roznych
                            --workdir -- ten sam katalog jest chroniony
                            lockiem (flock) i drugi build poczeka/odmowi.
@@ -97,7 +97,7 @@ func main() {
 	var (
 		verboseFlag      bool
 		projectDir       = "."
-		workDir          = "./hackeros-build-work"
+		workDir          = "./build"
 		outputISO        = "./output.iso"
 		insecureRegistry bool
 		skipPreflight    bool
@@ -159,7 +159,7 @@ func main() {
 	// nie wymagaja config/config.hk (projekt mogl juz zostac usuniety/
 	// przeniesiony, a katalog roboczy nadal tam jest) i nie przechodza
 	// przez logike preflight/buildflow. Wciaz wymagaja roota, bo pliki w
-	// workDir (rootfs/, oci-push/, iso-build/) sa typowo wlasnoscia roota
+	// workDir (rootfs/, oci/, iso/) sa typowo wlasnoscia roota
 	// (debootstrap/chroot je tworzyly).
 	if len(positional) == 1 && positional[0] == "clean" {
 		if os.Geteuid() != 0 {
