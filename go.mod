@@ -1,4 +1,4 @@
-module hackeros-builder
+module github.com/HackerOS-Linux-System/HackerOS-Builder
 
 go 1.22
 
