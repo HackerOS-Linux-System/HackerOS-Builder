@@ -14,7 +14,7 @@ import (
 // pochodzi + opcjonalne dodatkowe pakiety (zaleznosci nie rozwiazywane przez
 // dpkg w trybie standalone-extract, ale wymagane przez skrypt).
 type Tool struct {
-	Binary      string   // nazwa binarki szukanej w $PATH / toolchain-bin/
+	Binary      string   // nazwa binarki szukanej w $PATH / toolchain/bin/
 	AptPackages []string // pakiety .deb do pobrania i rozpakowania
 	UsedBy      string   // opis kroku builda (do logow i komunikatow bledu)
 }
@@ -48,16 +48,16 @@ var buildTools = []Tool{
 }
 
 // toolchainBinDir to nazwa podkatalogu katalogu roboczego buildu przeznaczonego
-// na tymczasowe binarki pobrane przez toolchain.
-const toolchainBinDir = "toolchain-bin"
+// na tymczasowe binarki pobrane przez toolchain (build/toolchain/bin/).
+const toolchainBinDir = "toolchain/bin"
 
 // Manager zarzadza zestawem narzedzi build-time dla konkretnego buildu.
 type Manager struct {
-	// WorkDir to katalog roboczy buildu (np. ./hackeros-build-work).
-	// Narzedzia sa rozpakowywane do WorkDir/toolchain-bin/.
+	// WorkDir to katalog roboczy buildu (domyslnie ./build).
+	// Narzedzia sa rozpakowywane do WorkDir/toolchain/bin/.
 	WorkDir string
 
-	// binDir to pelna sciezka do toolchain-bin/ -- obliczana raz w Init.
+	// binDir to pelna sciezka do toolchain/bin/ -- obliczana raz w Init.
 	binDir string
 
 	// preparedPath to wartosc $PATH z dopisanym binDir na pocztaku,
@@ -116,7 +116,7 @@ func (m *Manager) PrepareAll() error {
 
 // Env zwraca zmienne srodowiskowe ktore powinny byc przekazane do procesow
 // potomnych (apt-get, debootstrap itp.) tak by uzywaly tymczasowych binarek
-// z toolchain-bin/ jesli potrzebne. Wywolaj po PrepareAll.
+// z toolchain/bin/ jesli potrzebne. Wywolaj po PrepareAll.
 //
 // Zwraca []string w formacie "KLUCZ=WARTOSC" gotowy do os.Environ() / exec.Cmd.Env.
 func (m *Manager) Env() []string {
@@ -126,7 +126,7 @@ func (m *Manager) Env() []string {
 	return []string{"PATH=" + m.preparedPath}
 }
 
-// BinPath zwraca pelna sciezke do binarki w toolchain-bin/, jesli tam istnieje.
+// BinPath zwraca pelna sciezke do binarki w toolchain/bin/, jesli tam istnieje.
 // Zwraca pusty string jesli binarka nie jest w toolchain (jest w systemowym PATH).
 func (m *Manager) BinPath(binary string) string {
 	p := filepath.Join(m.binDir, binary)
@@ -136,10 +136,10 @@ func (m *Manager) BinPath(binary string) string {
 	return ""
 }
 
-// toolAvailable sprawdza czy binarka jest dostepna w toolchain-bin/ LUB
-// w systemowym $PATH (w tej kolejnosci -- toolchain-bin/ ma priorytet).
+// toolAvailable sprawdza czy binarka jest dostepna w toolchain/bin/ LUB
+// w systemowym $PATH (w tej kolejnosci -- toolchain/bin/ ma priorytet).
 func (m *Manager) toolAvailable(binary string) bool {
-	// najpierw toolchain-bin/
+	// najpierw toolchain/bin/
 	if _, err := os.Stat(filepath.Join(m.binDir, binary)); err == nil {
 		return true
 	}
@@ -226,7 +226,7 @@ func (m *Manager) downloadAndExtract(t Tool) error {
 
 	// Weryfikacja: czy docelowa binarka jest teraz dostepna?
 	if _, err := os.Stat(filepath.Join(m.binDir, t.Binary)); err != nil {
-		return fmt.Errorf("binarka %q nie znaleziona w toolchain-bin/ po rozpakowaniu -- "+
+		return fmt.Errorf("binarka %q nie znaleziona w toolchain/bin/ po rozpakowaniu -- "+
 			"sprawdz czy pakiet %v rzeczywiscie ja dostarcza", t.Binary, t.AptPackages)
 	}
 
@@ -238,7 +238,7 @@ func (m *Manager) downloadAndExtract(t Tool) error {
 // zanim uruchomi prawdziwy skrypt. Bez tego debootstrap nie znajdzie skryptow
 // suite (bookworm, trixie itp.) i pada z "E: Unknown suite".
 func (m *Manager) installDebootstrapData(extractDir string) error {
-	shareDir := filepath.Join(m.WorkDir, "toolchain-share", "debootstrap")
+	shareDir := filepath.Join(m.WorkDir, "toolchain", "share", "debootstrap")
 	if err := os.MkdirAll(shareDir, 0o755); err != nil {
 		return err
 	}
