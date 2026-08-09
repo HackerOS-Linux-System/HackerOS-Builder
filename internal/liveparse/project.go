@@ -21,9 +21,26 @@ type Project struct {
 	Hooks []HookScript
 
 	// IncludesChroot to sciezka do config/includes.chroot (lub "" jesli
-	// katalog nie istnieje) -- cala jego zawartosc jest kopiowana 1:1
-	// do korzenia rootfs PO instalacji pakietow, PRZED hooks.
+	// katalog nie istnieje) -- zachowane dla zgodnosci wstecz, semantyka
+	// TAKA SAMA jak IncludesChrootAfterPackages (kopiowane PO instalacji
+	// pakietow, PRZED hooks). Jesli projekt ma OBA katalogi (legacy
+	// "includes.chroot" i nowy "includes.chroot_after_packages"), oba sa
+	// kopiowane -- najpierw legacy, potem after_packages.
 	IncludesChroot string
+
+	// IncludesChrootBeforePackages to sciezka do
+	// config/includes.chroot_before_packages (lub "" jesli katalog nie
+	// istnieje) -- jej zawartosc jest kopiowana do korzenia rootfs zaraz PO
+	// debootstrap/preseed, ale PRZED dodatkowymi zrodlami apt i instalacja
+	// jakichkolwiek pakietow. Uzyteczne np. gdy trzeba podmienic
+	// /etc/apt/apt.conf.d/* albo /etc/hosts zanim apt-get w ogole ruszy.
+	IncludesChrootBeforePackages string
+
+	// IncludesChrootAfterPackages to sciezka do
+	// config/includes.chroot_after_packages -- kopiowana PO instalacji
+	// pakietow (rowniez po MAC/AppArmor/SELinux), PRZED hooks -- dokladnie
+	// tam gdzie do tej pory dzialalo samo "includes.chroot" (patrz wyzej).
+	IncludesChrootAfterPackages string
 
 	// ExtraSources to dodatkowe linie sources.list z config/archives/*.list.chroot.
 	ExtraSources []string
@@ -157,14 +174,22 @@ func (p *Project) parseHooks(configDir string) error {
 	return nil
 }
 
-// parseIncludesChroot ustawia sciezke do config/includes.chroot jesli istnieje.
-// Sama kopia plikow odbywa sie w pakiecie rootfs (BuildRootfs), nie tutaj --
-// ten pakiet tylko interpretuje strukture, nie wykonuje I/O na docelowym rootfs.
+// parseIncludesChroot ustawia sciezki do config/includes.chroot,
+// config/includes.chroot_before_packages i config/includes.chroot_after_packages
+// jesli istnieja. Sama kopia plikow odbywa sie w pakiecie rootfs (BuildRootfs),
+// nie tutaj -- ten pakiet tylko interpretuje strukture, nie wykonuje I/O na
+// docelowym rootfs.
 func (p *Project) parseIncludesChroot(configDir string) {
-	dir := filepath.Join(configDir, "includes.chroot")
-	if info, err := os.Stat(dir); err == nil && info.IsDir() {
-		p.IncludesChroot = dir
+	setIfDir := func(name string) string {
+		dir := filepath.Join(configDir, name)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+		return ""
 	}
+	p.IncludesChroot = setIfDir("includes.chroot")
+	p.IncludesChrootBeforePackages = setIfDir("includes.chroot_before_packages")
+	p.IncludesChrootAfterPackages = setIfDir("includes.chroot_after_packages")
 }
 
 // parseArchives czyta config/archives/*.list.chroot (dodatkowe linie
@@ -221,9 +246,16 @@ func (p *Project) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Pakietow do instalacji:  %d\n", len(p.Packages))
 	fmt.Fprintf(&b, "Hookow do wykonania:     %d\n", len(p.Hooks))
+	if p.IncludesChrootBeforePackages != "" {
+		fmt.Fprintf(&b, "includes.chroot_before_packages: %s\n", p.IncludesChrootBeforePackages)
+	}
 	if p.IncludesChroot != "" {
 		fmt.Fprintf(&b, "includes.chroot:         %s\n", p.IncludesChroot)
-	} else {
+	}
+	if p.IncludesChrootAfterPackages != "" {
+		fmt.Fprintf(&b, "includes.chroot_after_packages: %s\n", p.IncludesChrootAfterPackages)
+	}
+	if p.IncludesChroot == "" && p.IncludesChrootBeforePackages == "" && p.IncludesChrootAfterPackages == "" {
 		fmt.Fprintf(&b, "includes.chroot:         (brak)\n")
 	}
 	fmt.Fprintf(&b, "Dodatkowych zrodel apt:  %d\n", len(p.ExtraSources))
