@@ -49,6 +49,20 @@ func BuildAndPush(p BuildParams) (string, error) {
 	}
 	defer os.Remove(layerTarPath)
 
+	// Walidacja LOKALNA zaraz po zbudowaniu warstwy, PRZED jakimkolwiek
+	// wypchnieciem do registry. tarball.LayerFromFile (nizej) czyta ten
+	// plik z dysku WIELOKROTNIE podczas remote.Write (raz zeby policzyc
+	// SHA256, raz zeby faktycznie wgrac dane) -- jesli layer.tar.gz jest
+	// obciety/uszkodzony, bez tej walidacji dowiedzielibysmy sie o tym
+	// dopiero przy "build iso" (pull z registry), jako niejasne
+	// "unexpected EOF" oderwane od miejsca faktycznej przyczyny. Tutaj
+	// blad wychodzi natychmiast, lokalnie, z jasnym komunikatem.
+	if err := validateLayerTarball(layerTarPath); err != nil {
+		return "", fmt.Errorf("zbudowana warstwa OCI jest uszkodzona (%s): %w -- "+
+			"NIE wypychamy jej do registry; sprawdz miejsce na dysku w %s i uruchom build ponownie",
+			layerTarPath, err, p.WorkDir)
+	}
+
 	util.Infof("Budowanie obrazu OCI (v1.Image)...")
 	img, err := buildImageFromLayer(layerTarPath)
 	if err != nil {
@@ -88,14 +102,49 @@ func createLayerTarball(rootfsDir, destTarGz string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	gz := gzip.NewWriter(out)
-	defer gz.Close()
-
 	tw := tar.NewWriter(gz)
-	defer tw.Close()
 
+	walkErr := createLayerTarballWalk(rootfsDir, tw)
+
+	// UWAGA: zamykamy w poprawnej kolejnosci (tar -> gzip -> plik) i
+	// SPRAWDZAMY KAZDY blad Close(). Wczesniej te trzy Close() byly
+	// wywolywane wylacznie przez `defer` z pominietym bledem zwrotnym --
+	// jesli tw.Close() lub gz.Close() zawiodlo (np. brak miejsca na
+	// dysku, przerwany zapis buforowanych danych gzip), archiwum konczylo
+	// sie BEZ koncowych blokow tar / trailer'a gzip, ale funkcja i tak
+	// zwracala sukces (bo filepath.Walk sam w sobie sie powiodl). Taki
+	// obciety layer.tar.gz byl nastepnie wypychany do registry jako
+	// poprawny obraz, a dopiero przy pozniejszym "build iso" (pull +
+	// rozpakowanie warstwy) ujawnial sie jako "unexpected EOF" -- czyli
+	// dokladnie objaw z tego zgloszenia. Teraz kazdy blad Close()
+	// przerywa build od razu, w miejscu gdzie powstaje, zamiast
+	// wyplywac pozniej przy pullu z registry.
+	if closeErr := tw.Close(); closeErr != nil && walkErr == nil {
+		walkErr = fmt.Errorf("zamykanie tar writer warstwy: %w", closeErr)
+	}
+	if closeErr := gz.Close(); closeErr != nil && walkErr == nil {
+		walkErr = fmt.Errorf("zamykanie gzip writer warstwy: %w", closeErr)
+	}
+	if closeErr := out.Close(); closeErr != nil && walkErr == nil {
+		walkErr = fmt.Errorf("zamykanie pliku warstwy %s: %w", destTarGz, closeErr)
+	}
+
+	if walkErr != nil {
+		// Nie zostawiamy czesciowo zapisanego/uszkodzonego pliku warstwy --
+		// kolejna proba builda ma zaczynac od zera, a nie przypadkiem
+		// podniesc obciety tar.gz z poprzedniej, nieudanej proby.
+		os.Remove(destTarGz)
+		return walkErr
+	}
+	return nil
+}
+
+// createLayerTarballWalk przechodzi po rootfsDir i zapisuje kazdy wpis do tw.
+// Wydzielone z createLayerTarball, zeby Close() warstwy dalo sie wywolac
+// jawnie (z obsluga bledu) niezaleznie od tego, czy sam walk sie powiodl.
+func createLayerTarballWalk(rootfsDir string, tw *tar.Writer) error {
 	return filepath.Walk(rootfsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -141,6 +190,55 @@ func createLayerTarball(rootfsDir, destTarGz string) error {
 		}
 		return nil
 	})
+}
+
+// validateLayerTarball otwiera layer.tar.gz od nowa (dokladnie tak jak
+// pozniej zrobi to tarball.LayerFromFile / remote.Write) i czyta go w calosci
+// -- gzip do konca strumienia oraz kazdy wpis tar az do ostatniego naglowka
+// EOF. To wykrywa dokladnie ten sam rodzaj uszkodzenia (obciety plik, brak
+// koncowych blokow tar / trailera gzip) jaki inaczej ujawnilby sie dopiero
+// przy pullu z registry jako "unexpected EOF", ale robi to LOKALNIE, zaraz
+// po zbudowaniu warstwy, zanim cokolwiek zostanie wyslane w swiat.
+func validateLayerTarball(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("otwarcie: %w", err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("naglowek gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	entries := 0
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("naglowek tar wpisu #%d: %w", entries+1, err)
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return fmt.Errorf("zawartosc wpisu tar %q: %w", hdr.Name, err)
+		}
+		entries++
+	}
+	if entries == 0 {
+		return fmt.Errorf("warstwa jest pusta (0 wpisow) -- prawdopodobnie rootfs nie zostal poprawnie zbudowany")
+	}
+
+	// gzr.Close() (deferred) sprawdza CRC32/rozmiar zapisane w trailerze
+	// gzip wzgledem faktycznie odczytanych danych -- wywolujemy jawnie tutaj
+	// (przed defer) zeby jego blad tez trafil do walidacji, a nie zostal
+	// po cichu zignorowany jak w oryginalnym bledzie tego zgloszenia.
+	if err := gzr.Close(); err != nil {
+		return fmt.Errorf("weryfikacja trailera gzip: %w", err)
+	}
+	return nil
 }
 
 // buildImageFromLayer tworzy v1.Image z pojedynczej warstwy tar.gz, startujac
