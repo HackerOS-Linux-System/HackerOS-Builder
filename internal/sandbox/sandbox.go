@@ -2,11 +2,14 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // noninteractiveEnv to zmienne srodowiskowe wstrzykiwane do KAZDEGO procesu
@@ -19,6 +22,23 @@ var noninteractiveEnv = []string{
 	"LC_ALL=C",
 	"LANG=C",
 	"LANGUAGE=C",
+	// needrestart (domyslnie wlaczony w wielu instalacjach Debiana od paczki
+	// libpam-systemd/init-system-helpers) po instalacji dowolnego pakietu
+	// z demonem pyta interaktywnie "ktore uslugi zrestartowac?" -- bez tty
+	// ten dialog albo wisi w nieskonczonosc, albo (zaleznie od wersji) od
+	// razu przerywa caly krok bledem. "a" = automatycznie restartuj wszystko,
+	// bez pytania.
+	"NEEDRESTART_MODE=a",
+	"NEEDRESTART_SUSPEND=1",
+	// ucf (uzywany przez postinst wielu pakietow do zarzadzania plikami
+	// konfiguracyjnymi) ma WLASNY mechanizm pytania o konflikty, niezalezny
+	// od Dpkg::Options::=--force-conf*. UCF_FORCE_CONFFOLD wymusza
+	// zachowanie istniejacego pliku (spojne z --force-confold dla dpkg).
+	"UCF_FORCE_CONFFOLD=1",
+	// apt-listchanges (jesli zainstalowany hookiem/pakietem) domyslnie
+	// otwiera pager z changelogiem i CZEKA na klawisz -- "none" wylacza
+	// wyswietlanie w ogole.
+	"APT_LISTCHANGES_FRONTEND=none",
 	// PATH wewnatrz chroot musi zawierac /sbin i /usr/sbin -- bez tego
 	// apt-get nie znajdzie dpkg, ldconfig, update-alternatives itp.
 	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -28,23 +48,66 @@ var noninteractiveEnv = []string{
 // srodowisku (wlasny namespace mount+PID+UTS) przez unshare + chroot.
 // stdout i stderr sa przekazywane na zywo do terminala (streaming).
 func Exec(rootfsDir string, command string, args ...string) error {
-	return execInternal(rootfsDir, nil, nil, command, args...)
+	return execInternal(rootfsDir, nil, nil, 0, command, args...)
 }
 
 // ExecEnv jak Exec, ale dopisuje dodatkowe zmienne srodowiskowe do
 // noninteractiveEnv (format "KLUCZ=WARTOSC").
 func ExecEnv(rootfsDir string, extraEnv []string, command string, args ...string) error {
-	return execInternal(rootfsDir, extraEnv, nil, command, args...)
+	return execInternal(rootfsDir, extraEnv, nil, 0, command, args...)
 }
 
 // ExecWithStdin jak Exec, ale podaje stdinData na stdin komendy wewnatrz
 // sandbox (np. dla "debconf-set-selections", ktore czyta preseed z stdin).
 func ExecWithStdin(rootfsDir string, stdinData []byte, command string, args ...string) error {
-	return execInternal(rootfsDir, nil, stdinData, command, args...)
+	return execInternal(rootfsDir, nil, stdinData, 0, command, args...)
 }
 
-// execInternal to wspolna implementacja Exec/ExecEnv/ExecWithStdin.
-func execInternal(rootfsDir string, extraEnv []string, stdin []byte, command string, args ...string) error {
+// DefaultHookTimeout to maksymalny czas na wykonanie POJEDYNCZEGO hooka
+// (config/hooks/normal/*.hook.chroot) zanim build zostanie przerwany z
+// jasnym komunikatem. Nadpisywalny zmienna srodowiskowa
+// HACKEROS_HOOK_TIMEOUT_SECONDS (np. dla hookow ktore legalnie potrzebuja
+// duzo czasu -- kompilacja ze zrodel, duze pobieranie).
+//
+// Powod istnienia: stdin hooka jest zawsze /dev/null (execInternal nie
+// podaje stdin dla ExecHook), wiec proste "read odpowiedz" w skrypcie od
+// razu dostaje EOF zamiast wisiec -- ale niektore narzedzia (dialog/whiptail
+// bez wykrytego terminala, proces czekajacy na polaczenie sieciowe/GUI ktore
+// nigdy nie nadejdzie) moga zawiesic sie mimo to. Timeout jest ostatnia
+// linia obrony: build ZAWSZE sie konczy, zamiast wisiec bez konca w CI/skrypcie.
+const DefaultHookTimeout = 20 * time.Minute
+
+// ExecHook uruchamia skrypt hooka wewnatrz rootfsDir z limitem czasu
+// (DefaultHookTimeout, chyba ze nadpisany HACKEROS_HOOK_TIMEOUT_SECONDS).
+// W razie przekroczenia limitu zwraca czytelny blad ExecTimeoutError zamiast
+// pozwolic calemu buildowi wisiec w nieskonczonosc.
+func ExecHook(rootfsDir string, hookPath string) error {
+	timeout := DefaultHookTimeout
+	if v := os.Getenv("HACKEROS_HOOK_TIMEOUT_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			timeout = time.Duration(secs) * time.Second
+		}
+	}
+	return execInternal(rootfsDir, nil, nil, timeout, hookPath)
+}
+
+// ExecTimeoutError sygnalizuje ze komenda zostala zabita po przekroczeniu
+// limitu czasu -- odrozniane od zwyklego bledu (kod wyjscia != 0), zeby
+// wolajacy mogl wyswietlic wskazowke ("hook prawdopodobnie czeka na
+// interakcje uzytkownika, ktorej nienadzorowany build nie moze dostarczyc").
+type ExecTimeoutError struct {
+	Command string
+	Timeout time.Duration
+}
+
+func (e *ExecTimeoutError) Error() string {
+	return fmt.Sprintf("przekroczono limit czasu (%s) na wykonanie %q", e.Timeout, e.Command)
+}
+
+// execInternal to wspolna implementacja Exec/ExecEnv/ExecWithStdin/ExecHook.
+// timeout=0 oznacza brak limitu (Exec/ExecEnv/ExecWithStdin -- apt-get na
+// wolnym mirrorze moze legalnie trwac dlugo, wiec te sciezki go nie maja).
+func execInternal(rootfsDir string, extraEnv []string, stdin []byte, timeout time.Duration, command string, args ...string) error {
 	// Zapewnij istnienie punktow montowania wewnatrz rootfs przed wejsciem
 	// do namespace -- chroot nie tworzy ich automatycznie, a mount -t proc
 	// wysypie sie jesli katalog docelowy nie istnieje.
@@ -59,10 +122,19 @@ func execInternal(rootfsDir string, extraEnv []string, stdin []byte, command str
 	env := append(os.Environ(), noninteractiveEnv...)
 	env = append(env, extraEnv...)
 
-	// unshare --kill-child: gdy hackeros-builder dostanie SIGTERM/SIGKILL,
-	// kernel wysyla SIGKILL do calej grupy procesow wewnatrz namespace --
-	// gwarantuje ze zadne "osierozone" procesy budowy nie zostaja w tle.
-	cmd := exec.Command("unshare",
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	// unshare --kill-child: gdy hackeros-builder dostanie SIGTERM/SIGKILL
+	// (albo gdy context wygasnie po timeout -> CommandContext wysyla
+	// SIGKILL do "unshare"), kernel wysyla SIGKILL do calej grupy procesow
+	// wewnatrz namespace -- gwarantuje ze zadne "osierocone" procesy budowy
+	// nie zostaja w tle, nawet jesli to byl hook ktory sam odpalil cos w tle.
+	cmd := exec.CommandContext(ctx, "unshare",
 		"--mount",      // prywatny namespace mount
 		"--pid",        // prywatny namespace PID
 		"--fork",       // wymagane przez --pid: unshare forkuje przed exec
@@ -77,7 +149,11 @@ func execInternal(rootfsDir string, extraEnv []string, stdin []byte, command str
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return &ExecTimeoutError{Command: command, Timeout: timeout}
+	}
+	if err != nil {
 		return fmt.Errorf("sandbox: exec %q w %s nie powiodl sie: %w", command, rootfsDir, err)
 	}
 	return nil
