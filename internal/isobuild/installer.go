@@ -47,7 +47,7 @@ var installerPackages = []string{
 // narzedzia pobrane w kroku "build cloud" sa tu ponownie uzywane z cache).
 func InjectInstaller(rootfsDir, workDir string) error {
 	// Toolchain: upewnij sie ze apt-get i dpkg-deb sa dostepne (sa zawsze,
-	// ale Manager.Env() daje nam sciezke z toolchain-bin/ na czele PATH
+	// ale Manager.Env() daje nam sciezke z toolchain/bin/ na czele PATH
 	// co jest potrzebne jesli debootstrap byl pobrany tymczasowo).
 	tc := toolchain.New(workDir)
 	tcEnv := tc.Env()
