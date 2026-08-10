@@ -4,25 +4,40 @@ import (
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/hk"
 )
 
-// DebOstreeConfigParams to dane potrzebne do wygenerowania deb-ostree.hk.
-// Pola odpowiadaja 1:1 polom wczytywanym przez deb-ostree z jego wlasnego
-// pliku konfiguracyjnego (cmd/types.h -> struct Config w repo deb-ostree).
-type DebOstreeConfigParams struct {
+// HammerConfigParams to dane potrzebne do wygenerowania /etc/hammer/oci.hk.
+//
+// Nazwy pol odpowiadaja kluczom odczytanym bezposrednio z binarki hammer
+// (analiza `strings`/`readelf` wydania oci-mode v0.6.0 -- hammer nie
+// publikuje osobnej dokumentacji schematu configu w chwili pisania tego
+// kodu): "refspec", "lists_paths", "sources_list", "sources_dir",
+// "keyring_dir", "require_gpg", "osname", "repo_path". Grupowanie w sekcje
+// ponizej jest odwzorowaniem analogicznym do /etc/deb-ostree/deb-ostree.hk
+// (ktory hammer zastepuje) -- jesli faktyczny parser hammer (podzbior
+// internal/hk, jak deb-ostree.hk mial swoj w C++) oczekuje innego
+// grupowania sekcji, dostosuj SectionBuilder ponizej; klucze same w sobie
+// sa zweryfikowane wprost z binarki.
+type HammerConfigParams struct {
 	SysrootPath    string
 	OstreeRepoPath string
 	OSName         string
-	OverlayWorkDir string
-	AptListsPath   string
+	ListsPath      string
+	SourcesList    string
+	SourcesDir     string
+	KeyringDir     string
+	RequireGPG     bool
 
-	// OriginRefspec to refspec obrazu OCI ktory deb-ostree powinien uznac za
-	// "origin" tego deploymentu, np. "deb-ostree-oci:ghcr.io/michal/hackeros:trixie".
-	// hackeros-builder wypelnia to automatycznie na podstawie obrazu ktory
-	// wlasnie zbudowal i wypchnal w komendzie "build cloud".
+	// OriginRefspec to refspec obrazu OCI ktory hammer powinien uznac za
+	// "origin" tego deploymentu. hackeros-builder wypelnia to automatycznie
+	// na podstawie obrazu ktory wlasnie zbudowal i wypchnal w komendzie
+	// "build cloud" -- format: "docker://<repository>:<tag>", zgodnie z
+	// prefiksem transportu widocznym w binarce hammer (docker://, oci:,
+	// containers-storage:), analogicznym do transportow uzywanych przez
+	// skopeo/podman i natywne wsparcie libostree dla kontenerow OCI.
 	OriginRefspec string
 }
 
-// GenerateDebOstreeConfig buduje HkConfig odpowiadajacy plikowi
-// /etc/deb-ostree/deb-ostree.hk, gotowy do zapisania przez hk.WriteFile.
+// GenerateHammerConfig buduje HkConfig odpowiadajacy plikowi
+// /etc/hammer/oci.hk, gotowy do zapisania przez hk.WriteFile.
 //
 // Struktura sekcji:
 //
@@ -35,15 +50,18 @@ type DebOstreeConfigParams struct {
 //	[system]
 //	-> osname => debian
 //
-//	[overlay]
-//	-> work_dir => /var/lib/deb-ostree/overlay-work
-//
 //	[apt]
-//	-> lists_path => /var/lib/deb-ostree/apt-cache
+//	-> lists_paths => /var/lib/hammer/lists
+//
+//	[sources]
+//	-> sources_list => /etc/hammer/sources-list.hk
+//	-> sources_dir  => /etc/hammer/sources-list.d
+//	-> keyring_dir  => /etc/hammer/trusted.gpg.d
+//	-> require_gpg  => true
 //
 //	[origin]
-//	-> refspec => deb-ostree-oci:ghcr.io/michal/hackeros:trixie
-func GenerateDebOstreeConfig(p DebOstreeConfigParams) *hk.HkConfig {
+//	-> refspec => docker://ghcr.io/michal/hackeros:trixie
+func GenerateHammerConfig(p HammerConfigParams) *hk.HkConfig {
 	b := hk.NewBuilder()
 
 	b.Section("sysroot").Set("path", hk.String(orDefault(p.SysrootPath, "/")))
@@ -53,11 +71,14 @@ func GenerateDebOstreeConfig(p DebOstreeConfigParams) *hk.HkConfig {
 
 	b.Section("system").Set("osname", hk.String(orDefault(p.OSName, "debian")))
 
-	b.Section("overlay").Set("work_dir",
-		hk.String(orDefault(p.OverlayWorkDir, "/var/lib/deb-ostree/overlay-work")))
+	b.Section("apt").Set("lists_paths",
+		hk.String(orDefault(p.ListsPath, "/var/lib/hammer/lists")))
 
-	b.Section("apt").Set("lists_path",
-		hk.String(orDefault(p.AptListsPath, "/var/lib/deb-ostree/apt-cache")))
+	sources := b.Section("sources")
+	sources.Set("sources_list", hk.String(orDefault(p.SourcesList, "/etc/hammer/sources-list.hk")))
+	sources.Set("sources_dir", hk.String(orDefault(p.SourcesDir, "/etc/hammer/sources-list.d")))
+	sources.Set("keyring_dir", hk.String(orDefault(p.KeyringDir, "/etc/hammer/trusted.gpg.d")))
+	sources.Set("require_gpg", hk.Bool(p.RequireGPG))
 
 	if p.OriginRefspec != "" {
 		b.Section("origin").Set("refspec", hk.String(p.OriginRefspec))
@@ -66,10 +87,10 @@ func GenerateDebOstreeConfig(p DebOstreeConfigParams) *hk.HkConfig {
 	return b.Build()
 }
 
-// WriteDebOstreeConfig generuje config i zapisuje go bezposrednio do destPath
-// (typowo "<rootfs>/etc/deb-ostree/deb-ostree.hk" podczas budowy obrazu).
-func WriteDebOstreeConfig(destPath string, p DebOstreeConfigParams) error {
-	cfg := GenerateDebOstreeConfig(p)
+// WriteHammerConfig generuje config i zapisuje go bezposrednio do destPath
+// (typowo "<rootfs>/etc/hammer/oci.hk" podczas budowy obrazu).
+func WriteHammerConfig(destPath string, p HammerConfigParams) error {
+	cfg := GenerateHammerConfig(p)
 	return hk.WriteFile(destPath, cfg)
 }
 
