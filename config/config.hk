@@ -36,18 +36,18 @@
 ! type: tryb pracy buildera.
 !
 !   (brak) / default / cybersecurity
-!       Pelny atomowy build: debootstrap -> OCI push -> deb-ostree.
+!       Pelny atomowy build: debootstrap -> OCI push -> hammer.
 !       To jest GLOWNY tryb hackeros-builder, aktywnie rozwijany.
 !
 !   normal / official
-!       Zwykla nakladka na live-build -- bez OCI, bez deb-ostree, bez atomowosci.
+!       Zwykla nakladka na live-build -- bez OCI, bez hammer, bez atomowosci.
 !       Builder deleguje caly build do "lb build". WYMAGA zainstalowanego
 !       live-build na hoscie (apt-get install live-build).
 !
 !   independent
 !       Alternatywa dla live-build dla projektow normal/official:
 !       uzywa wewnetrznego pipeline hackeros-builder (debootstrap + squashfs + iso)
-!       ale BEZ push OCI i BEZ deb-ostree. Nie wymaga live-build.
+!       ale BEZ push OCI i BEZ hammer. Nie wymaga live-build.
 !
 -> type => default
 
