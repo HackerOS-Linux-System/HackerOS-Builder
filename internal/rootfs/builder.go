@@ -326,6 +326,15 @@ func (b *Builder) applyExtraSources() error {
 // copyDirToRootfs kopiuje rekurencyjnie srcDir do korzenia rootfs, zachowujac
 // uprawnienia plikow (1:1 jak live-build). Uzywana dla wszystkich trzech
 // wariantow includes.chroot* (before_packages / legacy / after_packages).
+//
+// SEMANTYKA NADPISYWANIA (jak w live-build): pliki z includes.chroot* MAJA
+// nadpisywac to, co juz jest w rootfs -- w tym pliki/symlinki utworzone
+// przez pakiety zainstalowane wczesniej (np. adwaita-icon-theme tworzy
+// /usr/share/icons/Adwaita/cursors/arrow jako symlink, a projekt moze
+// chciec nadpisac go wlasnym kursorem przez includes.chroot_after_packages).
+// os.Symlink/os.OpenFile(O_CREATE) BEZ wczesniejszego usuniecia istniejacego
+// wpisu konczy sie bledem "file exists" -- stad removeExistingEntry ponizej,
+// wywolywane PRZED kazda proba utworzenia symlinku lub pliku.
 func (b *Builder) copyDirToRootfs(srcDir string) error {
 	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -342,6 +351,9 @@ func (b *Builder) copyDirToRootfs(srcDir string) error {
 		if info.IsDir() {
 			return os.MkdirAll(dest, info.Mode())
 		}
+		if err := removeExistingEntry(dest); err != nil {
+			return err
+		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(path)
 			if err != nil {
@@ -351,6 +363,37 @@ func (b *Builder) copyDirToRootfs(srcDir string) error {
 		}
 		return copyFile(path, dest, info.Mode())
 	})
+}
+
+// removeExistingEntry usuwa dest jesli istnieje jako plik regularny lub
+// symlink, zeby kolejne os.Symlink/os.OpenFile(O_CREATE) mogly bezpiecznie
+// utworzyc nowy wpis w jego miejsce (nadpisanie, nie blad "file exists").
+//
+// Jesli dest istnieje jako KATALOG, to jest to zwracane jako czytelny blad
+// konfiguracji (nie usuwamy cichcem calego poddrzewa katalogow -- zamiana
+// katalogu na plik/symlink przez includes.chroot to prawie zawsze pomylka
+// w projekcie, ktora powinna byc widoczna, a nie po cichu "naprawiona"
+// przez rekurencyjne skasowanie czegos, co moze zawierac wiele plikow).
+func removeExistingEntry(dest string) error {
+	fi, err := os.Lstat(dest)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("sprawdzanie istniejacego wpisu %s: %w", dest, err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf(
+			"%s jest juz katalogiem w rootfs, a includes.chroot probuje "+
+				"nadpisac go plikiem/symlinkiem -- to prawdopodobnie blad w "+
+				"strukturze projektu (sciezka zajeta przez pakiet lub inny "+
+				"wczesniejszy krok), sprawdz zawartosc includes.chroot* recznie",
+			dest)
+	}
+	if err := os.Remove(dest); err != nil {
+		return fmt.Errorf("usuwanie istniejacego wpisu %s przed nadpisaniem: %w", dest, err)
+	}
+	return nil
 }
 
 // runHooks wykonuje kazdy skrypt hooks wewnatrz izolowanego kontenera nspawn.
@@ -581,9 +624,21 @@ func (b *Builder) seedDebconf() error {
 
 // copyFile kopiuje plik src do dst, ustawiajac podane uprawnienia (mode)
 // i tworzac katalogi nadrzedne jesli potrzebne.
+//
+// Jesli dst juz istnieje jako symlink, jest USUWANY przed zapisem --
+// inaczej O_TRUNC podazylby za symlinkiem i obcial plik, na ktory ten
+// symlink wskazuje (mogloby to byc cos zupelnie niezwiazanego, np. plik
+// docelowy alternatywy systemowej), zamiast utworzyc nowy plik regularny
+// dokladnie w miejscu dst -- co jest oczekiwana semantyka nadpisania przy
+// kopiowaniu z includes.chroot*.
 func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
+	}
+	if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("usuwanie istniejacego symlinku %s przed nadpisaniem: %w", dst, err)
+		}
 	}
 	in, err := os.Open(src)
 	if err != nil {
