@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/rootfs"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
 )
 
@@ -40,30 +41,45 @@ func Build(p BuildParams) error {
 	}
 
 	if !p.SkipInstaller {
-		util.Infof("Krok 1/5: instalator GUI (Calamares)...")
+		util.Infof("Krok 1/6: instalator GUI (Calamares)...")
 		if err := InjectInstaller(p.RootfsDir, p.WorkDir); err != nil {
 			return fmt.Errorf("instalator GUI: %w", err)
 		}
 	} else {
-		util.Infof("Krok 1/5: instalator GUI pominiety (SkipInstaller)")
+		util.Infof("Krok 1/6: instalator GUI pominiety (SkipInstaller)")
 	}
 
-	util.Infof("Krok 2/5: tworzenie squashfs z rootfs...")
+	// Usuwamy apt/apt-get DOKLADNIE tutaj -- PO ewentualnym wstrzynkieciu
+	// Calamares (ktory jeszcze potrzebuje apt-get do zainstalowania siebie
+	// i swoich zaleznosci -- Xorg, openbox itd. -- w rootfs pociagnietym
+	// z registry, gdzie apt-get juz nie byl usuwany na etapie "build
+	// cloud", patrz komentarz w internal/rootfs/builder.go), ale PRZED
+	// zbudowaniem squashfs.img. Ten squashfs.img jest tym, co Calamares
+	// PozNIEJ kopiuje 1:1 na dysk uzytkownika -- czyli od tego miejsca w
+	// przeplywie budowy, "finalny dysk" uzytkownika jest juz gwarantowany
+	// jako wolny od apt/apt-get, przy zachowanej bazie dpkg (na ktorej
+	// nadal polega hammer).
+	util.Infof("Krok 2/6: usuwanie apt/apt-get (finalny dysk uzytkownika ma byc bez nich; baza dpkg pozostaje dla hammer)...")
+	if err := rootfs.RemoveAptTooling(p.RootfsDir); err != nil {
+		return fmt.Errorf("usuwanie apt/apt-get: %w", err)
+	}
+
+	util.Infof("Krok 3/6: tworzenie squashfs z rootfs...")
 	if err := buildSquashfs(p.RootfsDir, isoTree); err != nil {
 		return fmt.Errorf("squashfs: %w", err)
 	}
 
-	util.Infof("Krok 3/5: kopiowanie jadra i initrd...")
+	util.Infof("Krok 4/6: kopiowanie jadra i initrd...")
 	if err := copyKernelAndInitrd(p.RootfsDir, isoTree); err != nil {
 		return fmt.Errorf("kernel/initrd: %w", err)
 	}
 
-	util.Infof("Krok 4/5: generowanie konfiguracji GRUB (BIOS+UEFI)...")
+	util.Infof("Krok 5/6: generowanie konfiguracji GRUB (BIOS+UEFI)...")
 	if err := writeGrubConfig(isoTree, p.VolumeName); err != nil {
 		return fmt.Errorf("grub config: %w", err)
 	}
 
-	util.Infof("Krok 5/5: budowanie hybrydowego ISO (grub-mkrescue)...")
+	util.Infof("Krok 6/6: budowanie hybrydowego ISO (grub-mkrescue)...")
 	if err := runGrubMkrescue(isoTree, p.OutputISO, p.VolumeName); err != nil {
 		return fmt.Errorf("grub-mkrescue: %w", err)
 	}
