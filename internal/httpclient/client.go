@@ -9,7 +9,7 @@ import (
 
 // DefaultTimeout to maksymalny czas na CALE zadanie HTTP (polaczenie +
 // wyslanie + odebranie odpowiedzi) -- wystarczajacy dla zapytan API
-// (GitHub releases) i pobierania pojedynczych plikow (binarka deb-ostree).
+// (GitHub releases) i pobierania pojedynczych plikow (archiwum hammer oci-mode).
 const DefaultTimeout = 30 * time.Second
 
 // RegistryTimeout to dluzszy timeout na bezczynnosc polaczenia przy
@@ -20,7 +20,7 @@ const RegistryTimeout = 5 * time.Minute
 
 // New zwraca klienta HTTP z rozsadnym, ograniczonym timeoutem -- do uzycia
 // przy krotkich zadaniach (sprawdzanie najnowszej wersji, pobieranie
-// pojedynczego pliku binarnego typu deb-ostree).
+// pojedynczego pliku archiwum typu oci-mode.tar.gz hammer).
 func New() *http.Client {
 	return &http.Client{
 		Timeout: DefaultTimeout,
