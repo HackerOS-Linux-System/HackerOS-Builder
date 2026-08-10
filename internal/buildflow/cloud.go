@@ -62,7 +62,7 @@ type CloudOptions struct {
 type CloudResult struct {
 	Repository string // pelna sciezka repo w registry
 	Tag        string // tag wypchnietego obrazu
-	Refspec    string // "deb-ostree-oci:Repository:Tag" -- gotowe dla origin deb-ostree
+	Refspec    string // "docker://Repository:Tag" -- gotowe dla [origin] -> refspec w hammer (/etc/hammer/oci.hk)
 }
 
 // BuildCloud wykonuje pelny przeplyw "hackeros-builder build cloud":
@@ -70,7 +70,8 @@ type CloudResult struct {
 //  0. preflight.CheckCloud() -- weryfikuje debootstrap/chroot/mount/umount
 //  0. buildlock.Acquire(workDir) -- chroni przed wspolbieznym buildem w tym samym workDir
 //  1. parsuje config/config.hk i strukture live-build (liveparse)
-//  2. buduje rootfs (debootstrap + hooks + packages + deb-ostree + deb-ostree.hk)
+//  2. buduje rootfs (debootstrap + hooks + packages + hammer + /etc/hammer/oci.hk,
+//     apt/apt-get usuniete z finalnego obrazu -- baza dpkg pozostaje)
 //  3. pakuje rootfs do obrazu OCI i wypycha go do registry (ociimage)
 //
 // Po zakonczeniu obraz jest dostepny w registry -- to jest "wyslanie w swiat"
@@ -167,7 +168,7 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 	return &CloudResult{
 		Repository: repository,
 		Tag:        tag,
-		Refspec:    "deb-ostree-oci:" + refspec,
+		Refspec:    "docker://" + refspec,
 	}, nil
 }
 
