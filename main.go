@@ -253,7 +253,7 @@ func main() {
 		fmt.Println()
 		fmt.Println(util.Colorize(util.ColorGreen, "Obraz OCI wypchniety:") +
 			fmt.Sprintf(" %s:%s", result.Repository, result.Tag))
-		fmt.Printf("Origin refspec dla deb-ostree: %s\n", result.Refspec)
+		fmt.Printf("Origin refspec dla hammer: %s\n", result.Refspec)
 
 	case "iso":
 		err := buildflow.BuildIso(buildflow.IsoOptions{
