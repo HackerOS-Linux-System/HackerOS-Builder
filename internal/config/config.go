@@ -21,13 +21,13 @@ type ProjectType string
 
 const (
 	// ProjectTypeDefault / ProjectTypeCybersecurity / brak:
-	// Pelny atomowy build (debootstrap + OCI push + deb-ostree).
+	// Pelny atomowy build (debootstrap + OCI push + hammer).
 	// To jest glowny tryb hackeros-builder, aktywnie rozwijany.
 	ProjectTypeDefault       ProjectType = "default"
 	ProjectTypeCybersecurity ProjectType = "cybersecurity"
 
 	// ProjectTypeNormal / ProjectTypeOfficial:
-	// Zwykla nakladka na live-build -- bez deb-ostree, bez OCI, bez atomowosci.
+	// Zwykla nakladka na live-build -- bez hammer, bez OCI, bez atomowosci.
 	// Wymaga zainstalowanego live-build na hoscie.
 	// Builder deleguje caly build do "lb build" zamiast robic to samemu.
 	ProjectTypeNormal   ProjectType = "normal"
@@ -37,7 +37,7 @@ const (
 	// Alternatywa dla live-build dla projektow typu normal/official --
 	// nie atomowe, ale bez zewnetrznej zaleznosci od live-build.
 	// Uzywa wewnetrznego pipeline'u hackeros-builder (debootstrap + squashfs
-	// + iso) ale BEZ push OCI i BEZ deb-ostree.
+	// + iso) ale BEZ push OCI i BEZ hammer.
 	ProjectTypeIndependent ProjectType = "independent"
 )
 
@@ -97,7 +97,7 @@ type ProjectConfig struct {
 
 	// Type okresla tryb pracy buildera (patrz ProjectType*).
 	// Wartosc domyslna (brak lub "default" lub "cybersecurity"):
-	//   pelny atomowy build z OCI + deb-ostree.
+	//   pelny atomowy build z OCI + hammer.
 	Type ProjectType
 
 	// Installer okresla instalator dolaczany do obrazu ISO (patrz InstallerType*).
@@ -112,7 +112,7 @@ type ProjectConfig struct {
 }
 
 // IsAtomicBuild zwraca true jesli projekt ma byc budowany jako pelny
-// atomowy obraz OCI z deb-ostree (domyslne zachowanie). Zwraca false
+// atomowy obraz OCI z hammer (domyslne zachowanie). Zwraca false
 // dla typow normal/official/independent.
 func (p *ProjectConfig) IsAtomicBuild() bool {
 	switch p.Type {
