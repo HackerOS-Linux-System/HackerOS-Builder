@@ -40,7 +40,7 @@ type BuildParams struct {
 // BuildAndPush pakuje RootfsDir do jednowarstwowego obrazu OCI i wypycha go
 // do Repository:Tag. Zwraca pelny refspec wypchnietego obrazu
 // (np. "ghcr.io/michal/hackeros-debian:trixie") gotowy do wstawienia w
-// [origin] -> refspec configu deb-ostree.
+// [origin] -> refspec configu hammer (/etc/hammer/oci.hk).
 func BuildAndPush(p BuildParams) (string, error) {
 	util.Infof("Pakowanie rootfs do warstwy OCI...")
 	layerTarPath := filepath.Join(p.WorkDir, "layer.tar.gz")
@@ -95,7 +95,7 @@ func BuildAndPush(p BuildParams) (string, error) {
 
 // createLayerTarball pakuje cala zawartosc rootfsDir do pojedynczego pliku
 // tar.gz, zachowujac uprawnienia i symlinki -- kluczowe dla poprawnosci
-// systemowych binarek (setuid root, etc.) po stronie deb-ostree, ktore te
+// systemowych binarek (setuid root, etc.) po stronie hammer/libostree, ktore te
 // metadane odczytuje przy checkout z OSTree.
 func createLayerTarball(rootfsDir, destTarGz string) error {
 	out, err := os.Create(destTarGz)
