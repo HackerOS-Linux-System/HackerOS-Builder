@@ -28,7 +28,7 @@ type Builder struct {
 	RootfsDir string // katalog docelowy rootfs
 	WorkDir   string // katalog roboczy buildu (na toolchain/bin/ i inne temp)
 
-	// OriginRefspec to refspec obrazu OCI wpisywany do /etc/deb-ostree/deb-ostree.hk
+	// OriginRefspec to refspec obrazu OCI wpisywany do /etc/hammer/oci.hk
 	OriginRefspec string
 }
 
@@ -179,16 +179,31 @@ func (b *Builder) Build() error {
 		return fmt.Errorf("hooks: %w", err)
 	}
 
-	util.Infof("Krok 9/9: wstrzykiwanie deb-ostree + generowanie deb-ostree.hk...")
-	if err := b.injectDebOstree(); err != nil {
-		return fmt.Errorf("deb-ostree injection: %w", err)
+	util.Infof("Krok 9/9: wstrzykiwanie hammer + generowanie /etc/hammer/oci.hk...")
+	if err := b.injectHammer(); err != nil {
+		return fmt.Errorf("hammer injection: %w", err)
 	}
-	if err := b.installDebOstreeDeps(); err != nil {
-		return fmt.Errorf("deb-ostree biblioteki dynamiczne: %w", err)
+	if err := b.installHammerDeps(); err != nil {
+		return fmt.Errorf("hammer biblioteki dynamiczne: %w", err)
 	}
-	if err := b.generateDebOstreeConfig(); err != nil {
-		return fmt.Errorf("generowanie deb-ostree.hk: %w", err)
+	if err := b.generateHammerConfig(); err != nil {
+		return fmt.Errorf("generowanie /etc/hammer/oci.hk: %w", err)
 	}
+
+	// UWAGA: apt/apt-get NIE sa usuwane tutaj. Ten sam rootfs jest pakowany
+	// i wypychany jako obraz OCI ("build cloud"), a nastepnie -- w ramach
+	// "build iso" / "build all" -- SCIAGANY Z POWROTEM z registry i
+	// wzbogacany o graficzny instalator Calamares (ktory rowniez korzysta
+	// z apt-get, patrz internal/isobuild/installer.go), zanim trafi do
+	// finalnego squashfs.img na plycie ISO. Gdybysmy usuneli apt/apt-get
+	// juz tutaj, wstrzykiwanie Calamares w ISO przestaloby dzialac.
+	//
+	// Faktyczne usuniecie apt/apt-get z tego co trafia na "finalny dysk"
+	// uzytkownika nastepuje w internal/isobuild/builder.go -- PO
+	// wstrzynkieciu Calamares, ale PRZED zbudowaniem squashfs.img (czyli
+	// dokladnie w tresci ktora Calamares pozniej kopiuje 1:1 na dysk
+	// uzytkownika). Patrz rootfs.RemoveAptTooling (w tym pakiecie, ponizej)
+	// oraz jej wywolanie w internal/isobuild/builder.go.
 
 	util.Infof("Rootfs zbudowany: %s", b.RootfsDir)
 	return nil
@@ -381,57 +396,143 @@ func (b *Builder) runHooks() error {
 	return nil
 }
 
-// injectDebOstree sciaga najnowsza wersje deb-ostree z GitHub Releases
-// (lub wersje wskazana przez DEBOSTREE_VERSION jesli ustawiona -- przydatne
-// do pinowania konkretnej wersji / testow offline) i umieszcza w
-// rootfs/usr/bin/deb-ostree z uprawnieniami a+x.
-func (b *Builder) injectDebOstree() error {
-	version := os.Getenv("DEBOSTREE_VERSION")
+// injectHammer sciaga najnowsza wersje hammer z GitHub Releases (archiwum
+// oci-mode.tar.gz, tryb dedykowany systemom atomowym/immutable -- lub
+// wersje wskazana przez HAMMER_VERSION jesli ustawiona, przydatne do
+// pinowania konkretnej wersji / testow offline), rozpakowuje z niego
+// pojedyncza binarke "hammer" i umieszcza w rootfs/usr/bin/hammer z
+// uprawnieniami a+x.
+//
+// hackeros-builder jest CALKOWICIE NIEZALEZNY od deb-ostree -- jedynym
+// narzedziem zarzadzania pakietami/atomowoscia wstrzykiwanym do rootfs
+// jest hammer.
+func (b *Builder) injectHammer() error {
+	version := os.Getenv("HAMMER_VERSION")
 	if version == "" {
-		v, err := download.LatestDebOstreeVersion()
+		v, err := download.LatestHammerVersion()
 		if err != nil {
-			return fmt.Errorf("wykrywanie najnowszej wersji deb-ostree: %w", err)
+			return fmt.Errorf("wykrywanie najnowszej wersji hammer: %w", err)
 		}
 		version = v
 	}
 
-	destPath := filepath.Join(b.RootfsDir, "usr", "bin", "deb-ostree")
-	util.Infof("  deb-ostree %s -> %s", version, destPath)
+	destPath := filepath.Join(b.RootfsDir, "usr", "bin", "hammer")
+	util.Infof("  hammer %s (oci-mode) -> %s", version, destPath)
 
-	if err := download.DownloadDebOstree(version, destPath); err != nil {
+	if err := download.DownloadHammer(version, destPath); err != nil {
 		return err
 	}
 	return nil
 }
 
-// generateDebOstreeConfig wywoluje hkgen, by wygenerowac kompletny plik
-// /etc/deb-ostree/deb-ostree.hk wewnatrz rootfs, gotowy do uzycia przez
-// deb-ostree natychmiast po pierwszym boocie zbudowanego systemu.
+// generateHammerConfig wywoluje hkgen, by wygenerowac kompletny plik
+// /etc/hammer/oci.hk wewnatrz rootfs, gotowy do uzycia przez hammer
+// natychmiast po pierwszym boocie zbudowanego systemu.
 //
-// Wartosci sciezek (sysroot/ostree/overlay/apt) sa pozostawione jako
-// domyslne deb-ostree (przekazujemy puste stringi -> hkgen wypelni je
-// wartosciami domyslnymi zgodnymi z cmd/types.h w repo deb-ostree).
+// Wartosci sciezek (sysroot/ostree/apt/sources) sa pozostawione jako
+// domyslne hammer (przekazujemy puste stringi -> hkgen wypelni je
+// wartosciami domyslnymi odwzorowanymi ze sciezek widocznych w binarce
+// hammer -- patrz internal/hkgen/hammer_config.go).
 // OriginRefspec jest wypelniany przez b.OriginRefspec, jesli zostal ustawiony
-// przez wolajacego (typowo PO komendzie "build cloud", patrz cmd/build_cloud.go).
-func (b *Builder) generateDebOstreeConfig() error {
-	destPath := filepath.Join(b.RootfsDir, "etc", "deb-ostree", "deb-ostree.hk")
+// przez wolajacego (typowo PO komendzie "build cloud", patrz internal/buildflow/cloud.go).
+func (b *Builder) generateHammerConfig() error {
+	destPath := filepath.Join(b.RootfsDir, "etc", "hammer", "oci.hk")
 
-	// Katalog /etc/deb-ostree/ moze nie istniec w bazowym rootfs debootstrap --
-	// tworzy go tylko pakiet deb-ostree, a my wstrzykujemy binark deb-ostree
+	// Katalog /etc/hammer/ moze nie istniec w bazowym rootfs debootstrap --
+	// tworzy go tylko pakiet hammer, a my wstrzykujemy binarke hammer
 	// recznie (nie przez apt), wiec musimy sami zadbac o katalog.
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return fmt.Errorf("tworzenie katalogu %s: %w", filepath.Dir(destPath), err)
 	}
 
-	params := hkgen.DebOstreeConfigParams{
+	params := hkgen.HammerConfigParams{
 		OSName:        "debian",
+		RequireGPG:    true,
 		OriginRefspec: b.OriginRefspec,
 	}
 
-	if err := hkgen.WriteDebOstreeConfig(destPath, params); err != nil {
+	if err := hkgen.WriteHammerConfig(destPath, params); err != nil {
 		return fmt.Errorf("zapis %s: %w", destPath, err)
 	}
 	util.Infof("  wygenerowano: %s", destPath)
+	return nil
+}
+
+// aptBinariesToRemove to lista plikow dostarczanych przez pakiet "apt"
+// (oraz jego pomocnicze narzedzia transportowe w /usr/lib/apt) ktore
+// hackeros-builder usuwa z FINALNEGO rootfs -- zbudowany system NIE MA
+// miec dzialajacego apt/apt-get, poniewaz zarzadzanie pakietami przejmuje
+// w calosci hammer (ktory czyta baze dpkg bezposrednio, patrz
+// aptDatabasePathsToKeep ponizej).
+//
+// WAZNE -- to, co jest USUWANE, to tylko binarki-frontend (apt, apt-get,
+// apt-cache, apt-config, apt-mark, apt-cdrom, apt-key jesli obecny) oraz
+// katalog /usr/lib/apt/ (metody pobierania, solver zaleznosci) -- NIE
+// dpkg i NIE baza dpkg (/var/lib/dpkg/*), ktora zostaje nietknieta, bo to
+// wlasnie z niej hammer odczytuje liste zainstalowanych pakietow
+// ("hammer _import" czyta wprost /var/lib/dpkg/status).
+var aptBinariesToRemove = []string{
+	"usr/bin/apt",
+	"usr/bin/apt-get",
+	"usr/bin/apt-cache",
+	"usr/bin/apt-config",
+	"usr/bin/apt-cdrom",
+	"usr/bin/apt-mark",
+	"usr/bin/apt-key",
+}
+
+// aptDirsToRemove to katalogi calego drzewa /usr/lib/apt (metody transportu
+// http/https/copy/gpgv, solver zaleznosci itp.) -- nie sa to pojedyncze
+// pliki tylko caly podkatalog pakietu apt, wiec usuwamy go rekurencyjnie.
+var aptDirsToRemove = []string{
+	"usr/lib/apt",
+}
+
+// RemoveAptTooling usuwa z rootfsDir binarki apt/apt-get (i pomocnicze
+// narzedzia transportowe w /usr/lib/apt), zostawiajac NIETKNIETA baze
+// dpkg (/var/lib/dpkg/*) oraz sam dpkg -- hammer polega bezposrednio na
+// tej bazie do odczytu listy zainstalowanych pakietow, wiec jej usuniecie
+// zlamaloby hammer, a usuniecie samego dpkg zlamaloby wewnetrzne
+// wywolania hammer do dpkg-query/dpkg-divert/dpkg-statoverride
+// wykorzystywane przez tryb kompatybilnosci "polecenie dpkg/apt".
+//
+// Eksportowana (nie metoda Buildera) bo jest wolana z dwoch miejsc:
+//   - internal/isobuild/builder.go: PO wstrzynkieciu Calamares, PRZED
+//     zbudowaniem squashfs.img -- to jest sciezka realizujaca dokladnie to
+//     czego oczekuje uzytkownik: "jak zainstaluje juz finalna wersje na
+//     finalnym dysku, ma byc bez apt/apt-get" -- squashfs.img jest 1:1
+//     kopiowany przez Calamares na dysk, wiec usuniecie apt tutaj = brak
+//     apt na finalnym zainstalowanym dysku.
+//   - opcjonalnie recznie, dla scenariusza bezposredniego wdrozenia obrazu
+//     OCI przez "hammer oci deploy" bez ISO/Calamares (patrz komentarz w
+//     Builder.Build() powyzej dla wyjasnienia dlaczego NIE jest to
+//     wolane automatycznie w przeplywie "build cloud").
+func RemoveAptTooling(rootfsDir string) error {
+	removed := 0
+	for _, rel := range aptBinariesToRemove {
+		path := filepath.Join(rootfsDir, rel)
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("usuwanie %s: %w", rel, err)
+		}
+		removed++
+	}
+	for _, rel := range aptDirsToRemove {
+		path := filepath.Join(rootfsDir, rel)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("sprawdzanie %s: %w", rel, err)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("usuwanie katalogu %s: %w", rel, err)
+		}
+		removed++
+	}
+	util.Infof("  usunieto %d element(ow) apt/apt-get -- baza dpkg (/var/lib/dpkg) pozostawiona nietknieta dla hammer", removed)
 	return nil
 }
 
