@@ -2,7 +2,7 @@ package hk
 
 // Builder to pomocnicze, fluent API do programowego tworzenia HkConfig --
 // uzywane przez hackeros-builder do wygenerowania gotowego pliku
-// deb-ostree.hk bez recznego sklejania stringow.
+// /etc/hammer/oci.hk bez recznego sklejania stringow.
 //
 // Przyklad uzycia:
 //
