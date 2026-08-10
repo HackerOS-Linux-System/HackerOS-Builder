@@ -90,6 +90,26 @@ func Parse(root string) (*Project, error) {
 //
 // Format pliku .list.chroot (jak w live-build): jedna nazwa pakietu na
 // linie, '#' zaczyna komentarz, puste linie ignorowane.
+//
+// WYKLUCZENIA (konwencja live-build): linia zaczynajaca sie od '-' (np.
+// "-firefox-esr") NIE jest nazwa pakietu do zainstalowania -- to znacznik
+// "ten pakiet NIE ma trafic na finalna liste, nawet jesli zostal dodany
+// przez inny plik .list.chroot". Sluzy do wylaczania pakietow dodanych
+// przez wspoldzielone/dziedziczone listy (np. helpers/cybersecurity ma
+// package-lists z "firefox-esr", a config/package-lists/remove.list.chroot
+// nadpisuje to wpisem "-firefox-esr"). Live-build filtruje takie wpisy
+// PRZED wywolaniem apt-get -- apt-get NIGDY nie widzi surowego "-nazwa"
+// jako argumentu (potraktowalby to jako nieznana opcje wiersza polecen i
+// zakonczylby sie bledem, np. "Command line option 'i' [from -firefox-esr]
+// is not understood").
+//
+// Implementacja: dwuprzebiegowa. Najpierw zbieramy WSZYSTKIE wpisy ze
+// wszystkich plikow (pozytywne nazwy ORAZ wykluczenia z prefiksem '-'),
+// zachowujac kolejnosc napotkania dla nazw pozytywnych. Na koniec z listy
+// pozytywnych nazw usuwamy kazda, ktora pojawila sie w ktorymkolwiek pliku
+// jako wykluczenie -- niezaleznie od tego, czy wykluczenie wystapilo w tym
+// samym pliku, wczesniejszym czy pozniejszym (semantyka zbioru, nie
+// kolejnosci wykonania jak w apt-get install/remove w jednym poleceniu).
 func (p *Project) parsePackageLists(configDir string) error {
 	dir := filepath.Join(configDir, "package-lists")
 	entries, err := os.ReadDir(dir)
@@ -101,6 +121,7 @@ func (p *Project) parsePackageLists(configDir string) error {
 	}
 
 	seen := make(map[string]bool)
+	excluded := make(map[string]bool)
 	var packages []string
 
 	for _, e := range entries {
@@ -113,11 +134,30 @@ func (p *Project) parsePackageLists(configDir string) error {
 			return fmt.Errorf("blad parsowania %s: %w", path, err)
 		}
 		for _, n := range names {
+			if strings.HasPrefix(n, "-") {
+				excludeName := strings.TrimPrefix(n, "-")
+				if excludeName != "" {
+					excluded[excludeName] = true
+				}
+				continue
+			}
 			if !seen[n] {
 				seen[n] = true
 				packages = append(packages, n)
 			}
 		}
+	}
+
+	// Usuwamy z finalnej listy wszystko, co zostalo oznaczone jako
+	// wykluczone w KTORYMKOLWIEK pliku -- patrz komentarz funkcji.
+	if len(excluded) > 0 {
+		filtered := packages[:0]
+		for _, n := range packages {
+			if !excluded[n] {
+				filtered = append(filtered, n)
+			}
+		}
+		packages = filtered
 	}
 
 	sort.Strings(packages)
