@@ -33,7 +33,7 @@ type IsoOptions struct {
 //
 //  0. preflight.CheckIso() -- weryfikuje mksquashfs/grub-mkrescue/xorriso
 //  1. sciaga obraz OCI z registry (ociimage.PullAndUnpack)
-//  2. aktualizuje /etc/deb-ostree/deb-ostree.hk wewnatrz rozpakowanego
+//  2. aktualizuje /etc/hammer/oci.hk wewnatrz rozpakowanego
 //     rootfs, wpisujac poprawny [origin] -> refspec
 //  3. buduje hybrydowe ISO (BIOS+UEFI) z tego rootfs przez isobuild
 //
@@ -75,15 +75,16 @@ func BuildIso(opts IsoOptions) error {
 		return fmt.Errorf("sciaganie obrazu z registry: %w", err)
 	}
 
-	origin := fmt.Sprintf("deb-ostree-oci:%s:%s", repository, tag)
-	debOstreeHkPath := filepath.Join(rootfsDir, "etc", "deb-ostree", "deb-ostree.hk")
+	origin := fmt.Sprintf("docker://%s:%s", repository, tag)
+	hammerOciHkPath := filepath.Join(rootfsDir, "etc", "hammer", "oci.hk")
 
-	util.Infof("Aktualizacja [origin] w %s -> %s", debOstreeHkPath, origin)
-	if err := hkgen.WriteDebOstreeConfig(debOstreeHkPath, hkgen.DebOstreeConfigParams{
+	util.Infof("Aktualizacja [origin] w %s -> %s", hammerOciHkPath, origin)
+	if err := hkgen.WriteHammerConfig(hammerOciHkPath, hkgen.HammerConfigParams{
 		OSName:        "debian",
+		RequireGPG:    true,
 		OriginRefspec: origin,
 	}); err != nil {
-		return fmt.Errorf("aktualizacja deb-ostree.hk: %w", err)
+		return fmt.Errorf("aktualizacja /etc/hammer/oci.hk: %w", err)
 	}
 
 	volumeName := "HACKEROS"
