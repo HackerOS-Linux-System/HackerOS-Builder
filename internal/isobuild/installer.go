@@ -265,15 +265,15 @@ timeout: "10"
 const calamaresUmountConf = `---
 `
 
-// calamaresShellprocessConf zaszywa wpis [origin] deb-ostree w docelowym
+// calamaresShellprocessConf zaszywa wpis [origin] hammer w docelowym
 // systemie po skopiowaniu plikow (squashfs juz zawiera poprawny
-// /etc/deb-ostree/deb-ostree.hk wygenerowany przez "build iso" -- ten krok
+// /etc/hammer/oci.hk wygenerowany przez "build iso" -- ten krok
 // jest tylko siatka bezpieczenstwa, no-op gdy plik juz istnieje).
 const calamaresShellprocessConf = `---
 dontChroot: false
 timeout: 30
 script:
-    - command: "mkdir -p /etc/deb-ostree"
+    - command: "mkdir -p /etc/hammer"
 `
 
 const calamaresBrandingDesc = `---
