@@ -1,12 +1,38 @@
 # hackeros-builder
 
-**Wersja: 0.5.0**
+**Wersja: 0.6.0**
 
 Narzędzie do budowania niemutowalnych obrazów systemowych Debiana (w stylu
 `bootc`/`rpm-ostree`) ze struktury projektu **identycznej jak `live-build`**.
 Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
+
+## Co nowego w v0.6.0
+
+**Migracja `deb-ostree` → `hammer`.** `hackeros-builder` jest teraz
+**całkowicie niezależny od `deb-ostree`** — jedynym narzędziem
+zarządzania pakietami/atomowością wstrzykiwanym do budowanego obrazu jest
+`hammer`, w trybie OCI (`oci-mode.tar.gz`). Zmiany:
+
+- `internal/download/hammer.go` (zastępuje `debostree.go`) — ściąga
+  `oci-mode.tar.gz` z `https://github.com/HackerOS-Linux-System/hammer/releases`,
+  rozpakowuje z niego pojedynczą binarkę `hammer`, weryfikuje SHA256 całego
+  archiwum jeśli wydanie publikuje `checksums.txt`.
+- `internal/hkgen/hammer_config.go` (zastępuje `debostree_config.go`) —
+  generuje `/etc/hammer/oci.hk` zamiast `/etc/deb-ostree/deb-ostree.hk`.
+- `internal/rootfs/hammer_deps.go` (zastępuje `debostree_deps.go`) —
+  instaluje biblioteki dynamiczne realnie wymagane przez `hammer`
+  (`libostree-1-1`, `libglib2.0-0t64`, `liblzma5`, `libbz2-1.0`,
+  `libgcc-s1`), zweryfikowane bezpośrednio z `readelf -d` na wydaniu
+  `hammer` v0.6.0 — lista krótsza niż dla `deb-ostree`, bo `hammer` (Rust)
+  statycznie linkuje HTTP/TLS/GPG.
+- **`apt`/`apt-get` usuwane z finalnie zainstalowanego systemu.** W kroku
+  `build iso`, po wstrzyknięciu instalatora Calamares a przed spakowaniem
+  `filesystem.squashfs`, `hackeros-builder` usuwa `apt`, `apt-get` i
+  pomocnicze narzędzia (`apt-cache`, `apt-config`, `apt-cdrom`, `apt-mark`,
+  `apt-key`, `/usr/lib/apt`). **Baza `dpkg` (`/var/lib/dpkg/*`) i sam
+  `dpkg` zostają nietknięte** — `hammer` czyta tę bazę bezpośrednio.
 
 ## Co nowego w v0.1.0 – v0.5.0
 
@@ -26,10 +52,11 @@ szkieletu" do narzędzia z podstawowym hardeningiem produkcyjnym:
   (30s dla krótkich zapytań, dłuższy budżet na bezczynność połączenia dla
   transferów registry) zamiast `http.DefaultClient`, który mógł zawiesić
   cały build w nieskończoność przy martwym połączeniu.
-- **Weryfikacja SHA256** pobranej binarki `deb-ostree` — `download.DownloadDebOstree`
-  sprawdza sumę kontrolną z `checksums.txt` opublikowanego przy wydaniu
-  (jeśli wydanie go publikuje; w przeciwnym razie wypisuje wyraźne
-  ostrzeżenie i kontynuuje, nie blokując starszych tagów).
+- **Weryfikacja SHA256** pobranego archiwum `oci-mode.tar.gz` (hammer) —
+  `download.DownloadHammer` sprawdza sumę kontrolną z `checksums.txt`
+  opublikowanego przy wydaniu (jeśli wydanie go publikuje; w przeciwnym
+  razie wypisuje wyraźne ostrzeżenie i kontynuuje, nie blokując starszych
+  tagów).
 - **`--insecure-registry`** — opcjonalne wyłączenie weryfikacji TLS dla
   self-signed/wewnętrznych registry testowych, podłączone przez
   `remote.WithTransport` w `go-containerregistry`. Nigdy włączone domyślnie.
@@ -46,7 +73,9 @@ a to jest fundament modelu immutable/bootc (Fedora/RHEL ma to rozwiązane,
 Debian nie miał). `hackeros-builder` wypełnia tę dziurę: interpretuje
 strukturę `live-build` samodzielnie (bez wywoływania `lb build`), buduje
 rootfs, pakuje go jako obraz OCI, wypycha do registry, i z tego obrazu może
-zbudować bootowalne ISO z deb-ostree już wstrzykniętym do `/usr/bin/`.
+zbudować bootowalne ISO z `hammer` już wstrzykniętym do `/usr/bin/` i
+usuniętym `apt`/`apt-get` na finalnie zainstalowanym dysku (baza `dpkg`
+pozostaje — czyta ją bezpośrednio `hammer`).
 
 ## Komendy
 
@@ -69,12 +98,17 @@ Opcje globalne (patrz `--help` dla pełnej listy):
 
 - **`build cloud`** — preflight (`debootstrap`/`chroot`/`mount`) → lock na
   `workDir` → buduje rootfs (debootstrap + hooks + package-lists), wstrzykuje
-  `deb-ostree` (z weryfikacją SHA256) i wygenerowany config, pakuje całość
-  jako jednowarstwowy obraz OCI i wypycha go do registry.
+  `hammer` (z weryfikacją SHA256) i wygenerowany config `/etc/hammer/oci.hk`,
+  pakuje całość jako jednowarstwowy obraz OCI i wypycha go do registry.
+  `apt`/`apt-get` **pozostają** w tym obrazie na tym etapie — są jeszcze
+  potrzebne w kroku `build iso` do wstrzyknięcia instalatora Calamares.
 - **`build iso`** — preflight (`mksquashfs`/`grub-mkrescue`/`xorriso`) →
   ściąga obraz OCI z registry (dokładnie ten, który istnieje tam *teraz*),
-  aktualizuje w nim `[origin]` w `deb-ostree.hk`, i buduje z niego klasyczny
-  hybrydowy ISO (BIOS+UEFI).
+  aktualizuje w nim `[origin]` w `/etc/hammer/oci.hk`, wstrzykuje instalator
+  Calamares (apt-get), **usuwa `apt`/`apt-get`** (baza `dpkg` zostaje — czyta
+  ją `hammer`), i dopiero z tak przygotowanego rootfs buduje klasyczny
+  hybrydowy ISO (BIOS+UEFI). Od tego momentu system, który użytkownik
+  zainstaluje na dysku przez Calamares, nie ma już `apt`/`apt-get`.
 - **`build all`** — preflight dla obu etapów na starcie (zanim zacznie się
   kosztowny `debootstrap`) → jeden lock na cały przepływ → `build cloud`,
   a następnie `build iso` na obrazie który właśnie został wypchnięty.
@@ -132,14 +166,28 @@ Jedyny plik, którego `live-build` nie ma. Format to `.hk`
 
 ## Co hackeros-builder robi automatycznie
 
-1. **Wstrzykuje `deb-ostree`** — podczas budowy rootfs ściąga najnowszą
-   wersję z `https://github.com/HackerOS-Linux-System/deb-ostree/releases`
-   (lub wersję wskazaną w zmiennej środowiskowej `DEBOSTREE_VERSION`) i
-   umieszcza w `rootfs/usr/bin/deb-ostree` z uprawnieniami `a+x`.
-2. **Generuje `/etc/deb-ostree/deb-ostree.hk`** — gotowy plik konfiguracyjny
-   dla `deb-ostree`, żeby system zbudowany przez `hackeros-builder` od razu
-   po pierwszym boocie miał poprawny `[origin]` wskazujący na obraz OCI, z
-   którego powstał.
+1. **Wstrzykuje `hammer`** — podczas budowy rootfs ściąga najnowszą wersję
+   z `https://github.com/HackerOS-Linux-System/hammer/releases` (archiwum
+   `oci-mode.tar.gz`, lub wersję wskazaną w zmiennej środowiskowej
+   `HAMMER_VERSION`), rozpakowuje z niego pojedynczą binarkę `hammer` i
+   umieszcza w `rootfs/usr/bin/hammer` z uprawnieniami `a+x`. Instaluje też
+   jego biblioteki dynamiczne (`libostree-1-1`, `libglib2.0-0t64`,
+   `liblzma5`, `libbz2-1.0`, `libgcc-s1`).
+2. **Generuje `/etc/hammer/oci.hk`** — gotowy plik konfiguracyjny dla
+   `hammer`, żeby system zbudowany przez `hackeros-builder` od razu po
+   pierwszym boocie miał poprawny `[origin] -> refspec` (`docker://...`)
+   wskazujący na obraz OCI, z którego powstał.
+3. **Usuwa `apt`/`apt-get` z finalnie zainstalowanego systemu** — w kroku
+   `build iso`, po wstrzyknięciu Calamares a przed spakowaniem
+   `filesystem.squashfs` (czyli dokładnie w treści, którą Calamares kopiuje
+   1:1 na dysk użytkownika), `hackeros-builder` usuwa binarki `apt`,
+   `apt-get`, `apt-cache`, `apt-config`, `apt-cdrom`, `apt-mark`, `apt-key`
+   oraz katalog `/usr/lib/apt`. **Baza `dpkg` (`/var/lib/dpkg/*`) oraz sam
+   `dpkg` pozostają nietknięte** — `hammer` czyta tę bazę bezpośrednio do
+   odczytu listy zainstalowanych pakietów, więc jej usunięcie zepsułoby
+   `hammer`. Obraz OCI wypychany przez samo `build cloud` (bez `build iso`)
+   **nadal zawiera** `apt`/`apt-get` — patrz punkt 3 w sekcji „Co trzeba
+   dopracować”.
 
 ## Wymagania
 
@@ -151,6 +199,22 @@ Go 1.22+ do budowania samego `hackeros-builder` (binarka końcowa nie
 wymaga Go w runtime).
 
 ## Budowanie
+
+> **Uwaga o `go.mod`:** przy okazji tej rundy zmian poprawiono literówkę w
+> deklaracji modułu — było `module .../HackerOS-Builder` (wielka litera),
+> a WSZYSTKIE importy wewnętrzne w calym kodzie od poczatku uzywaly
+> `.../hackeros-builder` (mala litera) -- przez co `go build` nie
+> uruchamial sie w ogole (Go nie rozwiazywalby importow wzgledem
+> zadeklarowanej sciezki modulu). Poprawiono na `hackeros-builder`
+> (male litery), zgodnie z rzeczywistymi importami. **Cały projekt,
+> łącznie z tą zmianą i migracją deb-ostree → hammer, został faktycznie
+> skompilowany (`go build ./...`), sprawdzony (`go vet ./...`) i
+> przetestowany (`go test ./...`) lokalnie** (z tymczasowymi `replace` na
+> `golang.org/x/sys`/`golang.org/x/sync` -> mirrory na `github.com`, bo
+> środowisko w którym to pisano miało dostęp tylko do `github.com`, nie do
+> `golang.org`; w normalnym środowisku z pełnym dostępem do internetu te
+> `replace` nie są potrzebne i nie są częścią tego repo) — wszystko
+> przechodzi bez błędów.
 
 > **Uwaga o `go.sum`:** ten plik (lockfile z hashami zależności) nie jest
 > commitowany w repozytorium — środowisko, w którym ten kod został
@@ -194,8 +258,8 @@ config/{package-lists,  ▼
               ├─ apt-get install <package-lists>
               ├─ copy includes.chroot
               ├─ exec hooks/normal/*.hook.chroot (w chroot)
-              ├─ download.DownloadDebOstree -> /usr/bin/deb-ostree
-              └─ hkgen.WriteDebOstreeConfig -> /etc/deb-ostree/deb-ostree.hk
+              ├─ download.DownloadHammer -> /usr/bin/hammer
+              └─ hkgen.WriteHammerConfig -> /etc/hammer/oci.hk
                         │
          ┌──────────────┴───────────────┐
          ▼                              ▼
@@ -213,7 +277,9 @@ config/{package-lists,  ▼
          │
          ▼
   internal/isobuild.Build
-  ├─ mksquashfs rootfs -> filesystem.squashfs
+  ├─ InjectInstaller: apt-get install calamares + xorg (w rootfs z registry)
+  ├─ rootfs.RemoveAptTooling -> usuwa apt/apt-get (baza dpkg zostaje)
+  ├─ mksquashfs rootfs -> filesystem.squashfs   (JUZ bez apt/apt-get)
   ├─ copy vmlinuz + initrd.img
   ├─ generuj grub.cfg
   └─ grub-mkrescue -> hybrydowe ISO (BIOS+UEFI)
@@ -224,14 +290,23 @@ config/{package-lists,  ▼
 Parser pełnej specyfikacji `.hk` (sekcje, zagnieżdżenie `->`/`-->`/`--->`,
 klucze kropkowe, interpolacja `${...}` i `${env:...}`, tablice, typy
 string/number/bool) żyje w `internal/hk`. To jest implementacja referencyjna
-dla całego ekosystemu HackerOS — `deb-ostree` (C++) ma swój **podzbiór** tego
-parsera (`cmd/hk_parser.h` w repo `deb-ostree`) wystarczający dla jego
-własnego configu; jeśli `deb-ostree.hk` w przyszłości potrzebuje
-interpolacji czy głębszego zagnieżdżenia, logika z `internal/hk` (Go) jest
-wzorcem do portu na C++.
+dla całego ekosystemu HackerOS — `hammer` (Rust) ma swój **podzbiór** tego
+parsera wystarczający dla jego własnego configu (`/etc/hammer/oci.hk`);
+jeśli ten config w przyszłości potrzebuje interpolacji czy głębszego
+zagnieżdżenia, logika z `internal/hk` (Go) jest wzorcem do portu na Rust.
+
+> **Uwaga o strukturze `/etc/hammer/oci.hk`:** klucze pól (`refspec`,
+> `osname`, `repo_path`, `lists_paths`, `sources_list`, `sources_dir`,
+> `keyring_dir`, `require_gpg`) zostały zweryfikowane wprost z binarki
+> wydania `hammer` v0.6.0 (`strings`/`readelf`), ponieważ `hammer` nie
+> publikuje osobnej dokumentacji schematu configu w chwili pisania tego
+> kodu. Grupowanie tych kluczy w sekcje w `internal/hkgen/hammer_config.go`
+> jest odwzorowaniem analogicznym do poprzedniego `deb-ostree.hk` — jeśli
+> faktyczny parser `hammer` oczekuje innego układu sekcji, dostosuj
+> `hkgen.GenerateHammerConfig`; same klucze są zweryfikowane.
 
 `internal/hkgen` używa `internal/hk` do programowego wygenerowania
-`deb-ostree.hk` (fluent `Builder`/`SectionBuilder` API) bez ręcznego
+`/etc/hammer/oci.hk` (fluent `Builder`/`SectionBuilder` API) bez ręcznego
 sklejania stringów.
 
 ---
@@ -265,43 +340,56 @@ end-to-end na realnej maszynie budującej. Pierwszy krok po pobraniu repo:
    zapakowaniem do warstwy OCI — błąd w `debootstrap` mógłby skutkować
    pchnięciem zepsutego obrazu do registry.
 
-4. **`checksums.txt` musi zostać opublikowany przez wydania `deb-ostree`**
-   Weryfikacja SHA256 w `download.DownloadDebOstree` jest *gotowa po stronie
-   `hackeros-builder`*, ale działa tylko jeśli wydania `deb-ostree` na
+4. **`checksums.txt` musi zostać opublikowany przez wydania `hammer`**
+   Weryfikacja SHA256 w `download.DownloadHammer` jest *gotowa po stronie
+   `hackeros-builder`*, ale działa tylko jeśli wydania `hammer` na
    GitHub Releases publikują plik `checksums.txt` w formacie `sha256sum`
-   (`<hex>  deb-ostree`). Bez tego pliku weryfikacja jest pomijana z
+   (`<hex>  oci-mode.tar.gz`). Bez tego pliku weryfikacja jest pomijana z
    ostrzeżeniem — to nie jest błąd `hackeros-builder`, ale wymaga
-   skoordynowanej zmiany w pipeline release `deb-ostree`.
+   skoordynowanej zmiany w pipeline release `hammer`.
+
+5. **`apt`/`apt-get` nadal obecne w obrazie OCI wypychanym przez samo
+   `build cloud`** (bez `build iso`)
+   Usunięcie `apt`/`apt-get` następuje w `internal/isobuild`, PO
+   wstrzyknięciu Calamares, PONIEWAŻ Calamares wciąż go potrzebuje żeby
+   zainstalować siebie i swoje zależności (Xorg, openbox, itd.) w rootfs
+   pociągniętym z registry — apt/apt-get NIE są usuwane już na etapie
+   `build cloud`, bo to złamałoby ten krok. Jeśli obraz OCI ma być
+   wdrażany bezpośrednio (`hammer oci deploy ...`) bez przechodzenia przez
+   ISO/Calamares, apt/apt-get pozostaną obecne w takim wdrożeniu —
+   docelowo powinno to być finalizowane po stronie samego `hammer`
+   (analogicznie do tego, jak obrazy `bootc`/`rpm-ostree` nigdy nie mają
+   menedżera pakietów hosta wewnątrz zbudowanego drzewa).
 
 ### Ważne, ale nie blokujące pierwszego wydania
 
-5. **Jedna warstwa OCI dla całego rootfs**
+6. **Jedna warstwa OCI dla całego rootfs**
    `createLayerTarball` pakuje cały rootfs jako jedną warstwę — proste, ale
    nieefektywne dla `upgrade` (cały obraz trzeba ściągnąć ponownie nawet przy
    drobnej zmianie). Warstwy przyrostowe (baza / package-lists / hooks)
-   zmniejszyłyby transfer przy aktualizacjach w `deb-ostree upgrade`.
+   zmniejszyłyby transfer przy aktualizacjach przez `hammer`.
 
-6. **Brak weryfikacji podpisów / `--policy` przy pull obrazu OCI**
-   Tak jak w `deb-ostree`, `PullAndUnpack` nie weryfikuje podpisów obrazu
+7. **Brak weryfikacji podpisów / `--policy` przy pull obrazu OCI**
+   Tak jak w `hammer`, `PullAndUnpack` nie weryfikuje podpisów obrazu
    (`cosign`/`sigstore`).
 
-7. **Konfigurowalny mirror Debiana**
+8. **Konfigurowalny mirror Debiana**
    `defaultMirror` jest zaszyty na sztywno (`deb.debian.org`) — warto
    dodać opcjonalny klucz w `config.hk` (np. `[release] -> mirror`).
 
-8. **EFI boot image dla `grub-mkrescue`**
+9. **EFI boot image dla `grub-mkrescue`**
    Obecna implementacja zakłada, że `grub-mkrescue` ma dostęp do
    `/usr/lib/grub/x86_64-efi` (pakiet `grub-efi-amd64-bin`) — sprawdzić na
    docelowym systemie budującym, czy obraz UEFI faktycznie się generuje.
 
-9. **`buildlock` jest specyficzny dla Linuksa (`syscall.Flock`)**
+10. **`buildlock` jest specyficzny dla Linuksa (`syscall.Flock`)**
    Nie jest to problem dla `hackeros-builder` (który i tak wymaga
    `debootstrap`/`chroot`/`mount`, czyli działa tylko na Linuksie), ale
    warto to udokumentować jawnie — próba `go build` na innym systemie
    operacyjnym (np. do samych testów `internal/hk` na macOS) nie skompiluje
    całego modułu z powodu `internal/buildlock`.
 
-10. **Brak testów dla `internal/rootfs`, `internal/ociimage`, `internal/isobuild`**
+11. **Brak testów dla `internal/rootfs`, `internal/ociimage`, `internal/isobuild`**
     Te pakiety wymagają roota i rzeczywistych narzędzi systemowych
     (`debootstrap`, `mksquashfs`) lub żywego registry OCI do przetestowania
     — nie są łatwe do pokrycia testami jednostkowymi w CI bez kontenera
@@ -311,7 +399,7 @@ end-to-end na realnej maszynie budującej. Pierwszy krok po pobraniu repo:
 
 ### Estetyka / UX
 
-11. **Progress indicator** dla `debootstrap`/`mksquashfs`/push warstwy OCI —
+12. **Progress indicator** dla `debootstrap`/`mksquashfs`/push warstwy OCI —
     obecnie tylko statyczne logi `[INFO]`. **→ Roadmap v0.6.0.**
 
 ---
@@ -322,7 +410,7 @@ Zrealizowane w v0.1.0 – v0.5.0 (ta runda rozbudowy):
 
 - [x] Sprawdzenie dostępności wymaganych narzędzi na starcie (`internal/preflight`)
 - [x] Timeouty na żądaniach HTTP (`internal/httpclient`)
-- [x] Weryfikacja checksumy SHA256 pobranej binarki `deb-ostree`
+- [x] Weryfikacja checksumy SHA256 pobranego archiwum `hammer` (oci-mode.tar.gz)
 - [x] Wsparcie registry self-signed/insecure (`--insecure-registry`)
 - [x] Lockfile na `workDir` (`internal/buildlock`)
 - [x] Minimalny pipeline GitHub Actions (`go build`/`go vet`/`go test`/`gofmt`)
@@ -334,7 +422,7 @@ Pozostałe pozycje:
 
 - [ ] **v0.6.0** — **Ładny progress indicator** (spinner/progress bar) dla
       `debootstrap`, `mksquashfs`, push/pull warstw OCI — ten sam motyw co w
-      `deb-ostree` roadmap, najlepiej współdzielona biblioteka/styl między
+      `hammer` roadmap, najlepiej współdzielona biblioteka/styl między
       obydwoma narzędziami HackerOS.
 - [ ] **v0.6.0** — Warstwy OCI przyrostowe (baza / package-lists / hooks)
       zamiast jednej warstwy na cały rootfs.
