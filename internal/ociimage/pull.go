@@ -150,6 +150,36 @@ func isRetryableTransferErr(err error) bool {
 	return false
 }
 
+// tarModeToFileMode konwertuje surowe uniksowe bity trybu z naglowka tar
+// (hdr.Mode, np. 0o1777 dla /tmp albo 0o4755 dla binarki setuid jak
+// /usr/bin/sudo) na poprawny os.FileMode.
+//
+// TO NIE JEST to samo co os.FileMode(hdr.Mode)! os.FileMode koduje bity
+// specjalne (setuid/setgid/sticky) jako ODREBNE, WYSOKIE bity (ModeSetuid =
+// 1<<23 itd.), calkowicie inaczej niz tradycyjny uniksowy zapis osemkowy
+// (gdzie sticky/setgid/setuid siedza w NISKICH bitach, 0o1000/0o2000/0o4000).
+// Naiwna konwersja typu os.FileMode(hdr.Mode) NIE ustawia poprawnie tych
+// flag Go -- a co gorsza, o.Perm() (uzywane wewnetrznie przez os.Chmod przy
+// tlumaczeniu na wywolanie systemowe) maskuje wynik do samych 9 najnizszych
+// bitow (0o777), wiec bit sticky (0o1000) po prostu ZNIKA, a syscallMode()
+// nie doda S_ISVTX/S_ISUID/S_ISGID z powrotem, bo nie widzi ustawionej flagi
+// Go. Efekt: katalogi typu /tmp traca sticky bit, a binarki setuid (sudo!)
+// traca bit setuid -- w obu przypadkach CICHO, bez bledu, po prostu z
+// nieprawidlowymi uprawnieniami w finalnym rootfs.
+func tarModeToFileMode(rawMode int64) os.FileMode {
+	fm := os.FileMode(rawMode & 0o777)
+	if rawMode&0o4000 != 0 {
+		fm |= os.ModeSetuid
+	}
+	if rawMode&0o2000 != 0 {
+		fm |= os.ModeSetgid
+	}
+	if rawMode&0o1000 != 0 {
+		fm |= os.ModeSticky
+	}
+	return fm
+}
+
 // extractLayer rozpakowuje pojedyncza warstwe OCI (tar, zdekompresowany
 // automatycznie przez Uncompressed()) do destDir, obslugujac whiteouts OCI:
 //   - plik o nazwie ".wh.<nazwa>" oznacza usuniecie <nazwa> z warstw nizszych
@@ -163,7 +193,14 @@ func extractLayer(layer v1.Layer, destDir string) error {
 	}
 	defer rc.Close()
 
-	tr := tar.NewReader(rc)
+	return extractTarStream(tar.NewReader(rc), destDir)
+}
+
+// extractTarStream zawiera cala logike rozpakowywania pojedynczego strumienia
+// tar do destDir -- wydzielone z extractLayer wylacznie po to, zeby dalo sie
+// to przetestowac jednostkowo bez potrzeby prawdziwego v1.Layer/registry
+// (testy budują tr z bytes.Buffer przez archive/tar bezposrednio).
+func extractTarStream(tr *tar.Reader, destDir string) error {
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -197,17 +234,41 @@ func extractLayer(layer v1.Layer, destDir string) error {
 		}
 
 		target := filepath.Join(destDir, entryName)
+		mode := tarModeToFileMode(hdr.Mode)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+			if err := os.MkdirAll(target, mode); err != nil {
 				return err
+			}
+			// os.MkdirAll ma DWA problemy ktore razem gubia bity specjalne
+			// (najbardziej widoczne na /tmp, ktore w normalnym rootfs ma
+			// tryb 1777 -- sticky bit + zapis dla wszystkich):
+			//
+			//  1. Jesli target JUZ ISTNIEJE (np. zostal utworzony wczesniej
+			//     jako katalog nadrzedny jakiegos pliku przez ensureParentDir,
+			//     ktore uzywa na sztywno 0o755 -- patrz nizej), MkdirAll w
+			//     ogole nie zmienia jego trybu, tylko zwraca nil.
+			//  2. Nawet jesli target jest tworzony od nowa w tym wywolaniu,
+			//     jadro stosuje "mode & ~umask" -- przy typowym umask 0022
+			//     procesu (np. root spod sudo) zadane 01777 wychodzi jako
+			//     01755, czyli BEZ bitu zapisu dla "innych". To dokladnie
+			//     tyle, ile trzeba, zeby apt-get (ktory dla bezpieczenstwa
+			//     pobiera/weryfikuje repozytoria jako nieuprzywilejowany
+			//     uzytkownik _apt) nie mogl juz utworzyc pliku tymczasowego
+			//     w /tmp -- "Unable to mkstemp ... Permission denied".
+			//
+			// os.Chmod ustawia tryb DOKLADNIE taki jak zadany, pomijajac
+			// umask i dzialajac tez na katalogach ktore juz istnialy --
+			// wywolujemy go zawsze, bezwarunkowo, po MkdirAll.
+			if err := os.Chmod(target, mode); err != nil {
+				return fmt.Errorf("chmod katalogu %q na %o: %w", entryName, hdr.Mode, err)
 			}
 		case tar.TypeReg:
 			if err := ensureParentDir(target); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode))
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 			if err != nil {
 				return err
 			}
@@ -216,6 +277,16 @@ func extractLayer(layer v1.Layer, destDir string) error {
 				return fmt.Errorf("kopiowanie zawartosci %q ze strumienia warstwy: %w", entryName, err)
 			}
 			f.Close()
+			// Tak jak przy katalogach: O_CREATE respektuje umask procesu, a
+			// jesli plik JUZ ISTNIAL (nadpisanie czegos z poprzedniej
+			// warstwy), OpenFile w ogole nie zmienia trybu istniejacego
+			// pliku. Bity setuid/setgid sa krytyczne dla poprawnosci binarek
+			// typu /usr/bin/sudo (setuid root) -- bez tego chmod, sudo
+			// wygladaloby na zainstalowane, ale faktycznie nie dzialaloby
+			// dla zwyklych uzytkownikow w finalnie zainstalowanym systemie.
+			if err := os.Chmod(target, mode); err != nil {
+				return fmt.Errorf("chmod pliku %q na %o: %w", entryName, hdr.Mode, err)
+			}
 		case tar.TypeSymlink:
 			if err := ensureParentDir(target); err != nil {
 				return err
