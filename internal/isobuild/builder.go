@@ -186,6 +186,15 @@ func runGrubMkrescue(isoTree, outputISO, volumeName string) error {
 		isoTree,
 		"--",
 		"-volid", volumeName,
+		// -iso-level 3 wlacza obsluge plikow > 4 GiB w ISO9660 (mechanizm
+		// "multi-extent" -- xorriso dzieli duzy plik na wiele extentow
+		// ISO9660 i przezroczyscie skleja je z powrotem przy odczycie).
+		// Domyslny poziom ISO9660 (bez tej flagi) ogranicza pojedynczy
+		// plik do 4294967295 bajtow (4 GiB - 1), co jest zbyt malo dla
+		// filesystem.squashfs pelnego srodowiska graficznego (~5 GB) --
+		// bez tej flagi xorriso przerywa z "File exceeds size limit of
+		// 4294967295 bytes".
+		"-iso-level", "3",
 	)
 }
 
