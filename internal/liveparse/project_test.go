@@ -107,6 +107,63 @@ func TestParsePackageLists_MissingDirIsNotError(t *testing.T) {
 	}
 }
 
+func TestParseHooks_ReadsBothNormalAndLiveSubdirs(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	writeFile(t, filepath.Join(configDir, "hooks", "normal", "b-user-setup.hook.chroot"), "#!/bin/sh\n")
+	writeFile(t, filepath.Join(configDir, "hooks", "normal", "a-preseed.hook.chroot"), "#!/bin/sh\n")
+	writeFile(t, filepath.Join(configDir, "hooks", "live", "build-red-team-tools.hook.chroot"), "#!/bin/sh\n")
+
+	p := &Project{RootDir: root}
+	if err := p.parseHooks(configDir); err != nil {
+		t.Fatalf("parseHooks: %v", err)
+	}
+
+	var names []string
+	for _, h := range p.Hooks {
+		names = append(names, h.Name)
+	}
+
+	// hooks/normal/ posortowane alfabetycznie, PRZED hooks/live/ (ktore
+	// tez jest -- i, co najwazniejsze, JEST OBECNE, bo to byl caly punkt
+	// tego buga: hooks/live/ bylo wczesniej calkowicie pomijane).
+	want := []string{"a-preseed.hook.chroot", "b-user-setup.hook.chroot", "build-red-team-tools.hook.chroot"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("Hooks nazwy = %v, chcialem %v (hooks/live/ musi byc odczytane, "+
+			"nie tylko hooks/normal/)", names, want)
+	}
+}
+
+func TestParseHooks_MissingDirsIsNotError(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	p := &Project{RootDir: root}
+	if err := p.parseHooks(configDir); err != nil {
+		t.Fatalf("parseHooks: oczekiwano braku bledu gdy hooks/ nie istnieje, otrzymano: %v", err)
+	}
+	if len(p.Hooks) != 0 {
+		t.Fatalf("Hooks = %v, chcialem pusta liste", p.Hooks)
+	}
+}
+
+func TestParseHooks_OnlyNormalDirPresent(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	writeFile(t, filepath.Join(configDir, "hooks", "normal", "only.hook.chroot"), "#!/bin/sh\n")
+
+	p := &Project{RootDir: root}
+	if err := p.parseHooks(configDir); err != nil {
+		t.Fatalf("parseHooks: %v", err)
+	}
+	if len(p.Hooks) != 1 || p.Hooks[0].Name != "only.hook.chroot" {
+		t.Fatalf("Hooks = %v, chcialem dokladnie jeden hook 'only.hook.chroot'", p.Hooks)
+	}
+}
+
 func TestParsePackageLists_DeduplicatesAcrossFiles(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "config", "package-lists", "a.list.chroot"), "curl\n")
