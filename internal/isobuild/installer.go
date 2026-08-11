@@ -33,7 +33,11 @@ var installerPackages = []string{
 	"xinit",
 	"openbox",
 	"dbus-x11",
-	"policykit-1",
+	// "policykit-1" byl transitional package (polkitd + pkexec) usuniety w
+	// Debian trixie -- apt-get konczyl sie "E: Package 'policykit-1' has
+	// no installation candidate". Instalujemy oba realne pakiety wprost.
+	"polkitd",
+	"pkexec",
 	"network-manager",
 	"parted",
 	"gdisk",
