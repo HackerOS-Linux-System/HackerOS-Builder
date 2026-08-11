@@ -84,8 +84,16 @@ func (b *Builder) installMACPackages() error {
 	}
 	util.Infof("  MAC (%s): instalacja %d pakietow...", macName, len(pkgs))
 
+	// UWAGA: celowo BEZ --no-install-recommends. Domyslne zachowanie apt
+	// (i live-build, ktore ma AptRecommends: true chyba ze projekt jawnie
+	// ustawi --apt-recommends false) instaluje tez pakiety z pola
+	// "Recommends" -- HackerOS polega na tym (np. "sudo" jest ciagniete
+	// ubocznie jako Recommends wielu pakietow desktopowych, zamiast byc
+	// jawnie wpisane w kazdej liscie pakietow). Wylaczenie recommends
+	// dawalo mniejszy, bardziej "czysty" obraz, ale lamalo zalozenia
+	// projektu przygotowanego pod normalne apt/live-build.
 	args := append([]string{
-		"install", "-y", "--no-install-recommends",
+		"install", "-y",
 		"-o", "Dpkg::Options::=--force-confdef",
 		"-o", "Dpkg::Options::=--force-confold",
 	}, pkgs...)
@@ -283,8 +291,11 @@ func (b *Builder) installPackages() error {
 		return nil
 	}
 
+	// UWAGA: celowo BEZ --no-install-recommends -- patrz komentarz w
+	// installMACPackages powyzej. Zachowanie ma odpowiadac zwyklemu
+	// "apt-get install" / live-build z domyslnym AptRecommends: true.
 	args := append([]string{
-		"install", "-y", "--no-install-recommends",
+		"install", "-y",
 		"-o", "Dpkg::Options::=--force-confdef",
 		"-o", "Dpkg::Options::=--force-confold",
 		"-o", "APT::Get::Assume-Yes=true",
