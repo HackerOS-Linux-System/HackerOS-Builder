@@ -188,28 +188,46 @@ func readPackageListFile(path string) ([]string, error) {
 // parseHooks zbiera skrypty z config/hooks/normal/*.hook.chroot, sortowane
 // alfabetycznie po nazwie pliku -- live-build wykonuje je w tym porzadku,
 // stad konwencja numerowania prefiksow (0100-..., 0200-...).
+// parseHooks czyta hooki z DWOCH katalogow, zgodnie z konwencja live-build:
+//   - hooks/normal/  -- uruchamiane zawsze (odpowiednik "lb chroot hooks")
+//   - hooks/live/    -- uruchamiane tylko dla systemow "live" (odpowiednik
+//     hookow live-build wykonywanych na etapie live-image);
+//     HackerOS jest zawsze systemem live (live-boot/live-config
+//     zainstalowane w kazdej edycji, dostarczany jako bootowalne ISO), wiec
+//     hooks/live/ ma tu takie samo prawo bytu jak hooks/normal/.
+//
+// WCZESNIEJ ta funkcja czytala WYLACZNIE hooks/normal/ -- hooki polozone w
+// hooks/live/ (np. helpers/cybersecurity-default/hooks/live/build-red-team-tools.hook.chroot,
+// budujacy dziesiatki narzedzi red-teamowych ze zrodel) byly CICHO
+// pomijane: config.hk wygladalo na poprawne, build konczyl sie sukcesem,
+// ale znaczna czesc zamierzonej zawartosci obrazu nigdy nie powstawala,
+// bez zadnego bledu czy ostrzezenia.
 func (p *Project) parseHooks(configDir string) error {
-	dir := filepath.Join(configDir, "hooks", "normal")
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("nie mozna odczytac %s: %w", dir, err)
-	}
-
 	var hooks []HookScript
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".hook.chroot") {
+	for _, subdir := range []string{"normal", "live"} {
+		dir := filepath.Join(configDir, "hooks", subdir)
+		entries, err := os.ReadDir(dir)
+		if os.IsNotExist(err) {
 			continue
 		}
-		hooks = append(hooks, HookScript{
-			Name: e.Name(),
-			Path: filepath.Join(dir, e.Name()),
-		})
+		if err != nil {
+			return fmt.Errorf("nie mozna odczytac %s: %w", dir, err)
+		}
+
+		var subHooks []HookScript
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".hook.chroot") {
+				continue
+			}
+			subHooks = append(subHooks, HookScript{
+				Name: e.Name(),
+				Path: filepath.Join(dir, e.Name()),
+			})
+		}
+		sort.Slice(subHooks, func(i, j int) bool { return subHooks[i].Name < subHooks[j].Name })
+		hooks = append(hooks, subHooks...)
 	}
 
-	sort.Slice(hooks, func(i, j int) bool { return hooks[i].Name < hooks[j].Name })
 	p.Hooks = hooks
 	return nil
 }
