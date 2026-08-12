@@ -55,12 +55,21 @@ func BuildIso(opts IsoOptions) error {
 
 	repository := opts.Repository
 	tag := opts.Tag
-	if repository == "" {
-		imageName := defaultImageName(opts.ProjectDir)
-		repository = cfg.ImageRepository(defaultRegistryHost, imageName)
-	}
-	if tag == "" {
-		tag = cfg.Release
+	if repository == "" || tag == "" {
+		// resolveImageNameAndTag jest WSPOLNE z BuildCloud -- patrz komentarz
+		// przy jej definicji (cloud.go) po szczegoly buga ktory istnial tu
+		// wczesniej, gdy ta logika byla zduplikowana i rozjechala sie.
+		imageName, resolvedTag := resolveImageNameAndTag(cfg, opts.ProjectDir)
+		if repository == "" {
+			if cfg.Project.Name != "" {
+				util.Infof("Nazwa obrazu OCI z [project] -> name: %s", imageName)
+			}
+			repository = cfg.ImageRepository(defaultRegistryHost, imageName)
+		}
+		if tag == "" {
+			tag = resolvedTag
+			util.Infof("Tag obrazu OCI z [project] -> tag: %s", tag)
+		}
 	}
 
 	rootfsDir := filepath.Join(opts.WorkDir, "rootfs-from-cloud")
