@@ -30,6 +30,35 @@ func defaultImageName(projectDir string) string {
 	return filepath.Base(abs)
 }
 
+// resolveImageNameAndTag wylicza nazwe obrazu OCI i jego tag na podstawie
+// config.hk -- WSPOLNE dla BuildCloud i BuildIso, zeby te dwie komendy
+// NIGDY nie mogly sie rozjechac w tym co uwazaja za "ten sam" obraz.
+//
+// To realny bug ktory sie wydarzyl: BuildIso mialo wczesniej WLASNA,
+// niezalezna kopie tej logiki -- pomijala "cfg.Project.Name" (uzywala
+// wylacznie nazwy katalogu projektu na dysku, np. "HackerOS" bo tak
+// nazywa sie repo git) i uzywala "cfg.Release" (nazwa wydania DEBIANA,
+// np. "forky", pole calkowicie niezwiazane z tagiem obrazu OCI) zamiast
+// "cfg.Project.Tag". Samodzielne "build iso" (bez wczesniejszego "build
+// cloud" w tym samym procesie) probowalo wiec sciagnac obraz spod
+// zupelnie innej referencji niz ta pod ktora "build cloud" go wypchnal --
+// "build all" tego nie ujawnialo, bo BuildAll przekazuje repository/tag
+// JUZ WYLICZONE przez BuildCloud wprost do BuildIso, wiec ta galaz kodu
+// (i jej bug) w ogole sie nie wykonywala.
+//
+//   - imageName: [project] -> name z config.hk, fallback nazwa katalogu
+//     projektu na dysku (defaultImageName).
+//   - tag: [project] -> tag z config.hk, fallback "latest"
+//     (cfg.Project.ImageTag()).
+func resolveImageNameAndTag(cfg *config.Config, projectDir string) (imageName, tag string) {
+	imageName = defaultImageName(projectDir)
+	if cfg.Project.Name != "" {
+		imageName = cfg.Project.Name
+	}
+	tag = cfg.Project.ImageTag()
+	return imageName, tag
+}
+
 // CloudOptions to parametry komendy "build cloud". Wyodrebnione do struct
 // (zamiast pozycyjnych argumentow funkcji) zeby dodawanie nowych opcji
 // nie wymagalo zmiany sygnatury w kazdym miejscu wywolania.
@@ -110,15 +139,13 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 		return nil, fmt.Errorf("budowa rootfs: %w", err)
 	}
 
-	// Nazwa obrazu OCI z [project] -> name (jesli ustawione), fallback na nazwe katalogu.
-	imageName := defaultImageName(opts.ProjectDir)
+	// Nazwa i tag obrazu OCI -- patrz resolveImageNameAndTag (wspolne z
+	// BuildIso, celowo, zeby te dwie komendy nigdy nie mogly sie rozjechac
+	// co do tego czym jest "ten sam" obraz).
+	imageName, imageTag := resolveImageNameAndTag(cfg, opts.ProjectDir)
 	if cfg.Project.Name != "" {
-		imageName = cfg.Project.Name
 		util.Infof("Nazwa obrazu OCI z [project] -> name: %s", imageName)
 	}
-
-	// Tag obrazu OCI z [project] -> tag, domyslnie "latest".
-	imageTag := cfg.Project.ImageTag()
 	util.Infof("Tag obrazu OCI: %s", imageTag)
 
 	repository := cfg.ImageRepository(defaultRegistryHost, imageName)
