@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/rootfs"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
@@ -181,21 +183,67 @@ func runGrubMkrescue(isoTree, outputISO, volumeName string) error {
 	if err := os.MkdirAll(filepath.Dir(outputISO), 0o755); err != nil {
 		return err
 	}
+
+	xorrisoWrapper, err := writeXorrisoIsoLevelWrapper(filepath.Dir(outputISO))
+	if err != nil {
+		return fmt.Errorf("przygotowanie wrappera xorriso (iso-level 3): %w", err)
+	}
+
 	return util.RunStreaming("", "grub-mkrescue",
+		"--xorriso="+xorrisoWrapper,
 		"-o", outputISO,
 		isoTree,
 		"--",
 		"-volid", volumeName,
-		// -iso-level 3 wlacza obsluge plikow > 4 GiB w ISO9660 (mechanizm
-		// "multi-extent" -- xorriso dzieli duzy plik na wiele extentow
-		// ISO9660 i przezroczyscie skleja je z powrotem przy odczycie).
-		// Domyslny poziom ISO9660 (bez tej flagi) ogranicza pojedynczy
-		// plik do 4294967295 bajtow (4 GiB - 1), co jest zbyt malo dla
-		// filesystem.squashfs pelnego srodowiska graficznego (~5 GB) --
-		// bez tej flagi xorriso przerywa z "File exceeds size limit of
-		// 4294967295 bytes".
-		"-iso-level", "3",
 	)
+}
+
+// writeXorrisoIsoLevelWrapper tworzy maly skrypt-wrapper podstawiany pod
+// grub-mkrescue przez flage --xorriso=FILE, ktorego JEDYNYM zadaniem jest
+// wstrzykniecie "-compliance iso_9660_level=3" jako PIERWSZEGO argumentu
+// przekazywanego do prawdziwego xorriso -- i zwrocenie sciezki do niego.
+//
+// To wlacza obsluge plikow > 4 GiB w ISO9660 (mechanizm "multi-extent" --
+// xorriso dzieli duzy plik na wiele extentow ISO9660 i przezroczyscie
+// skleja je z powrotem przy odczycie). Bez tego, domyslny poziom ISO9660
+// ogranicza pojedynczy plik do 4294967295 bajtow (4 GiB - 1), co jest za
+// malo dla filesystem.squashfs pelnego srodowiska graficznego (~5 GB) --
+// xorriso przerywa wtedy z "File exceeds size limit of 4294967295 bytes".
+//
+// DLACZEGO WRAPPER, A NIE PO PROSTU DOPISANIE "-compliance ..." DO
+// ARGUMENTOW PO "--": grub-mkrescue buduje WLASNA, wewnetrzna linie
+// polecen xorriso (wlasne "-outdev" i "-map" dla zawartosci GRUB-a oraz
+// dla isoTree) i dopiero na SAM KONIEC doklada to, co my przekazemy po
+// "--". Polecenia xorriso wykonuja sie SEKWENCYJNIE -- ustawienie
+// "-compliance" PO tym jak pliki zostaly juz dodane przez "-map" (co
+// weryfikowalismy bezposrednio: xorriso i tak konczy sie identycznym
+// "File exceeds size limit", mimo poprawnej skladni -compliance) nie ma
+// juz zadnego efektu. Podstawiajac cala binarke xorriso wrapperem,
+// wymuszamy "-compliance iso_9660_level=3" jako pierwszy argument, czyli
+// PRZED jakimkolwiek "-map" grub-mkrescue -- zweryfikowane bezposrednio
+// (plik testowy > 4 GiB, przez prawdziwy grub-mkrescue, zakonczone
+// sukcesem).
+func writeXorrisoIsoLevelWrapper(dir string) (string, error) {
+	realXorriso, err := exec.LookPath("xorriso")
+	if err != nil {
+		return "", fmt.Errorf("nie znaleziono 'xorriso' w PATH: %w", err)
+	}
+
+	wrapperPath := filepath.Join(dir, "xorriso-iso-level-wrapper.sh")
+	script := "#!/bin/sh\nexec " + shellQuote(realXorriso) +
+		" -compliance iso_9660_level=3 \"$@\"\n"
+
+	if err := os.WriteFile(wrapperPath, []byte(script), 0o755); err != nil {
+		return "", fmt.Errorf("zapis wrappera do %s: %w", wrapperPath, err)
+	}
+	return wrapperPath, nil
+}
+
+// shellQuote otacza s pojedynczymi cudzyslowami dla bezpiecznego uzycia w
+// wygenerowanym skrypcie POSIX sh (na wypadek gdyby sciezka do xorriso
+// zawierala spacje lub inne znaki specjalne).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // copyFile kopiuje zawartosc pliku src do dst (tworzac dst od nowa).
