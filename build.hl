@@ -1,1 +1,114 @@
+#!/usr/bin/hl
+using <gen 2>
 
+// go [golang]
+
+% BINARY: str      = hackeros-builder
+% PREFIX: str      = /usr/local
+% DESTDIR: str     = 
+% INSTALL_DIR: str = @DESTDIR@PREFIX/bin
+
+;; Wersja z gita (fallback: "dev")
+> git describe --tags --always --dirty 2>/dev/null |> @VERSION
+? err
+    % VERSION: str = dev
+done
+
+% BUILD_FLAGS: str = -mod=vendor -ldflags "-s -w -X main.version=@VERSION"
+
+: build def
+    \~> [build] @BINARY v@VERSION (vendor, offline)...
+    >> go build @BUILD_FLAGS -o @BINARY .
+    \~> [build] ok: ./@BINARY
+done
+
+: build-mod def
+    \~> [build-mod] @BINARY v@VERSION (sieć, -mod=mod)...
+    >> GONOSUMDB='*' GOFLAGS=-mod=mod go build -ldflags "-s -w -X main.version=@VERSION" -o @BINARY .
+    \~> [build-mod] ok: ./@BINARY
+done
+
+: install def
+    -- build
+    \~> [install] @INSTALL_DIR/@BINARY
+    >> install -Dm755 @BINARY @INSTALL_DIR/@BINARY
+    \~> [install] ok
+done
+
+: uninstall def
+    \~> [uninstall] usuwanie @INSTALL_DIR/@BINARY
+    >> rm -f @INSTALL_DIR/@BINARY
+done
+
+: clean def
+    \~> [clean] usuwanie ./@BINARY
+    >> rm -f @BINARY
+done
+
+: test def
+    >> go test -mod=vendor ./...
+done
+
+: fmt def
+    >> gofmt -w .
+done
+
+: vet def
+    >> go vet -mod=vendor ./...
+done
+
+: tidy def
+    \~> [tidy] go mod tidy (wymaga internetu)...
+    >> go mod tidy
+    \~> [tidy] ok -- zaktualizowano go.sum
+done
+
+: vendor-sync def
+    \~> [vendor-sync] go mod vendor (wymaga internetu)...
+    >> GONOSUMDB='*' go mod vendor
+    \~> [vendor-sync] ok -- vendor/ zaktualizowany
+done
+
+: help def
+    \~> Dostępne cele:
+    \~>   build          kompiluje hackeros-builder (używa vendor/, offline)
+    \~>   build-mod      kompiluje przez sieć (-mod=mod)
+    \~>   install        kompiluje i instaluje do @INSTALL_DIR
+    \~>   uninstall      usuwa @INSTALL_DIR/@BINARY
+    \~>   clean          usuwa skompilowaną binarkę
+    \~>   test           uruchamia testy jednostkowe
+    \~>   fmt            formatuje kod przez gofmt
+    \~>   vet            uruchamia go vet
+    \~>   tidy           aktualizuje go.sum (wymaga internetu)
+    \~>   vendor-sync    regeneruje vendor/ (wymaga internetu)
+    \~>   help           wyświetla tę pomoc
+done
+
+;; ===================== Dispatch =====================
+
+? switch @arg0
+| build
+    -- build
+| build-mod
+    -- build-mod
+| install
+    -- install
+| uninstall
+    -- uninstall
+| clean
+    -- clean
+| test
+    -- test
+| fmt
+    -- fmt
+| vet
+    -- vet
+| tidy
+    -- tidy
+| vendor-sync
+    -- vendor-sync
+| help
+    -- help
+| *
+    -- help
+done
