@@ -1,4 +1,3 @@
-! config/config.hk
 ! Jedyny plik ktory odroznia projekt hackeros-builder od zwyklego projektu
 ! live-build. Reszta struktury (hooks/, package-lists/, includes.chroot/)
 ! jest identyczna jak w live-build.
@@ -20,6 +19,26 @@
 ! Znane wartosci: bookworm, trixie, forky, sid, unstable
 -> name => trixie
 
+! mirror: adres mirrora Debiana przekazywany do debootstrap. OPCJONALNE --
+! domyslnie (brak klucza) "http://deb.debian.org/debian". Przydatne dla
+! mirrorow lokalnych/firmowych (szybszy build w sieci firmowej) albo
+! mirrorow regionalnych.
+-> mirror => http://deb.debian.org/debian
+
+! arch: architektura docelowa przekazywana do debootstrap jako --arch.
+! OPCJONALNE -- domyslnie (brak klucza) "amd64". Wspierane oficjalnie przez
+! Debiana: amd64, arm64, armhf, armel, i386, mips64el, mipsel, ppc64el,
+! riscv64, s390x.
+!
+! UWAGA WAZNA: ten klucz niezawodnie wplywa TYLKO na sam rootfs
+! (debootstrap) -- NIE na bootowalnosc finalnego ISO. "build iso" uzywa
+! grub-mkrescue BEZ jawnego "-d <platforma>", wiec dla architektury INNEJ
+! niz hosta budujacego potrzebne sa dodatkowe pakiety GRUB (np.
+! grub-efi-arm64-bin) recznie zainstalowane na hoscie -- inaczej ISO moze
+! wygladac na poprawne, ale nie wstac na docelowym sprzecie. Zobacz
+! ostrzezenie wypisywane przez "build iso" gdy arch != architektura hosta.
+-> arch => amd64
+
 [project]
 ! Sekcja [project] jest w CALOSCI OPCJONALNA -- brak sekcji nie jest bledem,
 ! stosowane sa wartosci domyslne opisane ponizej.
@@ -35,9 +54,18 @@
 
 ! type: tryb pracy buildera.
 !
-!   (brak) / default / cybersecurity
+!   (brak) / default
 !       Pelny atomowy build: debootstrap -> OCI push -> hammer.
 !       To jest GLOWNY tryb hackeros-builder, aktywnie rozwijany.
+!
+!   cybersecurity
+!       TO SAMO co "default" (pelny atomowy build z hammer) PLUS dodatkowy
+!       zestaw pakietow cybersecurity/pentest (nmap, wireshark, hydra, john,
+!       hashcat, aircrack-ng, sqlmap, radare2, binwalk, gdb, ...) instalowany
+!       do rootfs. Odpowiednik edycji "Cybersecurity Edition" z glownego
+!       repozytorium HackerOS. UWAGA: przed v0.7.0 ta wartosc byla wylacznie
+!       aliasem "default" bez zadnego efektu -- od v0.7.0 jest to realny,
+!       odrebny tryb.
 !
 !   normal / official
 !       Zwykla nakladka na live-build -- bez OCI, bez hammer, bez atomowosci.
@@ -49,15 +77,47 @@
 !       uzywa wewnetrznego pipeline hackeros-builder (debootstrap + squashfs + iso)
 !       ale BEZ push OCI i BEZ hammer. Nie wymaga live-build.
 !
+!   container
+!       Buduje ZWYKLY kontener roboczy (OCI, kompatybilny z podman/docker)
+!       do codziennej pracy -- NIE obraz atomowy/bootc. Bez hammer, bez ISO.
+!       Uzyj komendy "hackeros-builder build container". Wynik to lokalne
+!       archiwum .tar wczytywalne przez `podman load`/`docker load`, plus
+!       opcjonalny push do registry jesli [account]/[auth] ponizej sa
+!       wypelnione (nie sa wymagane dla samego lokalnego kontenera).
+!
+!   containerized
+!       Jak "container" (zwykly kontener roboczy, bez hammer, bez ISO,
+!       uzyj komendy "hackeros-builder build container") ale DODATKOWO
+!       wbudowuje Isolator (https://github.com/HackerOS-Linux-System/Isolator)
+!       do /usr/bin/ -- podman-owy menedzer pakietow HackerOS, ktory
+!       instaluje pakiety z dowolnej wspieranej dystrybucji do izolowanych/
+!       wspoldzielonych kontenerow, sam zarzadzajac GUI/GPU/audio/D-Bus.
+!       Kontener startuje gotowy do `isolator install <pakiet>` bez zadnej
+!       dodatkowej konfiguracji. Najnowsza wersja Isolatora jest wykrywana
+!       automatycznie (albo ustaw [project] -> isolator_version ponizej),
+!       pobierana z GitHub Releases (archiwum "isolator.tar.gz") i
+!       wypakowywana bezposrednio do rootfs -- ten sam mechanizm co
+!       pobieranie hammer dla typu "default"/"cybersecurity" (patrz
+!       internal/download/isolator.go).
+!
 -> type => default
 
 ! installer: instalator dolaczany do obrazu ISO.
 !
-!   (brak) / default / cybersecurity
+!   (brak) / default
 !       Wlasny instalator hackeros-builder (Calamares), uruchamiany OD RAZU
 !       przy starcie ISO (bez posredniego pulpitu live). Inspirowany trybem
 !       "Install" z Kubuntu -- uruchamiasz ISO i pierwsze co widzisz to
 !       kreator instalacji, nie pulpit z ikona "Zainstaluj".
+!
+!   cybersecurity
+!       TO SAMO co "default" (Calamares od razu przy starcie) PLUS: inny
+!       branding ("HackerOS Cybersecurity Edition", czerwony akcent zamiast
+!       niebieskiego) i kilka dodatkowych narzedzi sieciowych/diagnostycznych
+!       (nmap, net-tools, tcpdump, dnsutils) juz w samym srodowisku live/
+!       instalatora. UWAGA: przed v0.7.0 ta wartosc byla wylacznie aliasem
+!       "default", wizualnie i funkcjonalnie nieodrozniona od zwyklego
+!       instalatora -- od v0.7.0 jest to realny, odrebny wariant.
 !
 !   none
 !       Brak instalatora. Builder nie wstrzykuje zadnego instalatora do ISO.
@@ -75,3 +135,38 @@
 !                                 policycoreutils, auditd
 !
 -> selinux => false
+
+! cybersecurity_packages: NADPISUJE wbudowana liste pakietow cybersecurity/
+! pentest (dziala TYLKO gdy [project] -> type = cybersecurity). Format
+! tablicowy .hk. Puste/brak klucza -- uzyj wbudowanej listy domyslnej (nmap,
+! wireshark, tcpdump, hydra, john, hashcat, aircrack-ng, sqlmap, nikto,
+! radare2, binwalk, foremost, steghide, gdb i kilka innych -- pelna lista w
+! internal/rootfs/builder.go, cybersecurityPackages()).
+!
+! Przyklad (podmienia CALA liste, nie dodaje do niej):
+!   -> cybersecurity_packages => [nmap, wireshark, hydra, john, my-custom-tool]
+!-> cybersecurity_packages => [nmap, wireshark, hydra]
+
+! sign: czy "build cloud" ma podpisac wypchniety obraz OCI przez cosign
+! (https://github.com/sigstore/cosign) PO udanym push, kluczem prywatnym
+! wskazanym w cosign_key. Podpisywanie key-based (NIE keyless/OIDC) --
+! dziala identycznie na kazdej maszynie, bez logowania przez przegladarke.
+! Wymaga zainstalowanego binarnego "cosign" w $PATH.
+-> sign => false
+
+! verify_signature: czy "build iso" ma zweryfikowac podpis cosign obrazu
+! OCI PRZED pociagnieciem go z registry, kluczem publicznym wskazanym w
+! cosign_key. Build PRZERYWA sie jesli podpis jest nieprawidlowy/brakujacy.
+-> verify_signature => false
+
+! cosign_key: sciezka do klucza cosign -- PRYWATNEGO gdy sign=true (na
+! maszynie ktora robi "build cloud"), PUBLICZNEGO gdy verify_signature=true
+! (na maszynie ktora robi "build iso"). Wygeneruj para kluczy przez:
+!   cosign generate-key-pair
+-> cosign_key => /sciezka/do/cosign.key
+
+! isolator_version: nadpisuje automatycznie wykrywana najnowsza wersje
+! Isolatora wbudowywana do rootfs dla [project] -> type = containerized
+! (np. "v0.3.0"). OPCJONALNE -- domyslnie (brak klucza) automatyczne
+! wykrycie najnowszego wydania z GitHub Releases.
+!-> isolator_version => v0.3.0
