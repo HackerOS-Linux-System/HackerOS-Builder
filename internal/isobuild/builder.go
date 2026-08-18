@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/liveparse"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/rootfs"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
 )
@@ -25,11 +27,88 @@ type BuildParams struct {
 	// kazde "build iso" produkuje gotowy do instalacji nosnik, bootujacy
 	// PROSTO w instalator (patrz installer.go), bez posredniego pulpitu live.
 	SkipInstaller bool
+
+	// InstallerVariant okresla branding/dodatkowe narzedzia instalatora
+	// (patrz InstallerVariant / brandingDescFor w installer.go). Wartosc
+	// zerowa "" jest traktowana jak InstallerVariantDefault. Ignorowane
+	// gdy SkipInstaller=true.
+	InstallerVariant InstallerVariant
+
+	// InstallerHooks to skrypty z config/hooks/installer/ (patrz
+	// liveparse.Project.InstallerHooks / liveparse.ParseInstallerHooks) --
+	// wykonywane TUTAJ, PO InjectInstaller, WYLACZNIE w tej kopii rootfs
+	// uzywanej do zbudowania ISO (nigdy nie trafiaja do systemu docelowego).
+	// Ignorowane gdy SkipInstaller=true (nie ma czego customizowac, skoro
+	// instalator w ogole nie jest wstrzykiwany).
+	InstallerHooks []liveparse.HookScript
+
+	// Arch to architektura docelowa ([release] -> arch w config.hk, patrz
+	// config.Config.EffectiveArch()) -- uzywana WYLACZNIE do ostrzezenia
+	// (patrz warnIfForeignArch nizej), NIE do faktycznego przekazania
+	// "-d <platforma>" do grub-mkrescue (to wymagaloby pakietow
+	// grub-efi-<arch>-bin dla architektur INNYCH niz hosta, ktorych
+	// hackeros-builder nie instaluje automatycznie -- patrz komentarz przy
+	// warnIfForeignArch). Puste "" == architektura hosta (bez ostrzezenia).
+	Arch string
 }
 
 // excludeFromSquash to katalogi ktore NIE powinny trafic do squashfs
 // (sa specyficzne dla danego boota hosta, nie dla obrazu systemu).
 var excludeFromSquash = []string{"proc", "sys", "dev", "tmp", "run"}
+
+// archToDebianArch mapuje runtime.GOARCH (architektura HOSTA, na ktorym
+// dziala akurat ten proces hackeros-builder) na nazewnictwo architektur
+// Debiana -- potrzebne do porownania z [release] -> arch (ktore uzywa
+// nazw Debiana: "amd64", "arm64", ...).
+var archToDebianArch = map[string]string{
+	"amd64":    "amd64",
+	"arm64":    "arm64",
+	"arm":      "armhf",
+	"386":      "i386",
+	"mips":     "mipsel",
+	"mips64le": "mips64el",
+	"ppc64le":  "ppc64el",
+	"riscv64":  "riscv64",
+	"s390x":    "s390x",
+}
+
+// warnIfForeignArch ostrzega gdy docelowa architektura ISO (arch) NIE
+// odpowiada architekturze hosta budujacego -- grub-mkrescue (wywolywane
+// nizej w runGrubMkrescue) NIE dostaje jawnego "-d <platforma>", wiec
+// korzysta z modulow GRUB zainstalowanych NA HOSCIE (np. pakiet
+// grub-efi-amd64-bin na typowym amd64 builderze). Dla architektury INNEJ
+// niz hosta potrzebne sa DODATKOWE pakiety (np. grub-efi-arm64-bin do
+// zbudowania ISO rozruchowego na arm64), ktorych hackeros-builder NIE
+// instaluje automatycznie -- bez nich grub-mkrescue albo zawiedzie, albo
+// (gorzej) po cichu zbuduje ISO ktore wyglada poprawnie, ale nie wstanie
+// na docelowym sprzecie. To swiadomie NIE jest twardy blad (build moze byc
+// uruchomiony na maszynie ktora faktycznie MA zainstalowane
+// wielo-architekturowe pakiety GRUB), tylko jawne ostrzezenie -- patrz
+// ROADMAP w README.md, "pelne wsparcie cross-arch ISO" jest osobnym,
+// wiekszym zadaniem (przekazanie "-d" + walidacja obecnosci pakietow
+// grub-efi-<arch>-bin PRZED probą budowy).
+func warnIfForeignArch(arch string) {
+	if arch == "" {
+		return
+	}
+	hostArch, known := archToDebianArch[runtime.GOARCH]
+	if !known {
+		return
+	}
+	if arch == hostArch {
+		return
+	}
+	util.Warnf(
+		"[release] -> arch=%q rozni sie od architektury hosta budujacego (%q) -- "+
+			"grub-mkrescue uzyje modulow GRUB Z HOSTA (hackeros-builder nie przekazuje "+
+			"jawnego \"-d <platforma>\"), co dla INNEJ architektury zazwyczaj oznacza ISO "+
+			"ktore NIE WSTANIE na docelowym sprzecie, chyba ze host ma recznie zainstalowane "+
+			"wielo-architekturowe pakiety GRUB (np. grub-efi-%s-bin) I samodzielnie "+
+			"skonfigurowany odpowiedni --target. Pelne wsparcie cross-arch ISO to osobna "+
+			"pozycja w ROADMAP (README.md) -- na razie [release] -> arch niezawodnie wplywa "+
+			"TYLKO na sam rootfs (debootstrap), nie na bootowalnosc finalnego ISO.",
+		arch, hostArch, arch)
+}
 
 // Build wykonuje caly przeplyw budowy ISO:
 //  1. mksquashfs rootfs -> iso-tree/live/filesystem.squashfs
@@ -37,56 +116,84 @@ var excludeFromSquash = []string{"proc", "sys", "dev", "tmp", "run"}
 //  3. generowanie konfiguracji GRUB (BIOS+UEFI) w iso-tree/boot/grub/
 //  4. grub-mkrescue -> OutputISO, hybrid BIOS+UEFI (xorriso pod maska)
 func Build(p BuildParams) error {
+	util.Section("Budowa ISO")
+	warnIfForeignArch(p.Arch)
+
 	isoTree := filepath.Join(p.WorkDir, "iso-tree")
 	if err := os.RemoveAll(isoTree); err != nil {
 		return fmt.Errorf("czyszczenie %s: %w", isoTree, err)
 	}
 
+	totalSteps := 6
+	if !p.SkipInstaller && len(p.InstallerHooks) > 0 {
+		totalSteps = 7
+	}
+	step := 0
+
 	if !p.SkipInstaller {
-		util.Infof("Krok 1/6: instalator GUI (Calamares)...")
-		if err := InjectInstaller(p.RootfsDir, p.WorkDir); err != nil {
+		variant := p.InstallerVariant
+		if variant == "" {
+			variant = InstallerVariantDefault
+		}
+		step++
+		util.Step(step, totalSteps, "instalator GUI (Calamares, wariant: %s)...", variantLabel(variant))
+		if err := InjectInstaller(p.RootfsDir, p.WorkDir, variant); err != nil {
 			return fmt.Errorf("instalator GUI: %w", err)
 		}
+
+		if len(p.InstallerHooks) > 0 {
+			step++
+			util.Step(step, totalSteps, "hooki instalatora (config/hooks/installer/, %d)...", len(p.InstallerHooks))
+			if err := runInstallerHooks(p.RootfsDir, p.WorkDir, p.InstallerHooks); err != nil {
+				return fmt.Errorf("hooki instalatora: %w", err)
+			}
+		}
 	} else {
-		util.Infof("Krok 1/6: instalator GUI pominiety (SkipInstaller)")
+		step++
+		util.Step(step, totalSteps, "instalator GUI pominiety (SkipInstaller)")
 	}
 
 	// Usuwamy apt/apt-get DOKLADNIE tutaj -- PO ewentualnym wstrzynkieciu
-	// Calamares (ktory jeszcze potrzebuje apt-get do zainstalowania siebie
-	// i swoich zaleznosci -- Xorg, openbox itd. -- w rootfs pociagnietym
-	// z registry, gdzie apt-get juz nie byl usuwany na etapie "build
-	// cloud", patrz komentarz w internal/rootfs/builder.go), ale PRZED
-	// zbudowaniem squashfs.img. Ten squashfs.img jest tym, co Calamares
-	// PozNIEJ kopiuje 1:1 na dysk uzytkownika -- czyli od tego miejsca w
-	// przeplywie budowy, "finalny dysk" uzytkownika jest juz gwarantowany
-	// jako wolny od apt/apt-get, przy zachowanej bazie dpkg (na ktorej
-	// nadal polega hammer).
-	util.Infof("Krok 2/6: usuwanie apt/apt-get (finalny dysk uzytkownika ma byc bez nich; baza dpkg pozostaje dla hammer)...")
+	// Calamares i hookow instalatora (ktore jeszcze potrzebuja apt-get do
+	// zainstalowania siebie/swoich zaleznosci -- Xorg, openbox, interpretery
+	// jezykow itd. -- w rootfs pociagnietym z registry, gdzie apt-get juz
+	// nie byl usuwany na etapie "build cloud", patrz komentarz w
+	// internal/rootfs/builder.go), ale PRZED zbudowaniem squashfs.img. Ten
+	// squashfs.img jest tym, co Calamares PozNIEJ kopiuje 1:1 na dysk
+	// uzytkownika -- czyli od tego miejsca w przeplywie budowy, "finalny
+	// dysk" uzytkownika jest juz gwarantowany jako wolny od apt/apt-get,
+	// przy zachowanej bazie dpkg (na ktorej nadal polega hammer).
+	step++
+	util.Step(step, totalSteps, "usuwanie apt/apt-get (finalny dysk uzytkownika ma byc bez nich; baza dpkg pozostaje dla hammer)...")
 	if err := rootfs.RemoveAptTooling(p.RootfsDir); err != nil {
 		return fmt.Errorf("usuwanie apt/apt-get: %w", err)
 	}
 
-	util.Infof("Krok 3/6: tworzenie squashfs z rootfs...")
+	step++
+	util.Step(step, totalSteps, "tworzenie squashfs z rootfs...")
 	if err := buildSquashfs(p.RootfsDir, isoTree); err != nil {
 		return fmt.Errorf("squashfs: %w", err)
 	}
 
-	util.Infof("Krok 4/6: kopiowanie jadra i initrd...")
+	step++
+	util.Step(step, totalSteps, "kopiowanie jadra i initrd...")
 	if err := copyKernelAndInitrd(p.RootfsDir, isoTree); err != nil {
 		return fmt.Errorf("kernel/initrd: %w", err)
 	}
 
-	util.Infof("Krok 5/6: generowanie konfiguracji GRUB (BIOS+UEFI)...")
+	step++
+	util.Step(step, totalSteps, "generowanie konfiguracji GRUB (BIOS+UEFI)...")
 	if err := writeGrubConfig(isoTree, p.VolumeName); err != nil {
 		return fmt.Errorf("grub config: %w", err)
 	}
 
-	util.Infof("Krok 6/6: budowanie hybrydowego ISO (grub-mkrescue)...")
+	step++
+	util.Step(step, totalSteps, "budowanie hybrydowego ISO (grub-mkrescue)...")
 	if err := runGrubMkrescue(isoTree, p.OutputISO, p.VolumeName); err != nil {
 		return fmt.Errorf("grub-mkrescue: %w", err)
 	}
 
-	util.Infof("ISO zbudowane: %s", p.OutputISO)
+	util.Infof("ISO zbudowane: %s", util.Underline(p.OutputISO))
 	return nil
 }
 
