@@ -1,10 +1,13 @@
 package util
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // RunResult to wynik wykonania komendy zewnetrznej.
@@ -105,7 +108,104 @@ func RunStreamingEnv(dir string, env []string, name string, args ...string) erro
 	return nil
 }
 
-// RunWithStdin wykonuje komende synchronicznie, podajac stdinData na stdin
+// RunStreamingWithLines jak RunStreaming, ale zamiast przekazywac
+// stdout/stderr surowo do terminala, laczy oba strumienie i woła onLine
+// dla kazdej "linii" (rozdzielanej zarowno przez '\n' jak i przez '\r' --
+// niektore narzedzia, np. debootstrap, aktualizuja pasek postepu w miejscu
+// przez sam '\r' bez konca linii w sensie Uniksowym). Uzywane do zasilania
+// internal/util.ProgressBar REALNYMI zdarzeniami sparsowanymi z wyjscia
+// polecenia, zamiast pokazywac surowy, gadatliwy log na zywo.
+func RunStreamingWithLines(dir string, onLine func(string), name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(pr)
+		scanner.Split(scanLinesOrCR)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			onLine(line)
+		}
+	}()
+
+	Debugf("exec (streaming+lines): %s %v", name, args)
+	runErr := cmd.Run()
+	pw.Close()
+	<-done
+
+	if runErr != nil {
+		return fmt.Errorf("komenda %q %v nie powiodla sie: %w", name, args, runErr)
+	}
+	return nil
+}
+
+// scanLinesOrCR to bufio.SplitFunc dzielacy strumien na "linie" zarowno po
+// '\n' jak i po samym '\r' (bez towarzyszacego '\n') -- potrzebne dla
+// narzedzi (debootstrap) ktore aktualizuja pasek postepu w miejscu samym
+// '\r', co standardowy bufio.ScanLines (dzielacy WYLACZNIE po '\n')
+// zignorowalby az do nastepnego prawdziwego konca linii.
+func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// CountingReader owija io.Reader i zlicza bajty faktycznie przeczytane --
+// uzywane do zasilania ProgressBar REALNYMI bajtami podczas strumieniowego
+// czytania (np. pull warstwy OCI z registry: layer.Compressed() daje
+// strumien o znanym z gory rozmiarze przez layer.Size(), CountingReader
+// pozwala aktualizowac pasek w miejscu, bez buforowania calej warstwy w
+// pamieci przed policzeniem postepu).
+type CountingReader struct {
+	R      io.Reader
+	OnRead func(n int64) // wolane po kazdym udanym Read z LICZBA nowo przeczytanych bajtow (delta, nie suma)
+}
+
+func (c *CountingReader) Read(p []byte) (int, error) {
+	n, err := c.R.Read(p)
+	if n > 0 && c.OnRead != nil {
+		c.OnRead(int64(n))
+	}
+	return n, err
+}
+
+// FormatBytes formatuje liczbe bajtow w czytelnej postaci (KB/MB/GB) do
+// logow -- np. FormatBytes(1536000) -> "1.5 MB".
+func FormatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n2 := n / unit; n2 >= unit; n2 /= unit {
+		div *= unit
+		exp++
+	}
+	units := "KMGTPE"
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), units[exp])
+}
+
 // procesu i przechwytujac stdout/stderr -- uzywane np. dla pomocniczych
 // komend hosta ktore czytaja dane z wejscia standardowego.
 func RunWithStdin(dir string, stdinData []byte, name string, args ...string) error {
