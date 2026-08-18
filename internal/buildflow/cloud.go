@@ -8,6 +8,7 @@ import (
 
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/buildlock"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/config"
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/cosign"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/liveparse"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/ociimage"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/preflight"
@@ -126,6 +127,22 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 		return nil, err
 	}
 
+	// Walidacja trybu projektu -- container/containerized maja WLASNE
+	// przeplywy (buildflow.BuildContainer) i nie powinny przypadkiem
+	// przejsc przez zwykla sciezke "build cloud" (ktora wstrzykuje hammer i
+	// pcha obraz jako bootc-style OCI -- dokladnie tego chcemy UNIKNAC dla
+	// zwyklego kontenera roboczego). Sprawdzane TUTAJ, PRZED liveparse i
+	// kosztownym debootstrap w rootfs.Builder.Build() -- ktory i tak
+	// wykonalby sie ponownie w BuildContainer, wiec nie ma sensu pozwolic
+	// mu wystartowac tutaj tylko po to, by chwile pozniej i tak sie nie przydal.
+	if cfg.Project.IsContainerBuild() || cfg.Project.IsContainerizedIsolator() {
+		return nil, fmt.Errorf(
+			"[project] -> type = %q -- uzyj 'hackeros-builder build container' "+
+				"zamiast 'build cloud'/'build all' (kontener roboczy ma WLASNY "+
+				"przeplyw budowy, bez hammer/atomowosci -- patrz buildflow.BuildContainer)",
+			cfg.Project.Type)
+	}
+
 	project, err := liveparse.Parse(opts.ProjectDir)
 	if err != nil {
 		return nil, fmt.Errorf("parsowanie struktury projektu: %w", err)
@@ -137,6 +154,10 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 
 	if err := builder.Build(); err != nil {
 		return nil, fmt.Errorf("budowa rootfs: %w", err)
+	}
+
+	if err := rootfs.ValidateRootfs(rootfsDir, rootfs.ValidateOptions{RequireHammerConfig: true}); err != nil {
+		return nil, fmt.Errorf("walidacja rootfs przed push: %w", err)
 	}
 
 	// Nazwa i tag obrazu OCI -- patrz resolveImageNameAndTag (wspolne z
@@ -172,22 +193,23 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 	// Pozwala wersjonowac obrazy OCI niezaleznie od wersji Debiana.
 	tag := imageTag
 
-	util.Infof("Pakowanie i wypychanie obrazu OCI do %s:%s...", repository, tag)
-	pushWorkDir := filepath.Join(opts.WorkDir, "oci-push")
-	if err := os.MkdirAll(pushWorkDir, 0o755); err != nil {
-		return nil, fmt.Errorf("tworzenie katalogu roboczego push: %w", err)
-	}
+	util.Infof("Pakowanie (warstwy przyrostowe) i wypychanie obrazu OCI do %s:%s...", repository, tag)
 
-	refspec, err := ociimage.BuildAndPush(ociimage.BuildParams{
-		RootfsDir:  rootfsDir,
+	refspec, err := ociimage.BuildAndPushLayers(ociimage.LayeredBuildParams{
+		LayerPaths: builder.LayerTarballs(),
 		Repository: repository,
 		Tag:        tag,
 		Token:      cfg.Token,
-		WorkDir:    pushWorkDir,
 		Insecure:   opts.InsecureRegistry,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build cloud: %w", err)
+	}
+
+	if cfg.Project.Sign {
+		if err := cosign.Sign(refspec, cfg.Project.CosignKey); err != nil {
+			return nil, fmt.Errorf("podpisywanie obrazu ([project] -> sign=true): %w", err)
+		}
 	}
 
 	util.Infof("Build cloud zakonczony: %s", refspec)
@@ -212,6 +234,12 @@ func loadAndValidateConfig(projectDir string) (*config.Config, error) {
 		util.Warnf("Release %q nie jest na liscie znanych wersji Debiana "+
 			"(bookworm/trixie/forky/sid/unstable) -- kontynuuje, ale sprawdz "+
 			"czy nazwa suite istnieje w uzywanym mirror.", cfg.Release)
+	}
+	if !cfg.IsKnownArch() {
+		util.Warnf("[release] -> arch=%q nie jest na liscie architektur oficjalnie "+
+			"wspieranych przez Debiana (amd64/arm64/armhf/armel/i386/mips64el/mipsel/"+
+			"ppc64el/riscv64/s390x) -- kontynuuje, ale debootstrap prawdopodobnie zawiedzie "+
+			"jesli to literowka.", cfg.EffectiveArch())
 	}
 	return cfg, nil
 }
