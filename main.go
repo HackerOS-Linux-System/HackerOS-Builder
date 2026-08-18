@@ -9,11 +9,11 @@ import (
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
 )
 
-const version = "0.3.0"
+const version = "0.10.0"
 
 // validSubcommands to jedyne akceptowane nazwy podkomendy (po opcjonalnym
 // "build"). Uzywane do walidacji i do budowy czytelnego komunikatu bledu.
-var validSubcommands = []string{"cloud", "iso", "all"}
+var validSubcommands = []string{"cloud", "iso", "all", "container"}
 
 func isValidSubcommand(s string) bool {
 	for _, v := range validSubcommands {
@@ -29,8 +29,8 @@ func printUsage() {
 	fmt.Printf(`%s %s -- budowanie niemutowalnych obrazow Debiana (OCI/bootc-style)
 
 %s
-  hackeros-builder [opcje] build <cloud|iso|all>
-  hackeros-builder [opcje] <cloud|iso|all>          (forma skrocona, bez "build")
+  hackeros-builder [opcje] build <cloud|iso|all|container>
+  hackeros-builder [opcje] <cloud|iso|all|container>          (forma skrocona, bez "build")
   hackeros-builder clean                            Usun katalog roboczy (--workdir).
   hackeros-builder clean --all                      Jak wyzej + usun wynikowy plik .iso (--output).
 
@@ -42,6 +42,16 @@ func printUsage() {
                         do instalacji -- boot startuje PROSTO w graficzny
                         instalator (Calamares), bez posredniego pulpitu live.
   build all              Wykonaj 'build cloud', nastepnie 'build iso'.
+  build container        Zbuduj kontener roboczy (podman/docker), NIE obraz
+                        atomowy/bootc -- bez hammer, bez ISO. Wynik to
+                        lokalne archiwum .tar (wczytywalne przez 'podman
+                        load'/'docker load') plus opcjonalny push do
+                        registry jesli [account]/[auth] sa ustawione w
+                        config.hk. Gdy [project] -> type = containerized,
+                        dodatkowo wbudowuje Isolator (podman-owy menedzer
+                        pakietow HackerOS) do /usr/bin/ -- kontener startuje
+                        gotowy do 'isolator install <pakiet>'. Patrz
+                        [project] -> type = container/containerized.
   clean                  Usun katalog roboczy (rootfs/oci/iso/...).
   clean --all             Jak 'clean', plus usun wynikowy plik .iso.
 
@@ -67,6 +77,12 @@ func printUsage() {
                            graficznego instalatora (Calamares) do ISO --
                            wynikowy obraz to czyste live-medium bez kreatora
                            instalacji.
+  --local-only             (tylko 'build container') Nie wypychaj kontenera
+                           do registry -- zapisz WYLACZNIE lokalne archiwum
+                           .tar wczytywalne przez 'podman load'/'docker load'.
+                           Bez tej flagi push jest i tak wykonywany TYLKO
+                           jesli [account]/[auth] sa faktycznie ustawione w
+                           config.hk (build container nie wymaga registry).
   --all                    (tylko 'clean') Usun rowniez plik wyjsciowy .iso,
                            nie tylko katalog roboczy.
   -h, --help               Wyswietl ta pomoc i wyjdz.
@@ -103,6 +119,7 @@ func main() {
 		skipPreflight    bool
 		noInstaller      bool
 		cleanAll         bool
+		localOnly        bool
 	)
 
 	var positional []string
@@ -134,6 +151,8 @@ func main() {
 			skipPreflight = true
 		case "--no-installer":
 			noInstaller = true
+		case "--local-only":
+			localOnly = true
 		case "--all":
 			cleanAll = true
 		case "-h", "--help", "help":
@@ -283,11 +302,31 @@ func main() {
 		}
 		fmt.Println()
 		fmt.Println(util.Colorize(util.ColorGreen, "Build all zakonczony.") + " ISO: " + absOutputISO)
+
+	case "container":
+		result, err := buildflow.BuildContainer(buildflow.ContainerOptions{
+			ProjectDir:       absProjectDir,
+			WorkDir:          absWorkDir,
+			LocalOnly:        localOnly,
+			InsecureRegistry: insecureRegistry,
+			SkipPreflight:    skipPreflight,
+		})
+		if err != nil {
+			fail(err.Error())
+		}
+		fmt.Println()
+		fmt.Println(util.Colorize(util.ColorGreen, "Kontener roboczy gotowy:") + " " + result.LocalArchivePath)
+		fmt.Printf("Zaladuj:  podman load -i %s   (albo: docker load -i %s)\n",
+			result.LocalArchivePath, result.LocalArchivePath)
+		fmt.Printf("Uruchom:  podman run -it --rm %s:%s\n", result.Repository, result.Tag)
+		if result.Pushed {
+			fmt.Printf("Wypchniety rowniez do registry: %s:%s\n", result.Repository, result.Tag)
+		}
 	}
 }
 
 func fail(msg string) {
-	fmt.Fprintln(os.Stderr, util.Colorize(util.ColorRed, "hackeros-builder:")+" "+msg)
+	util.PrintErrorBox("hackeros-builder", msg)
 	os.Exit(1)
 }
 
