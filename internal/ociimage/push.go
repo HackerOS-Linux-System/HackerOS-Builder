@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -35,6 +36,135 @@ type BuildParams struct {
 	// lokalnej). Nigdy nie wlaczane domyslnie; ustawiane explicite przez
 	// uzytkownika (np. flaga --insecure-registry w CLI).
 	Insecure bool
+}
+
+// LayeredBuildParams to dane potrzebne do zbudowania i wypchniecia obrazu
+// OCI z JUZ GOTOWYCH warstw przyrostowych (patrz internal/rootfs/layers.go,
+// Builder.LayerTarballs()) -- w odroznieniu od BuildParams/BuildAndPush
+// (ponizej), ktore nadal pakuja CALY rootfs w JEDNA warstwe od zera (uzywane
+// przez "build container", gdzie nie ma sensu przyrostowosci wzgledem
+// registry -- patrz internal/buildflow/container.go).
+type LayeredBuildParams struct {
+	LayerPaths []string // kolejne warstwy tar.gz, JUZ zbudowane przez rootfs.Builder (baza -> pakiety -> hooki -> runtime)
+	Repository string
+	Tag        string
+	Token      string
+	Insecure   bool
+}
+
+// BuildAndPushLayers buduje v1.Image z WIELU warstw (mutate.AppendLayers,
+// w kolejnosci) i wypycha go do Repository:Tag, pokazujac REALNY pasek
+// postepu liczony z bajtow faktycznie wyslanych do registry
+// (remote.WithProgress -- API biblioteki go-containerregistry, karmione
+// przez nia samej podczas kazdego PUT bloba/manifestu, nie przez nasze
+// wlasne przyblizenie).
+//
+// Korzysc z warstw przyrostowych ujawnia sie PO STRONIE REGISTRY: jesli
+// warstwa "base" jest bajt-w-bajt taka sama jak w poprzednim wypchnietym
+// obrazie (ten sam SHA256 digest), zgodny z OCI registry rozpozna to po
+// samym digescie i NIE poprosi o ponowne wgranie danych (blob juz istnieje)
+// -- to jest wbudowany mechanizm kazdego rejestru kontenerow (content-
+// addressed storage), nie cos co ten kod musi implementowac recznie.
+func BuildAndPushLayers(p LayeredBuildParams) (string, error) {
+	if len(p.LayerPaths) == 0 {
+		return "", fmt.Errorf(
+			"brak warstw OCI do wypchniecia -- rootfs.Builder.Build() nie zaraportowal " +
+				"ani jednej zmiany, co nie powinno sie zdarzyc dla swiezo zbudowanego rootfs " +
+				"(sprawdz czy debootstrap faktycznie utworzyl jakiekolwiek pliki w RootfsDir)")
+	}
+
+	util.Infof("Walidacja %d warstw(y) OCI przed wypchnieciem...", len(p.LayerPaths))
+	var totalBytes int64
+	for i, path := range p.LayerPaths {
+		if err := validateLayerTarball(path); err != nil {
+			return "", fmt.Errorf("warstwa %d/%d (%s) jest uszkodzona: %w -- "+
+				"NIE wypychamy ZADNEJ warstwy do registry (obraz musi byc spojny w calosci)",
+				i+1, len(p.LayerPaths), path, err)
+		}
+		if info, statErr := os.Stat(path); statErr == nil {
+			totalBytes += info.Size()
+		}
+	}
+
+	util.Infof("Budowanie obrazu OCI z %d warstw (razem %s)...", len(p.LayerPaths), util.FormatBytes(totalBytes))
+	img, err := buildImageFromLayers(p.LayerPaths)
+	if err != nil {
+		return "", fmt.Errorf("budowanie obrazu OCI: %w", err)
+	}
+
+	refStr := fmt.Sprintf("%s:%s", p.Repository, p.Tag)
+	ref, err := name.ParseReference(refStr)
+	if err != nil {
+		return "", fmt.Errorf("nieprawidlowa referencja obrazu %q: %w", refStr, err)
+	}
+
+	auth := &authn.Basic{
+		Username: "hackeros-builder",
+		Password: p.Token,
+	}
+	httpClient := httpclient.NewForRegistry(p.Insecure)
+
+	util.Infof("Wypychanie obrazu do %s...", refStr)
+	refStr2, err := pushWithProgress(ref, img, auth, httpClient, totalBytes)
+	if err != nil {
+		return "", err
+	}
+
+	util.Infof("Obraz wypchniety: %s (%d warstw)", refStr2, len(p.LayerPaths))
+	return refStr2, nil
+}
+
+// pushWithProgress opakowuje remote.Write w pasek postepu karmiony
+// v1.Update z remote.WithProgress -- wydzielone z BuildAndPushLayers zeby
+// ta sama logika dala sie ponownie uzyc dla BuildAndPush (jednowarstwowa
+// sciezka, patrz nizej) bez duplikacji.
+func pushWithProgress(ref name.Reference, img v1.Image, auth authn.Authenticator, httpClient *http.Client, totalBytes int64) (string, error) {
+	updates := make(chan v1.Update, 64)
+	bar := util.NewProgressBar("push OCI", totalBytes, "bajtow")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for u := range updates {
+			if u.Error != nil {
+				continue // blad koncowy i tak wraca z remote.Write ponizej, z pelnym kontekstem
+			}
+			bar.Set(u.Complete)
+		}
+	}()
+
+	writeErr := remote.Write(ref, img,
+		remote.WithAuth(auth),
+		remote.WithTransport(httpClient.Transport),
+		remote.WithProgress(updates))
+	<-done
+
+	if writeErr != nil {
+		bar.Fail("push do registry")
+		return "", fmt.Errorf("push do %s nie powiodl sie: %w", ref.String(), writeErr)
+	}
+	bar.Finish()
+	return ref.String(), nil
+}
+
+// buildImageFromLayers tworzy v1.Image z WIELU warstw tar.gz (w podanej
+// kolejnosci), startujac od empty.Image i dodajac je wszystkie naraz przez
+// mutate.AppendLayers -- ta sama funkcja co buildImageFromLayer (pojedyncza
+// warstwa) nizej, tylko dla N warstw.
+func buildImageFromLayers(layerPaths []string) (v1.Image, error) {
+	layers := make([]v1.Layer, 0, len(layerPaths))
+	for _, path := range layerPaths {
+		layer, err := tarball.LayerFromFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("tarball.LayerFromFile(%s): %w", path, err)
+		}
+		layers = append(layers, layer)
+	}
+	img, err := mutate.AppendLayers(empty.Image, layers...)
+	if err != nil {
+		return nil, fmt.Errorf("mutate.AppendLayers: %w", err)
+	}
+	return img, nil
 }
 
 // BuildAndPush pakuje RootfsDir do jednowarstwowego obrazu OCI i wypycha go
@@ -85,12 +215,16 @@ func BuildAndPush(p BuildParams) (string, error) {
 
 	httpClient := httpclient.NewForRegistry(p.Insecure)
 
-	if err := remote.Write(ref, img, remote.WithAuth(auth), remote.WithTransport(httpClient.Transport)); err != nil {
-		return "", fmt.Errorf("push do %s nie powiodl sie: %w", refStr, err)
+	var totalBytes int64
+	if info, statErr := os.Stat(layerTarPath); statErr == nil {
+		totalBytes = info.Size()
 	}
 
-	util.Infof("Obraz wypchniety: %s", refStr)
-	return refStr, nil
+	refStr2, err := pushWithProgress(ref, img, auth, httpClient, totalBytes)
+	if err != nil {
+		return "", err
+	}
+	return refStr2, nil
 }
 
 // createLayerTarball pakuje cala zawartosc rootfsDir do pojedynczego pliku
