@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -155,6 +156,63 @@ func execInternal(rootfsDir string, extraEnv []string, stdin []byte, timeout tim
 	}
 	if err != nil {
 		return fmt.Errorf("sandbox: exec %q w %s nie powiodl sie: %w", command, rootfsDir, err)
+	}
+	return nil
+}
+
+// ExecWithLines jak Exec, ale zamiast przekazywac stdout surowo na zywo do
+// terminala, woła onStdoutLine dla kazdej linii stdout -- uzywane do
+// zasilania paskow postepu (internal/util.ProgressBar) REALNYMI zdarzeniami
+// sparsowanymi z wyjscia polecenia (np. "Unpacking"/"Setting up" z
+// apt-get), zamiast zalewac terminal surowym, gadatliwym logiem apt.
+// stderr nadal idzie NA ZYWO do terminala -- bledy maja byc widoczne
+// natychmiast, niezaleznie od tego czy stdout jest w tej chwili
+// przechwytywany.
+func ExecWithLines(rootfsDir string, extraEnv []string, onStdoutLine func(string), command string, args ...string) error {
+	for _, sub := range []string{"proc", "sys", "dev", "dev/pts"} {
+		if err := os.MkdirAll(filepath.Join(rootfsDir, sub), 0o755); err != nil {
+			return fmt.Errorf("sandbox: mkdir %s w rootfs: %w", sub, err)
+		}
+	}
+
+	script := buildMountAndChrootScript(rootfsDir, command, args)
+
+	env := append(os.Environ(), noninteractiveEnv...)
+	env = append(env, extraEnv...)
+
+	cmd := exec.Command("unshare",
+		"--mount", "--pid", "--fork", "--uts", "--kill-child",
+		"sh", "-e", "-c", script,
+	)
+	cmd.Env = env
+	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("sandbox: stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("sandbox: start %q w %s: %w", command, rootfsDir, err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	// apt-get potrafi wypisywac bardzo dlugie linie (np. przy koliduj\u0105cych
+	// plikach konfiguracyjnych) -- domyslny limit bufio.Scanner (64KB) w
+	// rzadkich przypadkach mogl to obcinac; podnosimy limit do 1MB, tanie
+	// zabezpieczenie kosztem pomijalnej ilosci pamieci.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		onStdoutLine(scanner.Text())
+	}
+	scanErr := scanner.Err()
+
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return fmt.Errorf("sandbox: exec %q w %s nie powiodl sie: %w", command, rootfsDir, waitErr)
+	}
+	if scanErr != nil {
+		return fmt.Errorf("sandbox: odczyt stdout %q w %s: %w", command, rootfsDir, scanErr)
 	}
 	return nil
 }
