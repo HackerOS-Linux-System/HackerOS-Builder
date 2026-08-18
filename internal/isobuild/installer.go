@@ -22,11 +22,32 @@ var installerNoninteractiveEnv = []string{
 	"LANGUAGE=C",
 }
 
+// InstallerVariant okresla wariant/branding instalatora Calamares
+// wstrzykiwanego do ISO -- odpowiednik config.InstallerType, ale
+// zdefiniowany lokalnie w tym pakiecie zeby internal/isobuild nie musial
+// importowac internal/config wylacznie dla jednego typu wyliczeniowego
+// (buildflow.BuildIso wykonuje mapowanie config.InstallerType ->
+// isobuild.InstallerVariant przy wywolaniu).
+type InstallerVariant string
+
+const (
+	// InstallerVariantDefault: standardowy branding "HackerOS".
+	InstallerVariantDefault InstallerVariant = "default"
+
+	// InstallerVariantCybersecurity: branding "HackerOS Cybersecurity
+	// Edition" (inna paleta kolorow -- czerwony akcent) plus dodatkowy,
+	// mniejszy zestaw narzedzi diagnostycznych/sieciowych zainstalowany w
+	// SAMYM srodowisku live/instalatora (installerCybersecurityExtraPackages
+	// ponizej) -- odrebne od cybersecurityPackages() w internal/rootfs,
+	// ktore trafiaja do SYSTEMU DOCELOWEGO, nie do live-medium.
+	InstallerVariantCybersecurity InstallerVariant = "cybersecurity"
+)
+
 // installerPackages to minimalny zestaw potrzebny by Calamares mogl
 // wystartowac w X bez pelnego srodowiska graficznego (bez GNOME/KDE/etc --
 // sam Calamares ma wlasna szate Qt/QML, openbox jest tylko "oknem" pod spodem,
 // bez paskow zadan/dekoracji, zeby ekran wygladal jak dedykowany instalator,
-// a nie jak biurko).
+// a nie jak biurko). Instalowany zawsze, niezaleznie od InstallerVariant.
 var installerPackages = []string{
 	"calamares",
 	"xserver-xorg",
@@ -45,18 +66,39 @@ var installerPackages = []string{
 	"os-prober",
 }
 
+// installerCybersecurityExtraPackages to DODATKOWE pakiety instalowane w
+// srodowisku live/instalatora WYLACZNIE dla InstallerVariantCybersecurity --
+// przydatne do szybkiej diagnostyki sieci/sprzetu PRZED (lub zamiast)
+// instalacja na dysk, bez czekania na pelny system docelowy. Celowo
+// niewielki zestaw (nie duplikuje calego cybersecurityPackages() z
+// internal/rootfs) -- to jest live-medium, nie ma sensu obciazac go
+// dziesiatkami narzedzi ktore i tak beda dostepne w zainstalowanym
+// systemie gdy [project] -> type=cybersecurity.
+var installerCybersecurityExtraPackages = []string{
+	"nmap",
+	"net-tools",
+	"tcpdump",
+	"dnsutils",
+}
+
 // InjectInstaller wykonuje caly krok wstrzykniecia instalatora GUI do
 // rootfsDir (kopia ISO-only). workDir jest uzywany przez toolchain.Manager
 // do pobierania brakujacych narzedzi (wspoldzielony z reszta buildu --
 // narzedzia pobrane w kroku "build cloud" sa tu ponownie uzywane z cache).
-func InjectInstaller(rootfsDir, workDir string) error {
+// variant okresla branding/dodatkowe narzedzia -- patrz InstallerVariant.
+func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant) error {
 	// Toolchain: upewnij sie ze apt-get i dpkg-deb sa dostepne (sa zawsze,
 	// ale Manager.Env() daje nam sciezke z toolchain/bin/ na czele PATH
 	// co jest potrzebne jesli debootstrap byl pobrany tymczasowo).
 	tc := toolchain.New(workDir)
 	tcEnv := tc.Env()
 
-	util.Infof("  instalator GUI: instalacja Calamares + Xorg (%d pakietow)...", len(installerPackages))
+	pkgs := installerPackages
+	if variant == InstallerVariantCybersecurity {
+		pkgs = append(append([]string{}, installerPackages...), installerCybersecurityExtraPackages...)
+	}
+
+	util.Infof("  instalator GUI (%s): instalacja Calamares + Xorg (%d pakietow)...", variantLabel(variant), len(pkgs))
 	if err := sandbox.ExecEnv(rootfsDir, tcEnv, "apt-get", "update"); err != nil {
 		return fmt.Errorf("apt-get update: %w", err)
 	}
@@ -64,13 +106,13 @@ func InjectInstaller(rootfsDir, workDir string) error {
 		"install", "-y", "--no-install-recommends",
 		"-o", "Dpkg::Options::=--force-confdef",
 		"-o", "Dpkg::Options::=--force-confold",
-	}, installerPackages...)
+	}, pkgs...)
 	if err := sandbox.ExecEnv(rootfsDir, tcEnv, "apt-get", installArgs...); err != nil {
 		return fmt.Errorf("apt-get install (instalator): %w", err)
 	}
 
 	util.Infof("  instalator GUI: zapis konfiguracji Calamares...")
-	if err := writeCalamaresConfig(rootfsDir); err != nil {
+	if err := writeCalamaresConfig(rootfsDir, variant); err != nil {
 		return fmt.Errorf("konfiguracja calamares: %w", err)
 	}
 
@@ -82,6 +124,14 @@ func InjectInstaller(rootfsDir, workDir string) error {
 	return nil
 }
 
+// variantLabel zwraca czytelna etykiete wariantu do logow.
+func variantLabel(variant InstallerVariant) string {
+	if variant == InstallerVariantCybersecurity {
+		return "Cybersecurity Edition"
+	}
+	return "default"
+}
+
 // writeCalamaresConfig zapisuje pelny zestaw plikow konfiguracyjnych
 // Calamares wewnatrz rootfs (trafiaja do ISO, NIE do obrazu wypchnietego
 // "build cloud"). Sekwencja modulow odpowiada standardowemu, sprawdzonemu
@@ -90,7 +140,7 @@ func InjectInstaller(rootfsDir, workDir string) error {
 // users -> summary -> unpackfs (kopiowanie z /live/filesystem.squashfs) ->
 // machineid -> fstab -> localecfg -> grubcfg -> bootloader -> umountcfg ->
 // finished.
-func writeCalamaresConfig(rootfsDir string) error {
+func writeCalamaresConfig(rootfsDir string, variant InstallerVariant) error {
 	base := filepath.Join(rootfsDir, "etc", "calamares")
 	modulesDir := filepath.Join(base, "modules")
 	brandingDir := filepath.Join(base, "branding", "hackeros")
@@ -117,7 +167,7 @@ func writeCalamaresConfig(rootfsDir string) error {
 		filepath.Join(modulesDir, "umount.conf"):       calamaresUmountConf,
 		filepath.Join(modulesDir, "shellprocess.conf"): calamaresShellprocessConf,
 
-		filepath.Join(brandingDir, "branding.desc"): calamaresBrandingDesc,
+		filepath.Join(brandingDir, "branding.desc"): brandingDescFor(variant),
 	}
 
 	for path, content := range files {
@@ -126,6 +176,17 @@ func writeCalamaresConfig(rootfsDir string) error {
 		}
 	}
 	return nil
+}
+
+// brandingDescFor zwraca zawartosc branding.desc dopasowana do wariantu
+// instalatora -- InstallerVariantCybersecurity dostaje inna nazwe produktu
+// i czerwona palete akcentu (zamiast domyslnej niebieskiej), zeby instalator
+// byl wizualnie odrozniony od zwyklej edycji juz na pierwszym ekranie.
+func brandingDescFor(variant InstallerVariant) string {
+	if variant == InstallerVariantCybersecurity {
+		return calamaresBrandingDescCybersecurity
+	}
+	return calamaresBrandingDesc
 }
 
 const calamaresSettingsConf = `# Wygenerowane przez hackeros-builder -- NIE edytuj recznie w obrazie,
@@ -269,15 +330,32 @@ timeout: "10"
 const calamaresUmountConf = `---
 `
 
-// calamaresShellprocessConf zaszywa wpis [origin] hammer w docelowym
-// systemie po skopiowaniu plikow (squashfs juz zawiera poprawny
-// /etc/hammer/oci.hk wygenerowany przez "build iso" -- ten krok
-// jest tylko siatka bezpieczenstwa, no-op gdy plik juz istnieje).
+// calamaresShellprocessConf sprzata artefakty SAMEGO INSTALATORA z systemu
+// DOCELOWEGO tuz po unpackfs+bootloader, PRZED umount -- bez tego kroku
+// zainstalowany system dziedziczylby (bo unpackfs kopiuje 1:1 z tego samego
+// live-medium ktore ma writeInstallerAutostart wypalone w /etc, /root,
+// /usr/local/sbin) autologin roota na tty1 + natychmiastowy `startx` w
+// Calamares -- czyli PIERWSZY reboot po instalacji odpalilby instalator
+// PONOWNIE zamiast normalnie zalogowac do zainstalowanego systemu. To byl
+// realny brakujacy krok: shellprocess wczesniej robil WYLACZNIE
+// "mkdir -p /etc/hammer" (siatka bezpieczenstwa dla hammer), bez zadnego
+// sprzatania po instalatorze.
+//
+// dontChroot: false => kazda komenda ponizej jest wykonywana W CHROOCIE do
+// systemu docelowego (nie na live-medium) -- to wlasnie ten mechanizm robi
+// sprzatanie bezpiecznym: usuwamy pliki na PARTYCJI DOCELOWEJ, nie na ISO.
 const calamaresShellprocessConf = `---
 dontChroot: false
 timeout: 30
 script:
     - command: "mkdir -p /etc/hammer"
+    - command: "rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf"
+    - command: "rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d"
+    - command: "sh -c 'grep -q \"autostart instalatora GUI na tty1\" /root/.bash_profile 2>/dev/null && rm -f /root/.bash_profile; exit 0'"
+    - command: "rm -f /usr/local/sbin/hackeros-installer-xinit"
+    - command: "rm -rf /etc/hackeros-installer"
+    - command: "rm -f /run/hackeros-installer-started"
+    - command: "rm -rf /etc/calamares"
 `
 
 const calamaresBrandingDesc = `---
@@ -310,6 +388,44 @@ style:
    sidebarText:             "#ffffff"
    sidebarTextSelect:       "#3daee9"
    sidebarTextHighlight:    "#3daee9"
+`
+
+// calamaresBrandingDescCybersecurity -- InstallerVariantCybersecurity, patrz
+// brandingDescFor. Identyczna struktura co calamaresBrandingDesc, roznica
+// to nazwa produktu ("HackerOS Cybersecurity Edition") i paleta stylu
+// (czerwony akcent "#ff3b30" zamiast niebieskiego "#3daee9") -- wizualny
+// sygnal juz na pierwszym ekranie instalatora, ze to edycja Cybersecurity
+// (Red Team), nie zwykla edycja HackerOS.
+const calamaresBrandingDescCybersecurity = `---
+componentName:  hackeros
+
+welcomeStyleCalamares: true
+welcomeExpandingLogo:  true
+
+strings:
+    productName:         "HackerOS Cybersecurity Edition"
+    shortProductName:    "HackerOS CyberSec"
+    version:              ""
+    shortVersion:         ""
+    versionedName:        "HackerOS Cybersecurity Edition"
+    shortVersionedName:   "HackerOS CyberSec"
+    bootloaderEntryName:  "HackerOS Cybersecurity Edition"
+    productUrl:           "https://github.com/HackerOS-Linux-System"
+    supportUrl:           "https://github.com/HackerOS-Linux-System"
+    releaseNotesUrl:      "https://github.com/HackerOS-Linux-System"
+
+images:
+    productLogo:         "logo.png"
+    productIcon:         "logo.png"
+    productWelcome:      "welcome.png"
+
+slideshow: "show.qml"
+
+style:
+   sidebarBackground:       "#170a0a"
+   sidebarText:             "#ffffff"
+   sidebarTextSelect:       "#ff3b30"
+   sidebarTextHighlight:    "#ff3b30"
 `
 
 // writeInstallerAutostart sprawia, ze po starcie nosnika live PIERWSZY ekran
@@ -370,7 +486,7 @@ fi
 	xinitScript := `#!/bin/sh
 # Wygenerowane przez hackeros-builder.
 openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
-exec calamares -d
+exec calamares
 `
 	xinitPath := filepath.Join(binDir, "hackeros-installer-xinit")
 	if err := os.WriteFile(xinitPath, []byte(xinitScript), 0o755); err != nil {
