@@ -2,6 +2,7 @@ package ociimage
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -113,12 +114,30 @@ func pullAndUnpackOnce(ref name.Reference, auth authn.Authenticator, httpClient 
 		return fmt.Errorf("odczyt warstw obrazu: %w", err)
 	}
 
-	util.Infof("Rozpakowywanie %d warstw(y)...", len(layers))
+	var totalBytes int64
+	sizes := make([]int64, len(layers))
 	for i, layer := range layers {
-		if err := extractLayer(layer, destDir); err != nil {
+		size, sizeErr := layer.Size()
+		if sizeErr == nil {
+			sizes[i] = size
+			totalBytes += size
+		}
+	}
+
+	util.Infof("Rozpakowywanie %d warstw(y) (razem %s)...", len(layers), util.FormatBytes(totalBytes))
+	bar := util.NewProgressBar("pull OCI", totalBytes, "bajtow")
+	var doneBytes int64
+	onRead := func(n int64) {
+		doneBytes += n
+		bar.Set(doneBytes)
+	}
+	for i, layer := range layers {
+		if err := extractLayerWithProgress(layer, destDir, onRead); err != nil {
+			bar.Fail(fmt.Sprintf("warstwa %d/%d", i+1, len(layers)))
 			return fmt.Errorf("rozpakowywanie warstwy %d/%d: %w", i+1, len(layers), err)
 		}
 	}
+	bar.Finish()
 	return nil
 }
 
@@ -180,24 +199,32 @@ func tarModeToFileMode(rawMode int64) os.FileMode {
 	return fm
 }
 
-// extractLayer rozpakowuje pojedyncza warstwe OCI (tar, zdekompresowany
-// automatycznie przez Uncompressed()) do destDir, obslugujac whiteouts OCI:
-//   - plik o nazwie ".wh.<nazwa>" oznacza usuniecie <nazwa> z warstw nizszych
-//   - katalog z plikiem ".wh..wh..opq" oznacza "opaque whiteout" -- usuniecie
-//     CALEJ zawartosci tego katalogu pochodzacej z warstw nizszych przed
-//     wstawieniem nowej zawartosci tej warstwy
-func extractLayer(layer v1.Layer, destDir string) error {
-	rc, err := layer.Uncompressed()
+// extractLayerWithProgress rozpakowuje pojedyncza warstwe OCI, zliczajac
+// REALNE bajty skompresowane odczytane ze strumienia (layer.Compressed(),
+// nie Uncompressed()!) i przekazujac je do onRead -- total odpowiada
+// DOKLADNIE layer.Size() uzytemu przez wywolujacego (PullAndUnpack) do
+// zainicjowania paska postepu, wiec postep jest dokladny (nie
+// przyblizenie z rozmiaru zdekompresowanego, ktorego nie da sie poznac z
+// gory bez pobrania calej warstwy).
+func extractLayerWithProgress(layer v1.Layer, destDir string, onRead func(int64)) error {
+	rc, err := layer.Compressed()
 	if err != nil {
-		return fmt.Errorf("Uncompressed(): %w", err)
+		return fmt.Errorf("Compressed(): %w", err)
 	}
 	defer rc.Close()
 
-	return extractTarStream(tar.NewReader(rc), destDir)
+	counting := &util.CountingReader{R: rc, OnRead: onRead}
+	gzr, err := gzip.NewReader(counting)
+	if err != nil {
+		return fmt.Errorf("naglowek gzip warstwy: %w", err)
+	}
+	defer gzr.Close()
+
+	return extractTarStream(tar.NewReader(gzr), destDir)
 }
 
 // extractTarStream zawiera cala logike rozpakowywania pojedynczego strumienia
-// tar do destDir -- wydzielone z extractLayer wylacznie po to, zeby dalo sie
+// tar do destDir -- wydzielone z extractLayerWithProgress wylacznie po to, zeby dalo sie
 // to przetestowac jednostkowo bez potrzeby prawdziwego v1.Layer/registry
 // (testy budują tr z bytes.Buffer przez archive/tar bezposrednio).
 func extractTarStream(tr *tar.Reader, destDir string) error {
