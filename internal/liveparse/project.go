@@ -1,9 +1,11 @@
 package liveparse
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -18,7 +20,22 @@ type Project struct {
 
 	// Hooks to lista skryptow do wykonania wewnatrz chroot, w porzadku
 	// alfabetycznym nazwy pliku (tak jak live-build sortuje hooks/normal/).
+	// Obejmuje hooks/normal/ + hooks/live/ (patrz parseHooks). NIE obejmuje
+	// hooks/installer/ -- te sa osobno w InstallerHooks (patrz nizej),
+	// dzialaja na INNYM rootfs (kopia ISO-only) i w INNYM momencie buildu.
 	Hooks []HookScript
+
+	// InstallerHooks to lista skryptow z config/hooks/installer/, wykonywana
+	// WYLACZNIE przez "build iso" (isobuild), PO wstrzyknieciu instalatora
+	// (Calamares) do kopii rootfs uzywanej do budowy ISO -- i TYLKO gdy
+	// instalator jest wlaczony ([project] -> installer != none). Sluzy do
+	// dostosowywania SAMEGO instalatora (np. wlasny branding.desc,
+	// dodatkowe moduly Calamares, wlasny welcome.png/logo.png) -- w
+	// odroznieniu od Hooks (ktore modyfikuja system DOCELOWY), te hooki
+	// modyfikuja srodowisko INSTALATORA/live-medium. Ten sam format pliku
+	// (*.hook.chroot, dowolny jezyk przez shebang) i ten sam mechanizm
+	// wykonania (sandbox.ExecHook) co Hooks -- patrz isobuild.runInstallerHooks.
+	InstallerHooks []HookScript
 
 	// IncludesChroot to sciezka do config/includes.chroot (lub "" jesli
 	// katalog nie istnieje) -- zachowane dla zgodnosci wstecz, semantyka
@@ -55,6 +72,60 @@ type Project struct {
 type HookScript struct {
 	Name string // nazwa pliku, np. "0100-install-extra-tools.hook.chroot"
 	Path string // pelna sciezka na dysku hosta
+
+	// Interpreter to nazwa binarki interpretera wykryta z linii shebang
+	// (pierwsza linia pliku, "#!/usr/bin/..."), np. "python3", "ruby",
+	// "lua5.4", "sh". Pusty string jesli plik nie ma shebanga (wtedy
+	// wykonanie polega na tym, ze plik jest binarka ELF z bitem +x, albo
+	// zakonczy sie bledem "exec format error" -- oba te scenariusze sa
+	// jednoznacznie zdiagnozowane w komunikacie bledu wywolujacego, patrz
+	// rootfs.Builder.runHooks / isobuild.runInstallerHooks).
+	Interpreter string
+}
+
+// hookInterpreterRe wyciaga nazwe binarki interpretera z linii shebang.
+// Obsluguje oba popularne warianty:
+//
+//	#!/usr/bin/env python3        -> "python3"
+//	#!/usr/bin/python3            -> "python3"
+//	#!/bin/bash                   -> "bash"
+//
+// Zamierzenie: dowolny jezyk dziala "za darmo" przez shebang -- ta funkcja
+// tylko WYKRYWA co zostalo zadeklarowane, zeby CLI mogl (a) ladnie
+// zalogowac w jakim jezyku jest hook, (b) doinstalowac brakujacy
+// interpreter PRZED probą wykonania (patrz internal/rootfs, mapa
+// hookInterpreterPackages), zamiast dawac kryptyczny "exec format error"
+// albo "no such file or directory" z samego chroot/exec.
+var hookInterpreterRe = regexp.MustCompile(`^#!\s*(?:/usr/bin/env\s+)?(\S*/)?([A-Za-z0-9_.+-]+)`)
+
+// detectHookInterpreter czyta pierwsza linie pliku i zwraca nazwe binarki
+// interpretera (np. "python3", "ruby", "bash"), albo "" jesli plik nie ma
+// linii shebang. Blad odczytu jest CELOWO ignorowany (zwraca "") -- brak
+// mozliwosci wykrycia jezyka nie powinien wywrocic calego parsowania
+// projektu, tylko pozbawic ten JEDEN hook ladnej etykiety jezyka w logach;
+// faktyczny blad (plik nieczytelny/nieistniejacy) i tak wyjdzie pozniej,
+// przy faktycznej probie skopiowania/wykonania hooka.
+func detectHookInterpreter(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), 4096)
+	if !scanner.Scan() {
+		return ""
+	}
+	firstLine := scanner.Text()
+	if !strings.HasPrefix(firstLine, "#!") {
+		return ""
+	}
+	m := hookInterpreterRe.FindStringSubmatch(firstLine)
+	if m == nil {
+		return ""
+	}
+	return m[2]
 }
 
 // Parse interpretuje projekt w danym katalogu glownym (root). Zwraca blad
@@ -75,6 +146,9 @@ func Parse(root string) (*Project, error) {
 		return nil, err
 	}
 	if err := p.parseHooks(configDir); err != nil {
+		return nil, err
+	}
+	if err := p.parseInstallerHooks(configDir); err != nil {
 		return nil, err
 	}
 	p.parseIncludesChroot(configDir)
@@ -203,15 +277,46 @@ func readPackageListFile(path string) ([]string, error) {
 // ale znaczna czesc zamierzonej zawartosci obrazu nigdy nie powstawala,
 // bez zadnego bledu czy ostrzezenia.
 func (p *Project) parseHooks(configDir string) error {
+	hooks, err := readHookDirs(configDir, "normal", "live")
+	if err != nil {
+		return err
+	}
+	p.Hooks = hooks
+	return nil
+}
+
+// parseInstallerHooks zbiera skrypty z config/hooks/installer/ -- osobna
+// kategoria od Hooks (normal/live), patrz komentarz przy polu
+// Project.InstallerHooks. Nie jest wolane przez Parse() (build cloud nie
+// potrzebuje tych hookow -- dzialaja wylacznie w build iso), tylko
+// osobno przez ParseInstallerHooks ponizej.
+func (p *Project) parseInstallerHooks(configDir string) error {
+	hooks, err := readHookDirs(configDir, "installer")
+	if err != nil {
+		return err
+	}
+	p.InstallerHooks = hooks
+	return nil
+}
+
+// readHookDirs czyta config/hooks/<subdir1>/*.hook.chroot dla kazdego
+// podanego subdir (w podanej kolejnosci), sortujac PLIKI W OBRebie
+// KAZDEGO katalogu alfabetycznie (konwencja live-build: prefiksy
+// numeryczne typu "0100-...", "0200-..." decyduja o kolejnosci wykonania
+// wewnatrz jednego katalogu). Kazdy znaleziony plik ma wykrywany
+// interpreter z shebang (patrz detectHookInterpreter) -- niezaleznie od
+// kategorii, dowolny jezyk (shell, python, ruby, lua, perl, ...) jest
+// wspierany jednakowo we wszystkich trzech katalogach (normal/live/installer).
+func readHookDirs(configDir string, subdirs ...string) ([]HookScript, error) {
 	var hooks []HookScript
-	for _, subdir := range []string{"normal", "live"} {
+	for _, subdir := range subdirs {
 		dir := filepath.Join(configDir, "hooks", subdir)
 		entries, err := os.ReadDir(dir)
 		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("nie mozna odczytac %s: %w", dir, err)
+			return nil, fmt.Errorf("nie mozna odczytac %s: %w", dir, err)
 		}
 
 		var subHooks []HookScript
@@ -219,17 +324,33 @@ func (p *Project) parseHooks(configDir string) error {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".hook.chroot") {
 				continue
 			}
+			path := filepath.Join(dir, e.Name())
 			subHooks = append(subHooks, HookScript{
-				Name: e.Name(),
-				Path: filepath.Join(dir, e.Name()),
+				Name:        e.Name(),
+				Path:        path,
+				Interpreter: detectHookInterpreter(path),
 			})
 		}
 		sort.Slice(subHooks, func(i, j int) bool { return subHooks[i].Name < subHooks[j].Name })
 		hooks = append(hooks, subHooks...)
 	}
+	return hooks, nil
+}
 
-	p.Hooks = hooks
-	return nil
+// ParseInstallerHooks czyta config/hooks/installer/*.hook.chroot
+// NIEZALEZNIE od reszty struktury projektu (Parse) -- uzywane przez
+// "build iso", ktore MOZE dzialac bez pelnej struktury package-lists/
+// hooks-normal/includes.chroot na dysku lokalnym (np. gdy obraz OCI zostal
+// juz zbudowany gdzie indziej i "build iso" tylko go sciaga z registry).
+// Zwraca pusta liste (bez bledu) jesli root, config/ lub
+// config/hooks/installer/ nie istnieje -- brak tych hookow jest zupelnie
+// normalny (wiekszosc projektow ich nie uzywa), nie jest to blad.
+func ParseInstallerHooks(root string) ([]HookScript, error) {
+	configDir := filepath.Join(root, "config")
+	if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+		return nil, nil
+	}
+	return readHookDirs(configDir, "installer")
 }
 
 // parseIncludesChroot ustawia sciezki do config/includes.chroot,
@@ -303,7 +424,11 @@ func readLines(path string) ([]string, error) {
 func (p *Project) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Pakietow do instalacji:  %d\n", len(p.Packages))
-	fmt.Fprintf(&b, "Hookow do wykonania:     %d\n", len(p.Hooks))
+	fmt.Fprintf(&b, "Hookow do wykonania:     %d%s\n", len(p.Hooks), languageBreakdown(p.Hooks))
+	if len(p.InstallerHooks) > 0 {
+		fmt.Fprintf(&b, "Hookow instalatora:      %d%s (config/hooks/installer/)\n",
+			len(p.InstallerHooks), languageBreakdown(p.InstallerHooks))
+	}
 	if p.IncludesChrootBeforePackages != "" {
 		fmt.Fprintf(&b, "includes.chroot_before_packages: %s\n", p.IncludesChrootBeforePackages)
 	}
@@ -319,4 +444,32 @@ func (p *Project) Summary() string {
 	fmt.Fprintf(&b, "Dodatkowych zrodel apt:  %d\n", len(p.ExtraSources))
 	fmt.Fprintf(&b, "Dodatkowych kluczy GPG:  %d\n", len(p.ExtraKeys))
 	return b.String()
+}
+
+// languageBreakdown zwraca krotkie podsumowanie jezykow wykrytych w liscie
+// hookow w nawiasach, np. " (sh: 2, python3: 1)" -- albo pusty string gdy
+// lista jest pusta. Uzywane przez Summary() zeby uzytkownik od razu widzial
+// w jakich jezykach sa jego hooki, bez zagladania do kazdego pliku.
+func languageBreakdown(hooks []HookScript) string {
+	if len(hooks) == 0 {
+		return ""
+	}
+	counts := make(map[string]int)
+	var order []string
+	for _, h := range hooks {
+		lang := h.Interpreter
+		if lang == "" {
+			lang = "brak shebang"
+		}
+		if counts[lang] == 0 {
+			order = append(order, lang)
+		}
+		counts[lang]++
+	}
+	sort.Strings(order)
+	parts := make([]string, 0, len(order))
+	for _, lang := range order {
+		parts = append(parts, fmt.Sprintf("%s: %d", lang, counts[lang]))
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
