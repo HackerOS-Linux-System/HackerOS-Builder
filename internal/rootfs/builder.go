@@ -6,20 +6,24 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/config"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/download"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/hkgen"
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/hooklang"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/liveparse"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/sandbox"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/toolchain"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
 )
 
-// defaultMirror to domyslny mirror Debiana uzywany przez debootstrap gdy
-// uzytkownik nie poda innego (na razie sztywno -- ROADMAP: konfigurowalny
-// mirror per-projekt w config.hk).
-const defaultMirror = "http://deb.debian.org/debian"
+// defaultMirror -- PRZENIESIONE do config.DefaultMirror ([release] -> mirror
+// jest teraz konfigurowalny). Alias zostawiony zeby nie lamac ewentualnych
+// zewnetrznych odwolan -- kod w tym pakiecie uzywa juz
+// b.Config.EffectiveMirror()/EffectiveArch().
+const defaultMirror = config.DefaultMirror
 
 // Builder buduje rootfs na podstawie sparsowanego projektu i konfiguracji.
 type Builder struct {
@@ -30,6 +34,35 @@ type Builder struct {
 
 	// OriginRefspec to refspec obrazu OCI wpisywany do /etc/hammer/oci.hk
 	OriginRefspec string
+
+	// ContainerMode: gdy true, Build() POMIJA CALKOWICIE wstrzykiwanie
+	// hammer i generowanie /etc/hammer/oci.hk -- uzywane przez
+	// buildflow.BuildContainer ([project] -> type = container) dla
+	// zwyklych kontenerow roboczych (podman/docker), ktore NIE sa
+	// zarzadzane atomowo i nie maja hammer w ogole. Ustawiane recznie
+	// przez wolajacego (nie jest wyliczane automatycznie z Config, zeby
+	// decyzja "czy ten konkretny build ma hammer" byla jawna w miejscu
+	// wywolania, a nie ukryta w logice Buildera).
+	ContainerMode bool
+
+	// layerPaths gromadzi sciezki KOLEJNYCH warstw OCI przyrostowych
+	// (baza/pakiety/hooki/runtime) zbudowanych podczas Build() -- patrz
+	// internal/rootfs/layers.go i LayerTarballs() ponizej. Puste dopoki
+	// Build() sie nie powiedzie.
+	layerPaths []string
+}
+
+// LayerTarballs zwraca sciezki do KOLEJNYCH warstw OCI przyrostowych
+// zbudowanych podczas ostatniego udanego Build() (w kolejnosci w jakiej
+// maja zostac dolozone do obrazu przez mutate.AppendLayers -- baza
+// najpierw). Puste warstwy (brak zmian miedzy dwoma punktami kontrolnymi)
+// sa juz pominiete -- kazda sciezka na tej liscie odpowiada faktycznie
+// istniejacemu, niepustemu plikowi tar.gz. Wywolywane przez
+// internal/buildflow.BuildCloud PO udanym Build(), zeby przekazac warstwy
+// do internal/ociimage.BuildAndPushLayers zamiast (jak do wersji 0.8.0)
+// pakowac caly rootfs w jedna warstwe od nowa.
+func (b *Builder) LayerTarballs() []string {
+	return b.layerPaths
 }
 
 // New tworzy nowy Builder.
@@ -73,6 +106,144 @@ func (b *Builder) macPackages() []string {
 	}
 }
 
+// cybersecurityPackages zwraca liste pakietow apt instalowanych dla
+// [project] -> type = cybersecurity -- odpowiednik "Cybersecurity Edition"
+// znanej z glownego repozytorium HackerOS (nastawionej na Red Team), w
+// zakresie mozliwym do zrealizowania samym apt z repozytoriow Debiana
+// (bez proprietarnych narzedzi HackerOS, ktore sa poza zakresem tego
+// buildera -- te doinstalowuje sie normalnie przez wlasny package-lists
+// projektu / hooks, dokladnie tak jak kazdy inny dodatkowy pakiet).
+//
+// Dobor pakietow: rekonesans sieciowy (nmap, netcat-openbsd, tcpdump,
+// wireshark, whois, dnsutils), audyt/lamanie hasel (hydra, john, hashcat),
+// audyt sieci bezprzewodowych (aircrack-ng), audyt aplikacji webowych
+// (sqlmap, nikto), analiza binarna/forensyka (radare2, binwalk, foremost,
+// steghide) oraz debugowanie niskopoziomowe (gdb). Wszystkie sa dostepne
+// wprost w domyslnych repozytoriach Debiana (main), wiec nie wymagaja
+// dodatkowych [archives] w config/config.hk.
+func cybersecurityPackages() []string {
+	return []string{
+		// rekonesans / siec
+		"nmap",
+		"netcat-openbsd",
+		"tcpdump",
+		"wireshark",
+		"whois",
+		"dnsutils",
+		// audyt uwierzytelniania
+		"hydra",
+		"john",
+		"hashcat",
+		// audyt sieci bezprzewodowych
+		"aircrack-ng",
+		// audyt aplikacji webowych
+		"sqlmap",
+		"nikto",
+		// analiza binarna / forensyka
+		"radare2",
+		"binwalk",
+		"foremost",
+		"steghide",
+		// debugowanie niskopoziomowe
+		"gdb",
+	}
+}
+
+// aptInstallWithProgress instaluje pkgs przez apt-get, pokazujac REALNY
+// pasek postepu (internal/util.ProgressBar): total jest wyliczany PRZED
+// instalacja przez "apt-get install -y -s" (symulacja typu dry-run, apt
+// NIC nie zmienia w systemie, tylko wypisuje plan -- kazdy pakiet ktory
+// faktycznie zostanie zainstalowany/zaktualizowany pojawia sie jako linia
+// "Inst ..."), a postep w trakcie faktycznej instalacji jest zliczany na
+// podstawie linii "Setting up ..." (apt wypisuje ja dokladnie raz na
+// kazdy skonfigurowany pakiet, niezaleznie od kolejnosci rozpakowywania) --
+// to jest wiec postep policzony z FAKTYCZNIE wykonanej pracy, nie
+// przyblizenie "na oko".
+//
+// extraArgs to dodatkowe opcje apt (przed lista pakietow), np.
+// "--no-install-recommends" dla instalatora GUI w internal/isobuild.
+func (b *Builder) aptInstallWithProgress(label string, pkgs []string, extraArgs ...string) error {
+	if len(pkgs) == 0 {
+		return nil
+	}
+
+	simArgs := append(append([]string{"install", "-y", "-s"}, extraArgs...), pkgs...)
+	total := countAptPlannedOps(b.RootfsDir, simArgs)
+
+	installArgs := append([]string{
+		"install", "-y",
+		"-o", "Dpkg::Options::=--force-confdef",
+		"-o", "Dpkg::Options::=--force-confold",
+	}, extraArgs...)
+	installArgs = append(installArgs, pkgs...)
+
+	bar := util.NewProgressBar(label, int64(total), "pakietow")
+	var done int64
+	onLine := func(line string) {
+		util.Debugf("apt: %s", line)
+		if strings.HasPrefix(line, "Setting up ") {
+			done++
+			bar.Set(done)
+		}
+	}
+	if err := sandbox.ExecWithLines(b.RootfsDir, nil, onLine, "apt-get", installArgs...); err != nil {
+		bar.Fail("apt-get install")
+		return fmt.Errorf("instalacja pakietow %s (%v): %w", label, pkgs, err)
+	}
+	bar.Finish()
+	return nil
+}
+
+// countAptPlannedOps uruchamia "apt-get install -y -s <simArgs...>" (dry
+// run, NIE zmienia systemu) i liczy linie "Inst " -- dokladna liczba
+// pakietow ktore apt faktycznie zainstaluje/zaktualizuje w tym wywolaniu
+// (moze byc WIEKSZA niz len(pkgs), bo apt dociaga zaleznosci). Blad
+// symulacji (np. konflikt zaleznosci wykryty juz na tym etapie) NIE
+// przerywa builda tutaj -- total=0 daje pasek w trybie "sam licznik", a
+// faktyczny (nie-symulowany) apt-get install i tak zaraz potem zawiedzie z
+// pelnym, prawdziwym komunikatem bledu apt.
+func countAptPlannedOps(rootfsDir string, simArgs []string) int {
+	count := 0
+	onLine := func(line string) {
+		if strings.HasPrefix(line, "Inst ") {
+			count++
+		}
+	}
+	_ = sandbox.ExecWithLines(rootfsDir, nil, onLine, "apt-get", simArgs...)
+	return count
+}
+
+// installCybersecurityPackages instaluje cybersecurityPackages() wewnatrz
+// rootfs -- wolane TYLKO gdy b.Config.Project.IsCybersecurity() (patrz
+// Build()). Wykonywane PO systemie MAC a PRZED pakietami wlasnymi projektu,
+// zeby package-lists/hooks projektu mogly w razie potrzeby nadpisac/rozszerzyc
+// domyslny zestaw narzedzi cybersecurity (np. dopisac wlasna liste w
+// config/package-lists/*.list.chroot).
+//
+// UWAGA: pojedynczy pakiet z tej listy moze czasem nie byc dostepny w
+// wybranym [release] -> name (np. usuniety chwilowo z "sid"/"unstable") --
+// w takim wypadku apt-get install konczy caly build bledem, tak samo jak
+// dla kazdego innego brakujacego pakietu w Project.Packages. To celowe:
+// cichy fallback pomijajacy pojedyncze pakiety maskowalby realny problem
+// (np. literowke w nazwie pakietu wprowadzona przy przyszlej rozbudowie tej
+// listy) zamiast zglosic go od razu, w miejscu powstania.
+func (b *Builder) installCybersecurityPackages() error {
+	pkgs := cybersecurityPackages()
+	source := "wbudowana lista domyslna"
+	if len(b.Config.Project.CybersecurityPackages) > 0 {
+		// [project] -> cybersecurity_packages w config.hk NADPISUJE
+		// (nie rozszerza) wbudowana liste -- jesli ktos chce jednoczesnie
+		// wbudowana liste I swoje dodatki, powinien po prostu przepisac
+		// wbudowana liste do config.hk i dopisac swoje pozycje (patrz
+		// SupportedLanguages-owy wzorzec w README dla przykladu tresci
+		// wbudowanej listy do skopiowania).
+		pkgs = b.Config.Project.CybersecurityPackages
+		source = "[project] -> cybersecurity_packages w config.hk"
+	}
+	util.Infof("  cybersecurity ([project] -> type=cybersecurity): instalacja %d pakietow (%s)...", len(pkgs), source)
+	return b.aptInstallWithProgress("cybersecurity", pkgs)
+}
+
 // installMACPackages instaluje pakiety systemu kontroli dostepu (AppArmor
 // lub SELinux) wewnatrz rootfs przez sandbox. Wykonywane PRZED hookami
 // uzytkownika zeby hooki mogly juz zakladac ze MAC jest dostepny.
@@ -92,27 +263,63 @@ func (b *Builder) installMACPackages() error {
 	// jawnie wpisane w kazdej liscie pakietow). Wylaczenie recommends
 	// dawalo mniejszy, bardziej "czysty" obraz, ale lamalo zalozenia
 	// projektu przygotowanego pod normalne apt/live-build.
-	args := append([]string{
-		"install", "-y",
-		"-o", "Dpkg::Options::=--force-confdef",
-		"-o", "Dpkg::Options::=--force-confold",
-	}, pkgs...)
-	if err := b.sandboxExec("apt-get", args...); err != nil {
-		return fmt.Errorf("instalacja pakietow %s (%v): %w", macName, pkgs, err)
-	}
-	return nil
+	return b.aptInstallWithProgress("MAC:"+macName, pkgs)
 }
 
 // Build wykonuje caly przeplyw budowy rootfs.
 // Narzedzia (debootstrap, mksquashfs itp.) sa pobierane tymczasowo jesli
 // brakuje ich na hoscie -- bez instalacji, bez konfliktow zaleznosci.
 func (b *Builder) Build() error {
+	sectionLabel := "Budowa rootfs"
+	if b.ContainerMode {
+		sectionLabel = "Budowa rootfs (kontener roboczy)"
+	}
+	util.Section(sectionLabel)
+
 	if err := b.prepareDir(); err != nil {
 		return err
 	}
 
+	layersDir := filepath.Join(b.WorkDir, "layers")
+	if err := os.MkdirAll(layersDir, 0o755); err != nil {
+		return fmt.Errorf("tworzenie katalogu warstw OCI (%s): %w", layersDir, err)
+	}
+	b.layerPaths = nil
+	checkpoint, err := snapshotTree(b.RootfsDir)
+	if err != nil {
+		return fmt.Errorf("migawka poczatkowa rootfs: %w", err)
+	}
+	// nextLayer zamyka biezacy punkt kontrolny (migawka "checkpoint" wyzej)
+	// w nowa warstwe OCI o nazwie name -- migawkuje AKTUALNY stan rootfs,
+	// liczy roznice wzgledem poprzedniego punktu kontrolnego, zapisuje
+	// warstwe (jesli niepusta) do layersDir/<name>.tar.gz i PRZESUWA punkt
+	// kontrolny na biezacy stan (kolejne wywolanie liczy juz roznice OD TEGO
+	// MIEJSCA). Blad migawki/zapisu przerywa caly Build() -- niepelna,
+	// blednie policzona warstwa OCI nigdy nie powinna trafic do registry.
+	nextLayer := func(name string) error {
+		after, err := snapshotTree(b.RootfsDir)
+		if err != nil {
+			return fmt.Errorf("migawka rootfs po etapie %q: %w", name, err)
+		}
+		changed, removed := diffSnapshots(checkpoint, after)
+		layerPath := filepath.Join(layersDir, name+".tar.gz")
+		wrote, err := writeIncrementalLayer(b.RootfsDir, changed, removed, layerPath)
+		if err != nil {
+			return fmt.Errorf("zapis warstwy OCI %q: %w", name, err)
+		}
+		if wrote {
+			b.layerPaths = append(b.layerPaths, layerPath)
+			util.Debugf("warstwa OCI %q: %d zmienionych, %d usunietych sciezek -> %s",
+				name, len(changed), len(removed), layerPath)
+		} else {
+			util.Debugf("warstwa OCI %q: brak zmian -- pominieta", name)
+		}
+		checkpoint = after
+		return nil
+	}
+
 	// --- toolchain: przygotuj narzedzia build-time ---
-	util.Infof("Krok 0/9: sprawdzanie/pobieranie narzedzi build-time...")
+	util.Step(0, 10, "sprawdzanie/pobieranie narzedzi build-time...")
 	tc := toolchain.New(b.WorkDir)
 	if err := tc.PrepareAll(); err != nil {
 		return fmt.Errorf("toolchain: %w", err)
@@ -123,12 +330,12 @@ func (b *Builder) Build() error {
 		return fmt.Errorf("ustawienie PATH toolchain: %w", err)
 	}
 
-	util.Infof("Krok 1/9: debootstrap (%s)...", b.Config.Release)
+	util.Step(1, 10, "debootstrap (%s)...", b.Config.Release)
 	if err := b.runDebootstrap(); err != nil {
 		return fmt.Errorf("debootstrap: %w", err)
 	}
 
-	util.Infof("Krok 2/9: preseed debconf + sudo-stub...")
+	util.Step(2, 10, "preseed debconf + sudo-stub...")
 	if err := b.seedDebconf(); err != nil {
 		return fmt.Errorf("preseed debconf: %w", err)
 	}
@@ -137,37 +344,54 @@ func (b *Builder) Build() error {
 	}
 
 	if b.Project.IncludesChrootBeforePackages != "" {
-		util.Infof("Krok 3/9: kopiowanie includes.chroot_before_packages...")
+		util.Step(3, 10, "kopiowanie includes.chroot_before_packages...")
 		if err := b.copyDirToRootfs(b.Project.IncludesChrootBeforePackages); err != nil {
 			return fmt.Errorf("includes.chroot_before_packages: %w", err)
 		}
 	} else {
-		util.Infof("Krok 3/9: brak includes.chroot_before_packages -- pominieto")
+		util.Step(3, 10, "brak includes.chroot_before_packages -- pominieto")
 	}
 
 	if len(b.Project.ExtraSources) > 0 {
-		util.Infof("Krok 4/9: dodatkowe zrodla apt (%d)...", len(b.Project.ExtraSources))
+		util.Step(4, 10, "dodatkowe zrodla apt (%d)...", len(b.Project.ExtraSources))
 		if err := b.applyExtraSources(); err != nil {
 			return fmt.Errorf("extra sources: %w", err)
 		}
 	} else {
-		util.Infof("Krok 4/9: brak dodatkowych zrodel apt -- pominieto")
+		util.Step(4, 10, "brak dodatkowych zrodel apt -- pominieto")
 	}
 
-	util.Infof("Krok 5/9: instalacja systemu MAC ([project] -> selinux=%v)...",
+	util.Step(5, 10, "instalacja systemu MAC ([project] -> selinux=%v)...",
 		b.Config.Project.MAC == config.MACSELinux)
 	if err := b.installMACPackages(); err != nil {
 		return fmt.Errorf("instalacja MAC: %w", err)
 	}
 
-	util.Infof("Krok 6/9: instalacja %d pakiet(ow)...", len(b.Project.Packages))
+	if b.Config.Project.IsCybersecurity() {
+		util.Step(6, 10, "pakiety cybersecurity ([project] -> type=cybersecurity)...")
+		if err := b.installCybersecurityPackages(); err != nil {
+			return fmt.Errorf("instalacja pakietow cybersecurity: %w", err)
+		}
+	} else {
+		util.Step(6, 10, "[project] -> type != cybersecurity -- pominieto")
+	}
+
+	if err := nextLayer("base"); err != nil {
+		return fmt.Errorf("warstwa OCI 'base': %w", err)
+	}
+
+	util.Step(7, 10, "instalacja %d pakiet(ow)...", len(b.Project.Packages))
 	if err := b.installPackages(); err != nil {
 		return fmt.Errorf("instalacja pakietow: %w", err)
 	}
 
+	if err := nextLayer("packages"); err != nil {
+		return fmt.Errorf("warstwa OCI 'packages': %w", err)
+	}
+
 	hasAfterIncludes := b.Project.IncludesChroot != "" || b.Project.IncludesChrootAfterPackages != ""
 	if hasAfterIncludes {
-		util.Infof("Krok 7/9: kopiowanie includes.chroot / includes.chroot_after_packages...")
+		util.Step(8, 10, "kopiowanie includes.chroot / includes.chroot_after_packages...")
 		if b.Project.IncludesChroot != "" {
 			if err := b.copyDirToRootfs(b.Project.IncludesChroot); err != nil {
 				return fmt.Errorf("includes.chroot: %w", err)
@@ -179,23 +403,40 @@ func (b *Builder) Build() error {
 			}
 		}
 	} else {
-		util.Infof("Krok 7/9: brak includes.chroot/includes.chroot_after_packages -- pominieto")
+		util.Step(8, 10, "brak includes.chroot/includes.chroot_after_packages -- pominieto")
 	}
 
-	util.Infof("Krok 8/9: wykonywanie %d hook(ow)...", len(b.Project.Hooks))
+	util.Step(9, 10, "wykonywanie %d hook(ow)...", len(b.Project.Hooks))
 	if err := b.runHooks(); err != nil {
 		return fmt.Errorf("hooks: %w", err)
 	}
 
-	util.Infof("Krok 9/9: wstrzykiwanie hammer + generowanie /etc/hammer/oci.hk...")
-	if err := b.injectHammer(); err != nil {
-		return fmt.Errorf("hammer injection: %w", err)
+	if err := nextLayer("hooks"); err != nil {
+		return fmt.Errorf("warstwa OCI 'hooks': %w", err)
 	}
-	if err := b.installHammerDeps(); err != nil {
-		return fmt.Errorf("hammer biblioteki dynamiczne: %w", err)
-	}
-	if err := b.generateHammerConfig(); err != nil {
-		return fmt.Errorf("generowanie /etc/hammer/oci.hk: %w", err)
+
+	if b.ContainerMode {
+		// Kontener roboczy ([project] -> type=container) NIE jest
+		// zarzadzany atomowo -- brak hammer, brak /etc/hammer/oci.hk.
+		// apt/apt-get rowniez NIE sa usuwane (to i tak dzieje sie tylko
+		// w internal/isobuild, ktore w ogole nie jest wywolywane dla
+		// tego trybu -- patrz buildflow.BuildContainer).
+		util.Step(10, 10, "tryb kontenera roboczego (ContainerMode) -- pomijam wstrzykiwanie hammer/oci.hk")
+	} else {
+		util.Step(10, 10, "wstrzykiwanie hammer + generowanie /etc/hammer/oci.hk...")
+		if err := b.injectHammer(); err != nil {
+			return fmt.Errorf("hammer injection: %w", err)
+		}
+		if err := b.installHammerDeps(); err != nil {
+			return fmt.Errorf("hammer biblioteki dynamiczne: %w", err)
+		}
+		if err := b.generateHammerConfig(); err != nil {
+			return fmt.Errorf("generowanie /etc/hammer/oci.hk: %w", err)
+		}
+
+		if err := nextLayer("runtime"); err != nil {
+			return fmt.Errorf("warstwa OCI 'runtime': %w", err)
+		}
 	}
 
 	// UWAGA: apt/apt-get NIE sa usuwane tutaj. Ten sam rootfs jest pakowany
@@ -231,13 +472,39 @@ func (b *Builder) prepareDir() error {
 // JEDYNA czesc procesu ktora delegujemy do istniejacego narzedzia Debiana --
 // reimplementacja debootstrap (rozwiazywanie zaleznosci bazowego systemu od
 // zera) wykraczalaby daleko poza zakres hackeros-builder.
+// runDebootstrap uruchamia debootstrap z REALNYM paskiem postepu: total nie
+// jest znany z gory (debootstrap nie ma trybu "policz ile bedzie pakietow"
+// ktory dawalby wiarygodna liczbe bez pobierania indeksu Packages, a robienie
+// tego jako osobny krok podwajaloby czas startu), wiec pasek dziala w trybie
+// "rosnacy licznik" -- kazda linia "Retrieving X" / "Validating X" /
+// "Extracting X" z wyjscia debootstrap to JEDNO tyknięcie postepu, real-time,
+// bezposrednio z faktycznie wykonywanej pracy (nie animacja na czas).
 func (b *Builder) runDebootstrap() error {
-	return util.RunStreaming("", "debootstrap",
-		"--arch=amd64",
+	bar := util.NewProgressBar("debootstrap", 0, "operacji")
+	var ticks int64
+	onLine := func(line string) {
+		util.Debugf("debootstrap: %s", line)
+		if strings.HasPrefix(line, "I: Retrieving ") ||
+			strings.HasPrefix(line, "I: Validating ") ||
+			strings.HasPrefix(line, "I: Extracting ") ||
+			strings.HasPrefix(line, "I: Unpacking ") ||
+			strings.HasPrefix(line, "I: Configuring ") {
+			ticks++
+			bar.Set(ticks)
+		}
+	}
+	err := util.RunStreamingWithLines("", onLine, "debootstrap",
+		"--arch="+b.Config.EffectiveArch(),
 		b.Config.Release,
 		b.RootfsDir,
-		defaultMirror,
+		b.Config.EffectiveMirror(),
 	)
+	if err != nil {
+		bar.Fail("debootstrap")
+		return err
+	}
+	bar.Finish()
+	return nil
 }
 
 // installSudoStub instaluje /usr/local/sbin/sudo wewnatrz rootfs jako
@@ -294,16 +561,7 @@ func (b *Builder) installPackages() error {
 	// UWAGA: celowo BEZ --no-install-recommends -- patrz komentarz w
 	// installMACPackages powyzej. Zachowanie ma odpowiadac zwyklemu
 	// "apt-get install" / live-build z domyslnym AptRecommends: true.
-	args := append([]string{
-		"install", "-y",
-		"-o", "Dpkg::Options::=--force-confdef",
-		"-o", "Dpkg::Options::=--force-confold",
-		"-o", "APT::Get::Assume-Yes=true",
-	}, b.Project.Packages...)
-	if err := b.sandboxExec("apt-get", args...); err != nil {
-		return fmt.Errorf("apt-get install: %w", err)
-	}
-	return nil
+	return b.aptInstallWithProgress("pakiety projektu", b.Project.Packages, "-o", "APT::Get::Assume-Yes=true")
 }
 
 // applyExtraSources dopisuje config/archives/*.list.chroot do
@@ -422,16 +680,30 @@ func removeExistingEntry(dest string) error {
 // bledem niskiego poziomu.
 func (b *Builder) runHooks() error {
 	defer b.removeSudoStub()
-	for _, h := range b.Project.Hooks {
-		util.Infof("  hook: %s", h.Name)
+
+	if len(b.Project.Hooks) == 0 {
+		util.Infof("  brak hookow (config/hooks/normal|live/*.hook.chroot) -- pominieto")
+		return nil
+	}
+
+	if err := b.ensureHookInterpreters(b.Project.Hooks); err != nil {
+		return fmt.Errorf("przygotowanie interpreterow hookow: %w", err)
+	}
+
+	bar := util.NewProgressBar("hooki", int64(len(b.Project.Hooks)), "hookow")
+	for i, h := range b.Project.Hooks {
+		util.SubStep("[%d/%d] %s  %s", i+1, len(b.Project.Hooks), h.Name,
+			util.Colorize(util.ColorMagenta, "("+hooklang.Label(h.Interpreter)+")"))
 		tmpName := "/tmp-hackeros-hook-" + h.Name
 		destOnHost := filepath.Join(b.RootfsDir, tmpName)
 		if err := copyFile(h.Path, destOnHost, 0o755); err != nil {
+			bar.Fail(h.Name)
 			return fmt.Errorf("kopiowanie hooka %s: %w", h.Name, err)
 		}
 		err := sandbox.ExecHook(b.RootfsDir, tmpName)
 		os.Remove(destOnHost)
 		if err != nil {
+			bar.Fail(h.Name)
 			var timeoutErr *sandbox.ExecTimeoutError
 			if errors.As(err, &timeoutErr) {
 				return fmt.Errorf(
@@ -444,8 +716,57 @@ func (b *Builder) runHooks() error {
 						"jesli hook LEGALNIE potrzebuje wiecej czasu (kompilacja, duze pobieranie)",
 					h.Name, err)
 			}
+			if h.Interpreter != "" && !hooklang.IsRecognized(h.Interpreter) {
+				return fmt.Errorf(
+					"wykonanie hooka %s (interpreter %q z shebang) nie powiodlo sie: %w -- "+
+						"%q NIE jest jednym z jezykow z automatyczna instalacja interpretera "+
+						"(patrz lista nizej); jesli %q to faktycznie prawidlowy interpreter, "+
+						"dodaj odpowiedni pakiet recznie w config/package-lists/*.list.chroot "+
+						"PRZED tym hookiem (numeracja prefiksow decyduje o kolejnosci). "+
+						"Jezyki z automatyczna instalacja: %s",
+					h.Name, h.Interpreter, err, h.Interpreter, h.Interpreter,
+					strings.Join(hooklang.SupportedLanguages(), "; "))
+			}
 			return fmt.Errorf("wykonanie hooka %s: %w", h.Name, err)
 		}
+		bar.Add(1)
+	}
+	bar.Finish()
+	return nil
+}
+
+// ensureHookInterpreters skanuje shebang wszystkich hooks i doinstalowuje
+// (JEDNYM wywolaniem apt-get, dla wszystkich brakujacych naraz) kazdy
+// interpreter ktory nie jest juz czescia bazowego systemu Debian --
+// PRZED probą wykonania jakiegokolwiek hooka. Bez tego pierwszy hook w
+// np. Pythonie konczylby sie kryptycznym bledem chroot/exec zamiast po
+// prostu zadzialac.
+func (b *Builder) ensureHookInterpreters(hooks []liveparse.HookScript) error {
+	needed := make(map[string]bool)
+	var order []string
+	for _, h := range hooks {
+		pkg, ok := hooklang.InterpreterPackage(h.Interpreter)
+		if !ok {
+			continue
+		}
+		if !needed[pkg] {
+			needed[pkg] = true
+			order = append(order, pkg)
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+
+	sort.Strings(order)
+	util.Infof("  interpretery hookow: instalacja %s...", strings.Join(order, ", "))
+	args := append([]string{
+		"install", "-y",
+		"-o", "Dpkg::Options::=--force-confdef",
+		"-o", "Dpkg::Options::=--force-confold",
+	}, order...)
+	if err := b.sandboxExec("apt-get", args...); err != nil {
+		return fmt.Errorf("instalacja interpreterow hookow (%v): %w", order, err)
 	}
 	return nil
 }
