@@ -179,3 +179,107 @@ func TestParsePackageLists_DeduplicatesAcrossFiles(t *testing.T) {
 		t.Fatalf("Packages = %v, chcialem %v", p.Packages, want)
 	}
 }
+
+// TestDetectHookInterpreter_VariousShebangs sprawdza wykrywanie jezyka
+// hooka z shebang -- podstawa dla wsparcia hookow w Pythonie/Ruby/Lua/...
+// (nie tylko w powloce), patrz HookScript.Interpreter i internal/hooklang.
+func TestDetectHookInterpreter_VariousShebangs(t *testing.T) {
+	cases := map[string]string{
+		"#!/bin/sh\necho hi\n":                  "sh",
+		"#!/bin/bash\necho hi\n":                "bash",
+		"#!/usr/bin/env python3\nprint('hi')\n": "python3",
+		"#!/usr/bin/python3\nprint('hi')\n":     "python3",
+		"#!/usr/bin/env ruby\nputs 'hi'\n":      "ruby",
+		"#!/usr/bin/env lua5.4\nprint('hi')\n":  "lua5.4",
+		"#!/usr/bin/perl\nprint \"hi\";\n":      "perl",
+		"no shebang here\njust text\n":          "",
+	}
+	for content, want := range cases {
+		root := t.TempDir()
+		path := filepath.Join(root, "hook.hook.chroot")
+		writeFile(t, path, content)
+		got := detectHookInterpreter(path)
+		if got != want {
+			t.Errorf("detectHookInterpreter(%q) = %q, chcialem %q", content, got, want)
+		}
+	}
+}
+
+// TestParseHooks_DetectsInterpreterField sprawdza ze parseHooks (uzywana
+// dla hooks/normal i hooks/live) wypelnia HookScript.Interpreter, nie tylko
+// Name/Path.
+func TestParseHooks_DetectsInterpreterField(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "config", "hooks", "normal", "0100-py.hook.chroot"),
+		"#!/usr/bin/env python3\nprint('siema')\n")
+
+	p := &Project{RootDir: root}
+	if err := p.parseHooks(filepath.Join(root, "config")); err != nil {
+		t.Fatalf("parseHooks: %v", err)
+	}
+	if len(p.Hooks) != 1 {
+		t.Fatalf("Hooks = %v, chcialem dokladnie 1", p.Hooks)
+	}
+	if p.Hooks[0].Interpreter != "python3" {
+		t.Errorf("Interpreter = %q, chcialem \"python3\"", p.Hooks[0].Interpreter)
+	}
+}
+
+// TestParseInstallerHooks_SeparateFromNormalAndLive sprawdza ze
+// config/hooks/installer/ jest osobna kategoria (InstallerHooks), NIE
+// wpada do zwyklych Hooks (normal/live) i odwrotnie.
+func TestParseInstallerHooks_SeparateFromNormalAndLive(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "config", "hooks", "normal", "0100-a.hook.chroot"), "#!/bin/sh\ntrue\n")
+	writeFile(t, filepath.Join(root, "config", "hooks", "installer", "0100-branding.hook.chroot"),
+		"#!/usr/bin/env python3\nprint('branding')\n")
+
+	p := &Project{RootDir: root}
+	configDir := filepath.Join(root, "config")
+	if err := p.parseHooks(configDir); err != nil {
+		t.Fatalf("parseHooks: %v", err)
+	}
+	if err := p.parseInstallerHooks(configDir); err != nil {
+		t.Fatalf("parseInstallerHooks: %v", err)
+	}
+
+	if len(p.Hooks) != 1 || p.Hooks[0].Name != "0100-a.hook.chroot" {
+		t.Fatalf("Hooks = %v, chcialem dokladnie [0100-a.hook.chroot]", p.Hooks)
+	}
+	if len(p.InstallerHooks) != 1 || p.InstallerHooks[0].Name != "0100-branding.hook.chroot" {
+		t.Fatalf("InstallerHooks = %v, chcialem dokladnie [0100-branding.hook.chroot]", p.InstallerHooks)
+	}
+	if p.InstallerHooks[0].Interpreter != "python3" {
+		t.Errorf("InstallerHooks[0].Interpreter = %q, chcialem \"python3\"", p.InstallerHooks[0].Interpreter)
+	}
+}
+
+// TestParseInstallerHooks_MissingDirReturnsEmptyNoError sprawdza ze brak
+// config/hooks/installer/ (typowy przypadek -- wiekszosc projektow go nie
+// uzywa) to NIE jest blad, tylko pusta lista.
+func TestParseInstallerHooks_MissingDirReturnsEmptyNoError(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "config", "config.hk"), "[release]\n-> name => trixie\n")
+
+	hooks, err := ParseInstallerHooks(root)
+	if err != nil {
+		t.Fatalf("ParseInstallerHooks: %v", err)
+	}
+	if len(hooks) != 0 {
+		t.Fatalf("hooks = %v, chcialem pusta liste", hooks)
+	}
+}
+
+// TestParseInstallerHooks_MissingProjectRootReturnsEmptyNoError sprawdza
+// ze "build iso" moze wywolac ParseInstallerHooks nawet gdy caly katalog
+// projektu (albo sam config/) nie istnieje lokalnie -- nie powinno to
+// wywrocic budowy ISO ktora i tak tylko sciaga OCI z registry.
+func TestParseInstallerHooks_MissingProjectRootReturnsEmptyNoError(t *testing.T) {
+	hooks, err := ParseInstallerHooks(filepath.Join(t.TempDir(), "nie-istnieje"))
+	if err != nil {
+		t.Fatalf("ParseInstallerHooks: %v", err)
+	}
+	if len(hooks) != 0 {
+		t.Fatalf("hooks = %v, chcialem pusta liste", hooks)
+	}
+}
