@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/cosign"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/hkgen"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/isobuild"
+	"github.com/HackerOS-Linux-System/hackeros-builder/internal/liveparse"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/ociimage"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/preflight"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/util"
@@ -53,6 +55,18 @@ func BuildIso(opts IsoOptions) error {
 		return err
 	}
 
+	if cfg.Project.IsContainerBuild() || cfg.Project.IsContainerizedIsolator() {
+		extra := ""
+		if cfg.Project.IsContainerizedIsolator() {
+			extra = " + Isolator wbudowany w /usr/bin/"
+		}
+		return fmt.Errorf(
+			"[project] -> type = %q nie produkuje obrazu ISO -- to jest kontener "+
+				"roboczy (podman/docker%s), nie system instalowalny na dysk przez Calamares. "+
+				"Uzyj 'hackeros-builder build container' zamiast 'build iso'/'build all'",
+			cfg.Project.Type, extra)
+	}
+
 	repository := opts.Repository
 	tag := opts.Tag
 	if repository == "" || tag == "" {
@@ -73,6 +87,13 @@ func BuildIso(opts IsoOptions) error {
 	}
 
 	rootfsDir := filepath.Join(opts.WorkDir, "rootfs-from-cloud")
+
+	if cfg.Project.VerifySignature {
+		imageRef := fmt.Sprintf("%s:%s", repository, tag)
+		if err := cosign.Verify(imageRef, cfg.Project.CosignKey); err != nil {
+			return fmt.Errorf("weryfikacja podpisu ([project] -> verify_signature=true): %w", err)
+		}
+	}
 
 	if err := ociimage.PullAndUnpack(ociimage.PullParams{
 		Repository: repository,
@@ -107,12 +128,44 @@ func BuildIso(opts IsoOptions) error {
 		util.Infof("Instalator pominiety ([project] -> installer = none)")
 	}
 
+	// Mapowanie config.InstallerType -> isobuild.InstallerVariant. Osobne
+	// typy w dwoch pakietach sa celowe -- patrz komentarz przy definicji
+	// isobuild.InstallerVariant.
+	installerVariant := isobuild.InstallerVariantDefault
+	if cfg != nil && cfg.Project.UsesCybersecurityInstaller() {
+		installerVariant = isobuild.InstallerVariantCybersecurity
+		util.Infof("Instalator: wariant Cybersecurity Edition ([project] -> installer = cybersecurity)")
+	}
+
+	var installerHooks []liveparse.HookScript
+	// UWAGA -- decyzja projektowa: hooks/installer/ dziala gdy INSTALATOR
+	// JEST WLACZONY, czyli [project] -> installer != none (obejmuje zarowno
+	// installer=default JAK I installer=cybersecurity). Nie ogranicza tego
+	// do installer=default WYLACZNIE -- gdyby tak bylo, projekty z
+	// installer=cybersecurity nie mialyby zadnego sposobu na customizacje
+	// instalatora przez hooki, co wydaje sie niezamierzonym ograniczeniem.
+	// Jesli to zachowanie mialo byc inne (scisle installer=default), zmien
+	// warunek ponizej na "cfg.Project.Installer == config.InstallerDefault".
+	if !skipInstaller {
+		hooks, err := liveparse.ParseInstallerHooks(opts.ProjectDir)
+		if err != nil {
+			return fmt.Errorf("parsowanie hookow instalatora (config/hooks/installer/): %w", err)
+		}
+		installerHooks = hooks
+		if len(installerHooks) > 0 {
+			util.Infof("Hooki instalatora znalezione: %d (config/hooks/installer/)", len(installerHooks))
+		}
+	}
+
 	if err := isobuild.Build(isobuild.BuildParams{
-		RootfsDir:     rootfsDir,
-		OutputISO:     opts.OutputISO,
-		WorkDir:       isoWorkDir,
-		VolumeName:    volumeName,
-		SkipInstaller: skipInstaller,
+		RootfsDir:        rootfsDir,
+		OutputISO:        opts.OutputISO,
+		WorkDir:          isoWorkDir,
+		VolumeName:       volumeName,
+		SkipInstaller:    skipInstaller,
+		InstallerVariant: installerVariant,
+		InstallerHooks:   installerHooks,
+		Arch:             cfg.EffectiveArch(),
 	}); err != nil {
 		return fmt.Errorf("budowa ISO: %w", err)
 	}
