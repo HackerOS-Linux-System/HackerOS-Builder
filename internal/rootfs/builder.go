@@ -411,6 +411,38 @@ func (b *Builder) Build() error {
 		return fmt.Errorf("hooks: %w", err)
 	}
 
+	// Jawne, KONCOWE przebudowanie initrd -- domyka luke jaka zostawia
+	// samo poleganie na triggerach dpkg (uruchamianych automatycznie przy
+	// KAZDYM "apt-get install", ale NIE po includes.chroot_after_packages
+	// ani po hookach, ktore moga dopisac pliki wplywajace na initrd -- np.
+	// wlasny modul jadra, /etc/crypttab, config dla dracut/initramfs-tools
+	// -- albo, jak dla [project] -> type=cybersecurity, PODMIENIC caly
+	// kernel PO tym jak "packages" zainstalowalo juz live-boot; patrz
+	// helpers/cybersecurity-default/hooks/normal/install-kernel.hook.chroot
+	// w repo HackerOS -- ten hook wywoluje apt-get install lokalnych .deb,
+	// co samo w sobie odpala trigger initramfs-tools, ALE jest to ostatnia
+	// gwarancja bez wzgledu na to co jeszcze zrobi PRZYSZLY hook/includes).
+	// Wykonywane TYLKO gdy w /boot faktycznie jest jakis kernel (build
+	// mogl swiadomie NIE instalowac zadnego -- np. [project] -> type =
+	// container, ktore w ogole nie trafia do internal/isobuild) -- w takim
+	// wypadku nie ma czego regenerowac i "update-initramfs -u -k all"
+	// zakonczylby sie tylko myloncym bledem "W: There is no valid
+	// initrd.img" o niczym nie informujacym.
+	if hasAnyKernel, err := bootHasAnyKernel(b.RootfsDir); err != nil {
+		return fmt.Errorf("sprawdzanie obecnosci jadra w /boot: %w", err)
+	} else if hasAnyKernel {
+		util.Infof("  koncowe przebudowanie initrd (update-initramfs -u -k all)...")
+		if err := b.sandboxExec("update-initramfs", "-u", "-k", "all"); err != nil {
+			return fmt.Errorf(
+				"update-initramfs -u -k all: %w -- initrd.img w /boot moze NIE zawierac "+
+					"hookow live-boot/dodatkowych modulow dopisanych PO instalacji kernela "+
+					"(includes.chroot_after_packages, hooki) -- bez poprawnego initrd live-medium "+
+					"konczy sie panika \"Attempted to kill init!\" przy starcie", err)
+		}
+	} else {
+		util.Infof("  brak jadra w /boot -- pomijam koncowe update-initramfs (typowe dla ContainerMode)")
+	}
+
 	if err := nextLayer("hooks"); err != nil {
 		return fmt.Errorf("warstwa OCI 'hooks': %w", err)
 	}
@@ -544,6 +576,17 @@ func (b *Builder) removeSudoStub() {
 	if err := os.Remove(stubPath); err != nil && !os.IsNotExist(err) {
 		util.Warnf("Nie mozna usunac sudo-stub %s: %v", stubPath, err)
 	}
+}
+
+// bootHasAnyKernel zglasza czy rootfsDir/boot zawiera choc jeden plik
+// vmlinuz-* -- uzywane wylacznie by zdecydowac, czy koncowe
+// "update-initramfs -u -k all" (patrz Build()) ma jakikolwiek sens.
+func bootHasAnyKernel(rootfsDir string) (bool, error) {
+	matches, err := filepath.Glob(filepath.Join(rootfsDir, "boot", "vmlinuz-*"))
+	if err != nil {
+		return false, err
+	}
+	return len(matches) > 0, nil
 }
 
 // installPackages wykonuje apt-get update + apt-get install wewnatrz
