@@ -222,6 +222,56 @@ func (p *Project) parsePackageLists(configDir string) error {
 		}
 	}
 
+	// DOPISANIE BACKENDU "live-boot-initramfs-tools", GDY PROJEKT PROSI O
+	// "live-boot" -- PRZED filtrowaniem wykluczen (zeby projekt nadal mogl
+	// jawnie wpisac "-live-boot-initramfs-tools" i swiadomie to wylaczyc).
+	//
+	// KLUCZOWA ROZNICA wzgledem live-build: live-build, gdy skonfigurowane
+	// z LB_INITRAMFS="live-boot" (patrz np. helpers/gaming/common w repo
+	// HackerOS), SAMO doinstalowuje wlasciwy pakiet "backendu" generowania
+	// initrd (live-boot-initramfs-tools dla initramfs-tools, live-boot-dracut
+	// dla dracut) -- to wewnetrzna, automatyczna logika lb_binary_* i wiele
+	// istniejacych list pakietow (przygotowanych z mysla o live-build) polega
+	// na tym MILCZACO, wpisujac tylko "live-boot" bez backendu.
+	//
+	// hackeros-builder NIE ma takiej magii -- instaluje DOSLOWNIE to, co jest
+	// na liscie pakietow, nic wiecej (patrz komentarze w internal/rootfs/
+	// builder.go przy kroku "instalacja jadra" w build-hackeros-atomic).
+	// Samo "live-boot" NIE zawiera hooka dla initramfs-tools (pakiet
+	// "live-boot" dostarcza TYLKO skrypty /lib/live/boot i konfiguracje --
+	// wlasciwy hook /usr/share/initramfs-tools/hooks/live, ktory update-
+	// initramfs faktycznie wbudowuje do initrd.img, jest w OSOBNYM pakiecie
+	// "live-boot-initramfs-tools"; patrz oficjalny opis pakietu "live-boot"
+	// na packages.debian.org: "In addition to live-boot, a backend for the
+	// initrd generation is required, such as live-boot-initramfs-tools.").
+	//
+	// Bez tego pakietu, update-initramfs generuje CALKOWICIE ZWYKLY initrd
+	// (bez zadnej wiedzy o "boot=live"/squashfs) -- initrd.img trafia na
+	// ISO, grub przekazuje "boot=live" (patrz internal/isobuild/builder.go,
+	// writeGrubConfig) ale initramfs-tools nie ma jak tego zinterpretowac,
+	// nie znajduje ZADNEGO korzenia (nie ma tez "root=" w cmdline -- to
+	// live-boot mialo je wyznaczyc dynamicznie), wyczerpuje wszystkie
+	// fallbacki i konczy dzialanie -- kernel widzi PID 1 (skrypt /init z
+	// initramfs) po prostu KONCZACY SIE (exit 1), co objawia sie DOKLADNIE
+	// jako "Kernel panic - not syncing: Attempted to kill init!
+	// exitcode=0x00000100" -- panika NIE przy montowaniu (to bylby inny,
+	// bardziej oczywisty komunikat "VFS: Unable to mount root fs"), tylko
+	// przy "smierci" PID 1, bo /init w initramfs technicznie "dziala
+	// poprawnie", po prostu nie ma co dalej zrobic bez skryptow live-boot.
+	//
+	// Wykrywamy TYLKO "live-boot" (nie live-config -- live-config samo w
+	// sobie nie wplywa na initrd, dziala juz PO przelaczeniu na docelowy
+	// root) i dopisujemy backend TYLKO jesli srodowisko builda faktycznie
+	// generuje initrd przez initramfs-tools (co jest jedynym wspieranym
+	// backendem w hackeros-builder -- brak jakiejkolwiek sciezki dracut w
+	// tym repo), wiec zawsze "live-boot-initramfs-tools", nigdy
+	// "live-boot-dracut".
+	const liveBootBackend = "live-boot-initramfs-tools"
+	if seen["live-boot"] && !seen[liveBootBackend] {
+		seen[liveBootBackend] = true
+		packages = append(packages, liveBootBackend)
+	}
+
 	// Usuwamy z finalnej listy wszystko, co zostalo oznaczone jako
 	// wykluczone w KTORYMKOLWIEK pliku -- patrz komentarz funkcji.
 	if len(excluded) > 0 {
