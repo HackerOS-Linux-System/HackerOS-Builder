@@ -1,1 +1,112 @@
+name: Build hackeros-builder
 
+# Workflow buduje SAMO narzędzie hackeros-builder (binarkę Go) ze źródeł --
+# NIE buduje nim żadnego obrazu HackerOS (do tego służy osobny workflow
+# build-immuntable.yml w repo HackerOS, który pobiera GOTOWĄ binarkę
+# hackeros-builder i uruchamia ją na projekcie atomic/cybersecurity-default).
+#
+# Zakres tego pliku: instalacja Go, `go build`/`go vet`/`go test`/`gofmt`,
+# oraz spakowanie skompilowanej binarki jako artefakt workflow.
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: {}
+
+# Anuluje poprzedni, wciąż trwający run dla tego samego brancha/PR-a przy
+# nowym pushu -- bez tego kolejne commity kolejkowałyby się i marnowały
+# minuty runnera na już nieaktualny kod.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Trzymane w jednym miejscu, żeby nie rozjechało się między jobami.
+  GO_VERSION: "1.22"
+
+jobs:
+  build:
+    name: go build / vet / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # hackeros-builder to narzędzie stricte linuksowe w RUNTIME
+        # (debootstrap, mksquashfs, chroot, unshare -- patrz
+        # internal/preflight i internal/sandbox), ale sam KOD musi się
+        # kompilować i przechodzić testy jednostkowe -- macierz zostaje na
+        # jednym, znanym środowisku (ubuntu-24.04, tak samo jak inne
+        # workflowy w ekosystemie HackerOS), bez udawania że to narzędzie
+        # przenośne na inne OS-y.
+        os: [ ubuntu-24.04 ]
+
+    steps:
+      - name: Checkout repozytorium
+        uses: actions/checkout@v4
+
+      - name: Instalacja Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # actions/setup-go sam zarządza cache'em modułów (~/go/pkg/mod)
+          # kluczowanym po go.sum -- osobny krok actions/cache nie jest
+          # potrzebny.
+          cache: true
+
+      - name: Wypisanie wersji Go (diagnostyka)
+        run: go version
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go mod verify (spójność go.sum z faktycznie pobranymi modułami)
+        run: go mod verify
+
+      - name: gofmt (formatowanie kodu)
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "Następujące pliki nie są sformatowane przez 'gofmt -l':"
+            echo "$UNFORMATTED"
+            echo
+            echo "Uruchom lokalnie: gofmt -w ."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build (weryfikacja że KAŻDY pakiet się kompiluje)
+        run: go build ./...
+
+      - name: go test
+        run: go test -v ./...
+
+      - name: Zbudowanie finalnej binarki hackeros-builder
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/hackeros-builder .
+          chmod +x dist/hackeros-builder
+
+      - name: Sanity-check binarki (--help nie powinno się wywalić)
+        run: ./dist/hackeros-builder --help
+
+      - name: Upload artefaktu (binarka hackeros-builder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hackeros-builder-linux-amd64
+          path: dist/hackeros-builder
+          if-no-files-found: error
+          retention-days: 14
