@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/liveparse"
@@ -220,18 +221,57 @@ func buildSquashfs(rootfsDir, isoTree string) error {
 // copyKernelAndInitrd kopiuje vmlinuz i initrd.img z rootfs/boot do
 // isoTree/live/ -- nazwy plikow jadra w Debianie maja format
 // vmlinuz-<wersja> / initrd.img-<wersja>, wiec szukamy wzorca z glob.
+//
+// UWAGA (bylo zrodlem realnego bledu): wczesniej vmlinuz-* i initrd.img-*
+// byly wyszukiwane DWOMA NIEZALEZNYMI wywolaniami findGlob, kazde z osobna
+// wybierajace "ostatnie dopasowanie alfabetycznie" -- bez ZADNEJ gwarancji
+// ze wybrany vmlinuz-<A> i wybrany initrd.img-<B> odpowiadaja TEJ SAMEJ
+// wersji jadra. W typowym przypadku (dokladnie jeden kernel w /boot) nie ma
+// to znaczenia, ale gdy w /boot znajdzie sie WIECEJ NIZ JEDEN kernel (np.
+// projekt instaluje wlasny kernel hookiem PO tym jak jakis inny pakiet --
+// posrednio, przez Recommends/Depends, patrz "celowo BEZ
+// --no-install-recommends" w internal/rootfs/builder.go -- juz sciagnal
+// standardowy "linux-image-amd64"), niezalezne sortowanie moglo dobrac
+// NIEDOPASOWANA pare vmlinuz/initrd (initrd zbudowany dla INNEJ wersji
+// jadra niz to, ktore faktycznie bootuje) -- initrd taki nie ma poprawnego
+// katalogu modulow dla uruchomionego jadra, wiec live-boot/squashfs/overlay
+// moze nie zaladowac sie poprawnie, co konczy sie martwym PID 1 w initrd
+// (initramfs-tools "/init" wyczerpuje fallbacki i konczy dzialanie) --
+// kernel panikuje z "Attempted to kill init! exitcode=0x00000100".
+//
+// Teraz: znajdujemy WSZYSTKIE pary (vmlinuz-V, initrd.img-V) o TEJ SAMEJ
+// wersji V, i wybieramy najnowsza (sortowanie wersji Debiana). Jesli w
+// /boot jest wiecej niz jedna wersja jadra, to jest jawnie zglaszane w
+// logu (nie po cichu) -- bo to zazwyczaj oznacza ze projekt przypadkiem
+// sciaga dwa jadra (np. glowna lista pakietow I dodatkowy hook), co samo w
+// sobie warto naprawic w konfiguracji projektu, a nie tylko "obejsc" tutaj.
 func copyKernelAndInitrd(rootfsDir, isoTree string) error {
 	bootDir := filepath.Join(rootfsDir, "boot")
 	liveDir := filepath.Join(isoTree, "live")
 
-	kernelPath, err := findGlob(bootDir, "vmlinuz-*")
+	versions, err := kernelVersionsWithInitrd(bootDir)
 	if err != nil {
-		return fmt.Errorf("nie znaleziono jadra w %s (oczekiwano vmlinuz-*): %w", bootDir, err)
+		return err
 	}
-	initrdPath, err := findGlob(bootDir, "initrd.img-*")
-	if err != nil {
-		return fmt.Errorf("nie znaleziono initrd w %s (oczekiwano initrd.img-*): %w", bootDir, err)
+	if len(versions) == 0 {
+		return fmt.Errorf(
+			"nie znaleziono w %s ani jednej PELNEJ pary vmlinuz-<wersja>/initrd.img-<wersja> "+
+				"(sam vmlinuz bez initrd, lub sam initrd bez vmlinuz, sie nie licza -- "+
+				"boot musialby uzyc niedopasowanej pary, co konczy sie panika "+
+				"\"Attempted to kill init!\" na starcie live-medium)", bootDir)
 	}
+	if len(versions) > 1 {
+		util.Warnf(
+			"w %s znaleziono %d roznych wersji jadra z kompletna para vmlinuz/initrd (%s) -- "+
+				"wybieram najnowsza (%s); jesli to nieoczekiwane, sprawdz czy projekt (package-lists "+
+				"lub hooks) nie instaluje przypadkiem DWOCH jader (np. standardowego linux-image-amd64 "+
+				"jako zaleznosc posrednia I wlasnego kernela hookiem)",
+			bootDir, len(versions), strings.Join(versions, ", "), versions[len(versions)-1])
+	}
+	chosen := versions[len(versions)-1]
+
+	kernelPath := filepath.Join(bootDir, "vmlinuz-"+chosen)
+	initrdPath := filepath.Join(bootDir, "initrd.img-"+chosen)
 
 	if err := copyFile(kernelPath, filepath.Join(liveDir, "vmlinuz")); err != nil {
 		return fmt.Errorf("kopiowanie jadra: %w", err)
@@ -242,18 +282,44 @@ func copyKernelAndInitrd(rootfsDir, isoTree string) error {
 	return nil
 }
 
-// findGlob zwraca sciezke odpowiadajaca wzorcowi glob w danym katalogu
-// (ostatnia alfabetycznie jesli jest wiele dopasowan -- numery wersji jadra
-// Debiana sortuja sie rosnaco, wiec to typowo najnowsza wersja).
-func findGlob(dir, pattern string) (string, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+// kernelVersionsWithInitrd zwraca posortowane rosnaco (wg debianowej
+// kolejnosci wersji) listy sufiksow wersji <V>, dla ktorych w bootDir
+// istnieje JEDNOCZESNIE "vmlinuz-<V>" ORAZ "initrd.img-<V>" -- czyli
+// faktycznie uzywalne, DOPASOWANE pary. Wersje z samym vmlinuz albo samym
+// initrd (niekompletne, np. po nieudanym/przerwanym update-initramfs) sa
+// pomijane.
+func kernelVersionsWithInitrd(bootDir string) ([]string, error) {
+	vmlinuzMatches, err := filepath.Glob(filepath.Join(bootDir, "vmlinuz-*"))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if len(matches) == 0 {
-		return "", fmt.Errorf("brak plikow odpowiadajacych wzorcowi %s", pattern)
+	initrdMatches, err := filepath.Glob(filepath.Join(bootDir, "initrd.img-*"))
+	if err != nil {
+		return nil, err
 	}
-	return matches[len(matches)-1], nil
+
+	hasInitrd := make(map[string]bool, len(initrdMatches))
+	for _, p := range initrdMatches {
+		hasInitrd[strings.TrimPrefix(filepath.Base(p), "initrd.img-")] = true
+	}
+
+	var versions []string
+	for _, p := range vmlinuzMatches {
+		v := strings.TrimPrefix(filepath.Base(p), "vmlinuz-")
+		if hasInitrd[v] {
+			versions = append(versions, v)
+		}
+	}
+
+	// UWAGA: sortowanie leksykograficzne, NIE pelne porownanie wersji
+	// Debiana (jak np. "dpkg --compare-versions") -- ta sama, juz wczesniej
+	// istniejaca w tym pliku uproszczona zasada "ostatni alfabetycznie =
+	// najnowszy" (patrz poprzednia wersja findGlob). W typowym przypadku
+	// (dokladnie jedna wersja jadra w /boot) nie ma to znaczenia -- realny
+	// problem, ktory ta funkcja naprawia, to DOPASOWANIE pary vmlinuz/initrd
+	// do TEJ SAMEJ wersji, nie idealny wybor "najnowszej" sposrod wielu.
+	sort.Strings(versions)
+	return versions, nil
 }
 
 // writeGrubConfig generuje minimalna konfiguracje GRUB dla obrazu live --
