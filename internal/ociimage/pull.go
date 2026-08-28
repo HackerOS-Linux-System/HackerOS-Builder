@@ -295,6 +295,20 @@ func extractTarStream(tr *tar.Reader, destDir string) error {
 			if err := ensureParentDir(target); err != nil {
 				return err
 			}
+			// Tak jak przy TypeSymlink/TypeLink nizej: target MOZE juz
+			// istniec z poprzedniej warstwy jako SYMLINK (bardzo typowe
+			// w motywach ikon typu breeze-dark, gdzie wiele plikow to
+			// symlinki do innych ikon). os.OpenFile z O_CREATE NIE
+			// podmienia istniejacego symlinku -- PODAZA za nim (resolve).
+			// Jesli ten symlink jest czescia lancucha/petli przekraczajacej
+			// limit jadra, OpenFile wywala sie z ELOOP ("too many levels
+			// of symbolic links"), mimo ze intencja tej warstwy jest po
+			// prostu polozyc tu zwykly plik. Bezwarunkowe os.Remove PRZED
+			// OpenFile gwarantuje, ze zawsze piszemy do SWIEZEGO i-node,
+			// nigdy nie podazajac za starym symlinkiem z poprzedniej
+			// warstwy (blad "nie istnieje" z Remove jest tu nieistotny
+			// i celowo ignorowany).
+			os.Remove(target)
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 			if err != nil {
 				return err
