@@ -122,7 +122,7 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 		defer lock.Release()
 	}
 
-	cfg, err := loadAndValidateConfig(opts.ProjectDir)
+	cfg, err := loadAndValidateConfig(opts.ProjectDir, true)
 	if err != nil {
 		return nil, err
 	}
@@ -223,9 +223,12 @@ func BuildCloud(opts CloudOptions) (*CloudResult, error) {
 
 // loadAndValidateConfig wczytuje config/config.hk i wypisuje ostrzezenie
 // (nie blad) jesli release nie jest na liscie znanych wersji Debiana.
-func loadAndValidateConfig(projectDir string) (*config.Config, error) {
+//
+// requireAuth: patrz config.Load -- "build container" (jedyny subcommand,
+// gdzie push do registry jest opcjonalny) przekazuje tu false.
+func loadAndValidateConfig(projectDir string, requireAuth bool) (*config.Config, error) {
 	configPath := filepath.Join(projectDir, "config", "config.hk")
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(configPath, requireAuth)
 	if err != nil {
 		return nil, fmt.Errorf("wczytywanie %s: %w", configPath, err)
 	}
