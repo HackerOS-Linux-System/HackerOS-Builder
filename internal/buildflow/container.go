@@ -104,7 +104,10 @@ func BuildContainer(opts ContainerOptions) (*ContainerResult, error) {
 		defer lock.Release()
 	}
 
-	cfg, err := loadAndValidateConfig(opts.ProjectDir)
+	// requireAuth=false: "build container" (w odroznieniu od cloud/iso/all)
+	// nie wymaga konta w registry -- puste [account]/[auth] w config.hk sa
+	// tu w pelni poprawne, patrz shouldPush nizej.
+	cfg, err := loadAndValidateConfig(opts.ProjectDir, false)
 	if err != nil {
 		return nil, err
 	}
