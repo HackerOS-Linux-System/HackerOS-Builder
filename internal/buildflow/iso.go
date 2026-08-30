@@ -50,7 +50,7 @@ func BuildIso(opts IsoOptions) error {
 		}
 	}
 
-	cfg, err := loadAndValidateConfig(opts.ProjectDir)
+	cfg, err := loadAndValidateConfig(opts.ProjectDir, true)
 	if err != nil {
 		return err
 	}
