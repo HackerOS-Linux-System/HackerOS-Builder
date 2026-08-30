@@ -338,7 +338,13 @@ var knownReleases = map[string]bool{
 }
 
 // Load wczytuje i parsuje config.hk z podanej sciezki.
-func Load(path string) (*Config, error) {
+//
+// requireAuth: gdy true, [account] -> name oraz [auth] -> token musza miec
+// NIEPUSTE wartosci (wymagane dla "build cloud"/"build iso"/"build all",
+// ktore zawsze pushuja do registry). Gdy false, puste wartosci sa
+// dozwolone -- uzywane przez "build container", gdzie konto w registry
+// jest opcjonalne (patrz internal/buildflow/container.go).
+func Load(path string, requireAuth bool) (*Config, error) {
 	parsed, err := hk.LoadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config.hk: %w", err)
@@ -386,7 +392,7 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(requireAuth); err != nil {
 		return nil, err
 	}
 
@@ -611,7 +617,7 @@ func getRequiredString(cfg *hk.HkConfig, section, key string) (string, error) {
 	return str, nil
 }
 
-func (c *Config) validate() error {
+func (c *Config) validate(requireAuth bool) error {
 	switch c.AccountType {
 	case AccountTypeUser, AccountTypeOrganisation:
 	default:
@@ -619,11 +625,23 @@ func (c *Config) validate() error {
 			"config.hk: [account] -> type musi byc 'user' lub 'organisation', otrzymano %q",
 			c.AccountType)
 	}
-	if c.AccountName == "" {
-		return fmt.Errorf("config.hk: [account] -> name nie moze byc puste")
-	}
-	if c.Token == "" {
-		return fmt.Errorf("config.hk: [auth] -> token nie moze byc puste")
+	// UWAGA: [account] -> name oraz [auth] -> token MOGA byc pustymi
+	// stringami w kontekstach, gdzie push do registry jest OPCJONALNY
+	// (patrz "build container" w internal/buildflow/container.go: klucze
+	// musza byc OBECNE w config.hk -- to sprawdza juz getRequiredString()
+	// w Load() ponizej -- ale ich WARTOSC moze byc pusta, bo push jest
+	// wykonywany DODATKOWO tylko gdy oba pola sa faktycznie wypelnione).
+	// Dla "build cloud"/"build iso"/"build all" push jest OBOWIAZKOWY,
+	// wiec tam requireAuth=true i te pola nadal musza byc niepuste --
+	// lepiej dostac czytelny blad TUTAJ, niz niejasny blad autoryzacji
+	// registry pozniej w trakcie pushowania warstw.
+	if requireAuth {
+		if c.AccountName == "" {
+			return fmt.Errorf("config.hk: [account] -> name nie moze byc puste")
+		}
+		if c.Token == "" {
+			return fmt.Errorf("config.hk: [auth] -> token nie moze byc puste")
+		}
 	}
 	if c.Release == "" {
 		return fmt.Errorf("config.hk: [release] -> name nie moze byc puste")
