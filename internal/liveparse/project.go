@@ -18,6 +18,12 @@ type Project struct {
 	// zebrana ze wszystkich plikow config/package-lists/*.list.chroot.
 	Packages []string
 
+	// ExcludedPackages to zbior nazw z wpisow "-nazwa" (wykluczenia w stylu
+	// live-build) znalezionych w package-lists -- rootfs.Builder uzywa go,
+	// zeby nie dopisywac na sile pakietow live-boot, jesli projekt swiadomie
+	// je wykluczyl.
+	ExcludedPackages map[string]bool
+
 	// Hooks to lista skryptow do wykonania wewnatrz chroot, w porzadku
 	// alfabetycznym nazwy pliku (tak jak live-build sortuje hooks/normal/).
 	// Obejmuje hooks/normal/ + hooks/live/ (patrz parseHooks). NIE obejmuje
@@ -286,6 +292,7 @@ func (p *Project) parsePackageLists(configDir string) error {
 
 	sort.Strings(packages)
 	p.Packages = packages
+	p.ExcludedPackages = excluded
 	return nil
 }
 
