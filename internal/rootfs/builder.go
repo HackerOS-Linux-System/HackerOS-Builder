@@ -342,6 +342,11 @@ func (b *Builder) Build() error {
 	if err := b.installSudoStub(); err != nil {
 		return fmt.Errorf("sudo stub: %w", err)
 	}
+	if !b.ContainerMode {
+		if err := b.writeInitramfsConf(); err != nil {
+			return fmt.Errorf("konfiguracja initramfs-tools: %w", err)
+		}
+	}
 
 	if b.Project.IncludesChrootBeforePackages != "" {
 		util.Step(3, 10, "kopiowanie includes.chroot_before_packages...")
@@ -438,6 +443,15 @@ func (b *Builder) Build() error {
 					"hookow live-boot/dodatkowych modulow dopisanych PO instalacji kernela "+
 					"(includes.chroot_after_packages, hooki) -- bez poprawnego initrd live-medium "+
 					"konczy sie panika \"Attempted to kill init!\" przy starcie", err)
+		}
+		if !b.ContainerMode {
+			util.Infof("  weryfikacja initrd (live-boot, squashfs, overlay)...")
+			if err := b.verifyInitrd(); err != nil {
+				return fmt.Errorf(
+					"weryfikacja initrd: %w -- initrd bez live-boot = panika jadra \"Attempted to kill init!\" "+
+						"przy starcie live-medium (sprawdz czy pakiety live-boot i live-boot-initramfs-tools "+
+						"sie zainstalowaly i nie sa wykluczone przez \"-live-boot\" w package-lists)", err)
+			}
 		}
 	} else {
 		util.Infof("  brak jadra w /boot -- pomijam koncowe update-initramfs (typowe dla ContainerMode)")
@@ -604,7 +618,91 @@ func (b *Builder) installPackages() error {
 	// UWAGA: celowo BEZ --no-install-recommends -- patrz komentarz w
 	// installMACPackages powyzej. Zachowanie ma odpowiadac zwyklemu
 	// "apt-get install" / live-build z domyslnym AptRecommends: true.
-	return b.aptInstallWithProgress("pakiety projektu", b.Project.Packages, "-o", "APT::Get::Assume-Yes=true")
+	return b.aptInstallWithProgress("pakiety projektu", b.packagesWithLiveBoot(), "-o", "APT::Get::Assume-Yes=true")
+}
+
+// liveBootPackages to pakiety niezbedne, zeby initrd potrafil wystartowac
+// system z "boot=live" (squashfs + overlay): "live-boot" (skrypty
+// /lib/live/boot) i "live-boot-initramfs-tools" (hook, ktory wbudowuje je
+// do initrd.img).
+//
+// live-build instaluje je SAM (LB_INITRAMFS=live-boot) -- dlatego listy
+// pakietow przygotowane z mysla o live-build (helpers/*/package-lists) ich
+// zwykle NIE zawieraja. hackeros-builder instaluje doslownie to, co jest na
+// liscie, wiec bez tej funkcji initrd byl zwyklym initramfs-tools bez
+// zadnej wiedzy o live -> /init konczyl sie i jadro robilo
+// "Attempted to kill init!" (u uzytkownika: zawsze, w QEMU i na laptopie).
+var liveBootPackages = []string{"live-boot", "live-boot-initramfs-tools"}
+
+// packagesWithLiveBoot zwraca Project.Packages uzupelnione o liveBootPackages
+// -- poza ContainerMode (kontener nie bootuje przez initrd) i poza
+// pakietami swiadomie wykluczonymi przez projekt ("-live-boot").
+func (b *Builder) packagesWithLiveBoot() []string {
+	pkgs := append([]string(nil), b.Project.Packages...)
+	if b.ContainerMode {
+		return pkgs
+	}
+	have := make(map[string]bool, len(pkgs))
+	for _, p := range pkgs {
+		have[p] = true
+	}
+	for _, p := range liveBootPackages {
+		if have[p] || b.Project.ExcludedPackages[p] {
+			continue
+		}
+		util.Infof("  dopisuje %q do pakietow (wymagane przez boot=live; live-build robi to automatycznie)", p)
+		pkgs = append(pkgs, p)
+	}
+	return pkgs
+}
+
+// writeInitramfsConf wymusza MODULES=most i dopisuje do initrd moduly
+// potrzebne do znalezienia i zamontowania medium live (CD/USB/virtio) oraz
+// zlozenia overlay na squashfs. Zapisywane PRZED instalacja pakietow, zeby
+// pierwszy update-initramfs (wyzwalany instalacja jadra) juz je mial.
+// MODULES=dep (autowykrywanie wg sprzetu HOSTA budujacego) dalby initrd
+// bez sterownikow potrzebnych na innej maszynie -- stad pewnosc, ze zawsze
+// "most".
+func (b *Builder) writeInitramfsConf() error {
+	confDir := filepath.Join(b.RootfsDir, "etc", "initramfs-tools", "conf.d")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		return err
+	}
+	conf := "# hackeros-builder: initrd musi dzialac na DOWOLNYM sprzecie (live ISO), nie tylko na hoscie budujacym.\nMODULES=most\n"
+	if err := os.WriteFile(filepath.Join(confDir, "hackeros-live.conf"), []byte(conf), 0o644); err != nil {
+		return err
+	}
+	modules := "# hackeros-builder: moduly wymagane przez boot=live\n" +
+		"squashfs\noverlay\nloop\nisofs\nudf\nvfat\nnls_cp437\nnls_utf8\nnls_iso8859-1\n" +
+		"sr_mod\nsd_mod\ncdrom\nusb_storage\nuas\nahci\nnvme\nvirtio_blk\nvirtio_scsi\nvirtio_pci\nata_piix\n"
+	f, err := os.OpenFile(filepath.Join(b.RootfsDir, "etc", "initramfs-tools", "modules"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(modules)
+	return err
+}
+
+// verifyInitrd sprawdza (lsinitramfs wewnatrz rootfs), ze KAZDY initrd.img-*
+// w /boot zawiera skrypty live-boot oraz modul squashfs. Zamiast zbudowac
+// ISO, ktore panikuje przy starcie, build konczy sie tu z czytelnym bledem.
+func (b *Builder) verifyInitrd() error {
+	script := `set -e
+found=0
+for f in /boot/initrd.img-*; do
+  [ -e "$f" ] || continue
+  found=1
+  list=$(lsinitramfs "$f")
+  echo "$list" | grep -Eq '(^|/)scripts/live$' || { echo "BLAD: $f nie zawiera scripts/live (brak live-boot-initramfs-tools?)" >&2; exit 1; }
+  echo "$list" | grep -Eq '(^|/)lib/live/boot/' || { echo "BLAD: $f nie zawiera lib/live/boot (brak live-boot?)" >&2; exit 1; }
+  echo "$list" | grep -Eq 'squashfs(\.ko[^ ]*)?$' || echo "OSTRZEZENIE: $f nie ma squashfs.ko (moze byc wbudowany w jadro)" >&2
+  echo "$list" | grep -Eq 'overlay(\.ko[^ ]*)?$' || echo "OSTRZEZENIE: $f nie ma overlay.ko (moze byc wbudowany w jadro)" >&2
+done
+[ "$found" = 1 ] || { echo "BLAD: brak /boot/initrd.img-*" >&2; exit 1; }
+`
+	return b.sandboxExec("sh", "-c", script)
 }
 
 // applyExtraSources dopisuje config/archives/*.list.chroot do
