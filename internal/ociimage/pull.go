@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -288,8 +289,8 @@ func extractTarStream(tr *tar.Reader, destDir string) error {
 			// os.Chmod ustawia tryb DOKLADNIE taki jak zadany, pomijajac
 			// umask i dzialajac tez na katalogach ktore juz istnialy --
 			// wywolujemy go zawsze, bezwarunkowo, po MkdirAll.
-			if err := os.Chmod(target, mode); err != nil {
-				return fmt.Errorf("chmod katalogu %q na %o: %w", entryName, hdr.Mode, err)
+			if err := applyOwnerAndMode(target, hdr, mode, false); err != nil {
+				return fmt.Errorf("katalog %q: %w", entryName, err)
 			}
 		case tar.TypeReg:
 			if err := ensureParentDir(target); err != nil {
@@ -325,8 +326,10 @@ func extractTarStream(tr *tar.Reader, destDir string) error {
 			// typu /usr/bin/sudo (setuid root) -- bez tego chmod, sudo
 			// wygladaloby na zainstalowane, ale faktycznie nie dzialaloby
 			// dla zwyklych uzytkownikow w finalnie zainstalowanym systemie.
-			if err := os.Chmod(target, mode); err != nil {
-				return fmt.Errorf("chmod pliku %q na %o: %w", entryName, hdr.Mode, err)
+			// KOLEJNOSC MA ZNACZENIE: chown kasuje bity setuid/setgid, wiec
+			// applyOwnerAndMode najpierw robi Lchown, a dopiero potem Chmod.
+			if err := applyOwnerAndMode(target, hdr, mode, false); err != nil {
+				return fmt.Errorf("plik %q: %w", entryName, err)
 			}
 		case tar.TypeSymlink:
 			if err := ensureParentDir(target); err != nil {
@@ -336,6 +339,34 @@ func extractTarStream(tr *tar.Reader, destDir string) error {
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
+			_ = applyOwnerAndMode(target, hdr, mode, true)
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			// Wezly urzadzen i FIFO. WCZESNIEJ byly POMIJANE z ostrzezeniem --
+			// a debootstrap tworzy w rootfs/dev m.in. /dev/console i
+			// /dev/null. Bez /dev/console w docelowym rootfs initramfs-tools
+			// nie jest w stanie wykonac "run-init ... <${rootmnt}/dev/console",
+			// /init (PID 1) umiera i jadro robi "Attempted to kill init!"
+			// -- czyli dokladnie panika z live-ISO.
+			if err := ensureParentDir(target); err != nil {
+				return err
+			}
+			var typeBits uint32
+			switch hdr.Typeflag {
+			case tar.TypeChar:
+				typeBits = syscall.S_IFCHR
+			case tar.TypeBlock:
+				typeBits = syscall.S_IFBLK
+			default:
+				typeBits = syscall.S_IFIFO
+			}
+			if err := util.Mknod(target, typeBits, mode, uint32(hdr.Devmajor), uint32(hdr.Devminor)); err != nil {
+				// Bez CAP_MKNOD (build nie jako root) nie przerywamy -- isobuild
+				// i tak odtwarza /dev/console i podstawowe wezly
+				// (util.EnsureDevSkeleton) tuz przed zbudowaniem squashfs.
+				util.Warnf("Nie mozna utworzyc wezla %s (typ %c): %v", entryName, hdr.Typeflag, err)
+				break
+			}
+			_ = applyOwnerAndMode(target, hdr, mode, false)
 		case tar.TypeLink:
 			if err := ensureParentDir(target); err != nil {
 				return err
@@ -351,6 +382,26 @@ func extractTarStream(tr *tar.Reader, destDir string) error {
 			// blokowac calego rozpakowania obrazu.
 			util.Warnf("Pominieto nieobslugiwany typ wpisu tar: %s (typeflag=%c)", entryName, hdr.Typeflag)
 		}
+	}
+	return nil
+}
+
+// applyOwnerAndMode odtwarza wlasciciela (uid/gid) i tryb wpisu z naglowka
+// tar. Wczesniej rozpakowanie NIE przywracalo wlasciciela -- kazdy plik
+// konczyl jako root:root (czyli /etc/shadow bez grupy shadow, /var/log/journal
+// bez systemd-journal, /etc/ssl/private bez ssl-cert, katalogi uzytkownikow
+// systemowych: _apt, messagebus, polkitd... -- uslugi systemd potem nie
+// mogly startowac/zapisywac). Lchown, a nie Chown, zeby nie podazac za
+// symlinkami. Brak uprawnien (EPERM, build nie jako root) jest ignorowany.
+func applyOwnerAndMode(target string, hdr *tar.Header, mode os.FileMode, isSymlink bool) error {
+	if err := os.Lchown(target, hdr.Uid, hdr.Gid); err != nil && !os.IsPermission(err) {
+		return fmt.Errorf("chown %d:%d: %w", hdr.Uid, hdr.Gid, err)
+	}
+	if isSymlink {
+		return nil
+	}
+	if err := os.Chmod(target, mode); err != nil {
+		return fmt.Errorf("chmod na %o: %w", hdr.Mode, err)
 	}
 	return nil
 }
