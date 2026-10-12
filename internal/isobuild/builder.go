@@ -1,6 +1,7 @@
 package isobuild
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -53,9 +54,40 @@ type BuildParams struct {
 	Arch string
 }
 
-// excludeFromSquash to katalogi ktore NIE powinny trafic do squashfs
-// (sa specyficzne dla danego boota hosta, nie dla obrazu systemu).
-var excludeFromSquash = []string{"proc", "sys", "dev", "tmp", "run"}
+// excludeFromSquash to WZORCE (mksquashfs -wildcards) wykluczajace z
+// squashfs ZAWARTOSC katalogow specyficznych dla danego boota hosta
+// (nie dla obrazu systemu) -- ale NIE same katalogi.
+//
+// KRYTYCZNY BUG (przyczyna paniki "Attempted to kill init!" na live-ISO):
+// wczesniej bylo tu []string{"proc","sys","dev","tmp","run"} z flaga "-e"
+// BEZ -wildcards -- a "-e dev" wycina caly katalog /dev (podobnie /proc,
+// /sys, /run, /tmp) z obrazu, nie tylko jego zawartosc. Docelowy rootfs
+// nie mial wtedy ani /dev/console, ani punktow montowania; /init z
+// initramfs-tools (po zamontowaniu squashfs przez live-boot) robi
+// "mount --move" /sys,/proc,/run do ${rootmnt} i na koniec
+//
+//	exec run-init ... <"${rootmnt}/dev/console" >"${rootmnt}/dev/console"
+//
+// co wywala sie na braku pliku -> /init (PID 1) konczy sie kodem != 0 ->
+// "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100".
+// Dlatego: wzorce "<katalog>/*" (zostaje pusty katalog), a /dev jest
+// obslugiwany osobno (patrz prepareRuntimeSkeleton).
+var excludeFromSquash = []string{"proc/*", "sys/*", "run/*", "tmp/*"}
+
+// requiredSquashEntries to wpisy, ktore MUSZA byc w filesystem.squashfs --
+// verifySquashfs sprawdza je po zbudowaniu obrazu i przerywa build z jasnym
+// komunikatem zamiast produkowac ISO, ktore panikuje przy starcie.
+var requiredSquashEntries = []string{
+	"squashfs-root/dev",
+	"squashfs-root/dev/console",
+	"squashfs-root/dev/null",
+	"squashfs-root/proc",
+	"squashfs-root/sys",
+	"squashfs-root/run",
+	"squashfs-root/tmp",
+	"squashfs-root/etc",
+	"squashfs-root/usr",
+}
 
 // archToDebianArch mapuje runtime.GOARCH (architektura HOSTA, na ktorym
 // dziala akurat ten proces hackeros-builder) na nazewnictwo architektur
@@ -210,12 +242,111 @@ func buildSquashfs(rootfsDir, isoTree string) error {
 
 	squashPath := filepath.Join(liveDir, "filesystem.squashfs")
 
-	args := []string{rootfsDir, squashPath, "-comp", "xz", "-noappend"}
-	for _, ex := range excludeFromSquash {
-		args = append(args, "-e", ex)
+	if err := prepareRuntimeSkeleton(rootfsDir); err != nil {
+		return err
 	}
 
-	return util.RunStreaming("", "mksquashfs", args...)
+	args := []string{rootfsDir, squashPath, "-comp", "xz", "-noappend", "-wildcards", "-e"}
+	args = append(args, excludeFromSquash...)
+
+	if err := util.RunStreaming("", "mksquashfs", args...); err != nil {
+		return err
+	}
+	return verifySquashfs(squashPath)
+}
+
+// prepareRuntimeSkeleton upewnia sie, ze rootfs (z ktorego powstanie
+// squashfs) ma katalogi punktow montowania i podstawowe wezly /dev
+// (console, null, ...) -- patrz komentarz przy excludeFromSquash. Rootfs
+// pochodzi z obrazu OCI, a wezly urzadzen byly historycznie gubione przy
+// rozpakowywaniu warstw, wiec odtwarzamy je tu niezaleznie (idempotentnie).
+//
+// Zabezpieczenie: gdyby cokolwiek bylo zamontowane POD rootfs/dev
+// (np. wyciek bind-mounta z sandboxa), NIE dotykamy tego katalogu --
+// mknod w devtmpfs hosta i pakowanie go do obrazu byloby grozne.
+func prepareRuntimeSkeleton(rootfsDir string) error {
+	if mounts := mountsUnder(rootfsDir); len(mounts) > 0 {
+		return fmt.Errorf(
+			"pod %s sa nadal zamontowane systemy plikow (%s) -- odmontuj je przed budowa "+
+				"squashfs (inaczej do obrazu trafilaby zawartosc hosta)",
+			rootfsDir, strings.Join(mounts, ", "))
+	}
+	for _, w := range util.EnsureDevSkeleton(rootfsDir) {
+		util.Warnf("rootfs skeleton: %s", w)
+	}
+	// /dev/console jest twardym wymaganiem -- bez niego live-medium panikuje.
+	if fi, err := os.Lstat(filepath.Join(rootfsDir, "dev", "console")); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf(
+			"brak wezla znakowego %s/dev/console i nie udalo sie go utworzyc (uruchom hackeros-builder jako root) "+
+				"-- bez niego initramfs nie wystartuje systemu (kernel panic: Attempted to kill init!)",
+			rootfsDir)
+	}
+	return nil
+}
+
+// mountsUnder zwraca punkty montowania lezace wewnatrz dir (wg
+// /proc/self/mountinfo). Gdy mountinfo jest nieczytelny -- zwraca nil.
+func mountsUnder(dir string) []string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		mp := strings.ReplaceAll(f[4], "\\040", " ")
+		if mp == abs || strings.HasPrefix(mp, abs+"/") {
+			out = append(out, mp)
+		}
+	}
+	return out
+}
+
+// verifySquashfs przeglada zawartosc zbudowanego filesystem.squashfs
+// ("unsquashfs -l") i sprawdza obecnosc wpisow z requiredSquashEntries.
+func verifySquashfs(squashPath string) error {
+	cmd := exec.Command("unsquashfs", "-l", squashPath)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("weryfikacja squashfs (unsquashfs -l): %w", err)
+	}
+	need := make(map[string]bool, len(requiredSquashEntries))
+	for _, e := range requiredSquashEntries {
+		need[e] = true
+	}
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		delete(need, strings.TrimSpace(sc.Text()))
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("weryfikacja squashfs (unsquashfs -l): %w", err)
+	}
+	if len(need) > 0 {
+		var missing []string
+		for k := range need {
+			missing = append(missing, strings.TrimPrefix(k, "squashfs-root"))
+		}
+		sort.Strings(missing)
+		return fmt.Errorf(
+			"filesystem.squashfs nie zawiera wymaganych wpisow: %s -- taki obraz konczy sie "+
+				"panika jadra \"Attempted to kill init!\" przy starcie", strings.Join(missing, ", "))
+	}
+	util.Infof("  squashfs zweryfikowany: /dev (z /dev/console), /proc, /sys, /run, /tmp obecne")
+	return nil
 }
 
 // copyKernelAndInitrd kopiuje vmlinuz i initrd.img z rootfs/boot do
@@ -331,19 +462,33 @@ func writeGrubConfig(isoTree, volumeName string) error {
 		return err
 	}
 
+	// Wpisy:
+	//  1. normalny start (quiet splash),
+	//  2. safe graphics (nomodeset),
+	//  3. DEBUG -- bez quiet/splash, z "debug" dla initramfs i konsola
+	//     szeregowa; przy awarii live-boot (np. "Unable to find a medium
+	//     containing a live file system") widac prawdziwy komunikat zamiast
+	//     gołej paniki jadra.
+	// "live-media-path=/live" jest domyslne w live-boot, ale podajemy je jawnie
+	// zeby konfiguracja byla samodokumentujaca sie.
 	cfg := fmt.Sprintf(`set timeout=5
 set default=0
 
-menuentry "%s" {
-    linux /live/vmlinuz boot=live quiet splash
+menuentry "%[1]s" {
+    linux /live/vmlinuz boot=live live-media-path=/live quiet splash
     initrd /live/initrd.img
 }
 
-menuentry "%s (safe graphics)" {
-    linux /live/vmlinuz boot=live quiet nomodeset
+menuentry "%[1]s (safe graphics)" {
+    linux /live/vmlinuz boot=live live-media-path=/live quiet nomodeset
     initrd /live/initrd.img
 }
-`, volumeName, volumeName)
+
+menuentry "%[1]s (debug - bez quiet/splash)" {
+    linux /live/vmlinuz boot=live live-media-path=/live nomodeset debug ignore_loglevel earlyprintk=vga console=tty0 console=ttyS0,115200
+    initrd /live/initrd.img
+}
+`, volumeName)
 
 	return os.WriteFile(filepath.Join(grubDir, "grub.cfg"), []byte(cfg), 0o644)
 }
