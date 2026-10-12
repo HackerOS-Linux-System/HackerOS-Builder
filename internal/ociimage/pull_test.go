@@ -195,3 +195,47 @@ func TestExtractTarStream_Whiteout(t *testing.T) {
 		t.Fatalf("plik 'stary' powinien zostac usuniety przez whiteout, stat err = %v", err)
 	}
 }
+
+// Regresja: wezly urzadzen byly pomijane przy rozpakowaniu (brak
+// /dev/console w rootfs -> panika "Attempted to kill init!"), a wlasciciel
+// plikow nie byl przywracany.
+func TestExtractTarStream_DeviceNodesAndOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("potrzebny root (mknod/chown)")
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdrs := []*tar.Header{
+		{Name: "dev/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "dev/console", Typeflag: tar.TypeChar, Mode: 0o600, Devmajor: 5, Devminor: 1},
+		{Name: "etc/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "etc/shadow", Typeflag: tar.TypeReg, Mode: 0o640, Uid: 0, Gid: 42, Size: 1},
+		{Name: "usr/bin/su", Typeflag: tar.TypeReg, Mode: 0o4755, Size: 1},
+	}
+	for _, h := range hdrs {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Size > 0 {
+			tw.Write([]byte("x"))
+		}
+	}
+	tw.Close()
+
+	dest := t.TempDir()
+	if err := extractTarStream(tar.NewReader(&buf), dest); err != nil {
+		t.Fatalf("extractTarStream: %v", err)
+	}
+	fi, err := os.Lstat(filepath.Join(dest, "dev/console"))
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		t.Fatalf("dev/console nie jest urzadzeniem znakowym: %v %v", fi, err)
+	}
+	st, _ := os.Lstat(filepath.Join(dest, "etc/shadow"))
+	if gid := st.Sys().(*syscall.Stat_t).Gid; gid != 42 {
+		t.Fatalf("gid etc/shadow = %d, chcialem 42", gid)
+	}
+	su, _ := os.Lstat(filepath.Join(dest, "usr/bin/su"))
+	if su.Mode()&os.ModeSetuid == 0 {
+		t.Fatalf("utracony bit setuid na su: %v", su.Mode())
+	}
+}
