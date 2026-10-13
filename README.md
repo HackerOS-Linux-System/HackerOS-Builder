@@ -8,6 +8,19 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+## Poprawka: niebieski ekran zamiast instalatora
+
+- **Plymouth**: parametr `splash` zostawial niebieski ekran startowy na tty1/DRM, a X
+  instalatora nie mogl go przejac (stad sam gradient, a na tty2 wszystko dzialalo). Wpisy GRUB z
+  instalatorem maja teraz `plymouth.enable=0` i nie maja `splash`; usluga dodatkowo robi `plymouth quit`.
+- **Branding Calamares**: `branding.desc` wskazywal `logo.png`, `welcome.png`, `show.qml`, ktorych
+  builder nigdy nie tworzyl -- Calamares nie ladowal brandingu. Pliki sa teraz generowane
+  (`brandingPNGs`), a `verifyInstaller` sprawdza ich obecnosc.
+- **Renderowanie**: Calamares startuje z `QT_QUICK_BACKEND=software` (bez zaleznosci od GL),
+  przez `dbus-launch`, z logiem `/var/log/hackeros-installer-calamares.log`.
+- **Awaria**: jesli Calamares zakonczy sie bledem, sesja wraca do loginu na tty1 z komunikatem
+  i lista logow (zamiast pustego ekranu).
+
 ## Poprawka: po starcie live zostawal tylko tty (zamiast Openbox + Calamares)
 
 Autostart oparty o autologin + `/root/.bash_profile` + `startx` zawodzil po cichu
