@@ -21,7 +21,11 @@ type BuildParams struct {
 	RootfsDir  string // rozpakowany rootfs (z obrazu OCI lub bezposrednio z build)
 	OutputISO  string // docelowa sciezka pliku .iso
 	WorkDir    string // katalog tymczasowy na squashfs/initrd/iso-tree
-	VolumeName string // etykieta woluminu ISO (np. "HACKEROS")
+	VolumeName string // etykieta woluminu ISO (np. "HACKEROS") -- ISO9660 woli wielkie litery
+	// MenuTitle to nazwa wyswietlana w menu GRUB (np. "HackerOS"). Puste
+	// = "HackerOS". Oddzielona od VolumeName, bo etykieta woluminu ISO
+	// zostaje wielkimi literami, a w menu ma byc "HackerOS".
+	MenuTitle string
 
 	// SkipInstaller pomija wstrzykniecie graficznego instalatora (Calamares)
 	// do RootfsDir -- przydatne dla obrazow rescue/serwerowych, gdzie ISO
@@ -216,7 +220,11 @@ func Build(p BuildParams) error {
 
 	step++
 	util.Step(step, totalSteps, "generowanie konfiguracji GRUB (BIOS+UEFI)...")
-	if err := writeGrubConfig(isoTree, p.VolumeName); err != nil {
+	menuTitle := p.MenuTitle
+	if menuTitle == "" {
+		menuTitle = "HackerOS"
+	}
+	if err := writeGrubConfig(isoTree, menuTitle, !p.SkipInstaller); err != nil {
 		return fmt.Errorf("grub config: %w", err)
 	}
 
@@ -456,7 +464,7 @@ func kernelVersionsWithInitrd(bootDir string) ([]string, error) {
 // writeGrubConfig generuje minimalna konfiguracje GRUB dla obrazu live --
 // wpis bootujacy jadro z initrd, z parametrem "boot=live" wskazujacym na
 // squashfs (konwencja live-boot uzywana takze przez live-build).
-func writeGrubConfig(isoTree, volumeName string) error {
+func writeGrubConfig(isoTree, menuTitle string, installer bool) error {
 	grubDir := filepath.Join(isoTree, "boot", "grub")
 	if err := os.MkdirAll(grubDir, 0o755); err != nil {
 		return err
@@ -471,24 +479,34 @@ func writeGrubConfig(isoTree, volumeName string) error {
 	//     gołej paniki jadra.
 	// "live-media-path=/live" jest domyslne w live-boot, ale podajemy je jawnie
 	// zeby konfiguracja byla samodokumentujaca sie.
+	// Gdy ISO ma instalator (hackeros-installer.service, patrz installer.go),
+	// live musi wstac w multi-user.target -- inaczej obok instalatora
+	// wystartowalby menedzer logowania/pulpit z rootfs i oba walczylyby o
+	// X :0 / tty. Robimy to parametrem jadra, a NIE nadpisaniem
+	// default.target w rootfs, bo ten rootfs kopiuje na dysk Calamares.
+	unit := ""
+	if installer {
+		unit = " systemd.unit=multi-user.target"
+	}
+
 	cfg := fmt.Sprintf(`set timeout=5
 set default=0
 
 menuentry "%[1]s" {
-    linux /live/vmlinuz boot=live live-media-path=/live quiet splash
+    linux /live/vmlinuz boot=live live-media-path=/live%[2]s quiet splash
     initrd /live/initrd.img
 }
 
 menuentry "%[1]s (safe graphics)" {
-    linux /live/vmlinuz boot=live live-media-path=/live quiet nomodeset
+    linux /live/vmlinuz boot=live live-media-path=/live%[2]s quiet nomodeset
     initrd /live/initrd.img
 }
 
 menuentry "%[1]s (debug - bez quiet/splash)" {
-    linux /live/vmlinuz boot=live live-media-path=/live nomodeset debug ignore_loglevel earlyprintk=vga console=tty0 console=ttyS0,115200
+    linux /live/vmlinuz boot=live live-media-path=/live%[2]s nomodeset debug ignore_loglevel earlyprintk=vga console=tty0 console=ttyS0,115200
     initrd /live/initrd.img
 }
-`, volumeName)
+`, menuTitle, unit)
 
 	return os.WriteFile(filepath.Join(grubDir, "grub.cfg"), []byte(cfg), 0o644)
 }
