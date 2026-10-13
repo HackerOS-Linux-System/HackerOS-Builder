@@ -51,3 +51,38 @@ func TestVerifyInstaller_ReportsMissing(t *testing.T) {
 		t.Fatalf("oczekiwano bledu z lista brakow, jest: %v", err)
 	}
 }
+
+// Regresja: branding.desc wskazuje logo.png/welcome.png/show.qml -- musza
+// istniec, inaczej Calamares nie zaladuje brandingu i instalator nie wstanie.
+func TestWriteCalamaresConfig_GeneratesBrandingAssets(t *testing.T) {
+	for _, v := range []InstallerVariant{InstallerVariantDefault, InstallerVariantCybersecurity} {
+		root := t.TempDir()
+		if err := writeCalamaresConfig(root, v); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, "etc/calamares/branding/hackeros")
+		desc, _ := os.ReadFile(filepath.Join(dir, "branding.desc"))
+		for _, f := range []string{"logo.png", "welcome.png", "show.qml"} {
+			b, err := os.ReadFile(filepath.Join(dir, f))
+			if err != nil || len(b) == 0 {
+				t.Fatalf("%s (%s): brak lub pusty: %v", f, v, err)
+			}
+			if strings.HasSuffix(f, ".png") && string(b[1:4]) != "PNG" {
+				t.Fatalf("%s nie jest PNG", f)
+			}
+			if !strings.Contains(string(desc), f) {
+				t.Errorf("branding.desc nie wspomina %s", f)
+			}
+		}
+	}
+}
+
+func TestInstallerScripts_SoftwareRenderingAndLogging(t *testing.T) {
+	if !strings.Contains(installerXinitScript, "QT_QUICK_BACKEND=software") ||
+		!strings.Contains(installerXinitScript, "hackeros-installer-calamares.log") {
+		t.Fatal("xinit script bez renderowania programowego/logu")
+	}
+	if !strings.Contains(installerServiceUnit, "plymouth quit") {
+		t.Fatal("unit nie zamyka plymouth")
+	}
+}
