@@ -486,14 +486,20 @@ func writeGrubConfig(isoTree, menuTitle string, installer bool) error {
 	// default.target w rootfs, bo ten rootfs kopiuje na dysk Calamares.
 	unit := ""
 	if installer {
-		unit = " systemd.unit=multi-user.target"
+		// Bez Plymouth: "splash" zostawial niebieski ekran na tty1/DRM i X
+		// instalatora nie mogl go przejac (widac bylo sam gradient).
+		unit = " systemd.unit=multi-user.target plymouth.enable=0"
+	}
+	splash := " splash"
+	if installer {
+		splash = ""
 	}
 
 	cfg := fmt.Sprintf(`set timeout=5
 set default=0
 
 menuentry "%[1]s" {
-    linux /live/vmlinuz boot=live live-media-path=/live%[2]s quiet splash
+    linux /live/vmlinuz boot=live live-media-path=/live%[2]s quiet%[3]s
     initrd /live/initrd.img
 }
 
@@ -506,7 +512,7 @@ menuentry "%[1]s (debug - bez quiet/splash)" {
     linux /live/vmlinuz boot=live live-media-path=/live%[2]s nomodeset debug ignore_loglevel earlyprintk=vga console=tty0 console=ttyS0,115200
     initrd /live/initrd.img
 }
-`, menuTitle, unit)
+`, menuTitle, unit, splash)
 
 	return os.WriteFile(filepath.Join(grubDir, "grub.cfg"), []byte(cfg), 0o644)
 }
