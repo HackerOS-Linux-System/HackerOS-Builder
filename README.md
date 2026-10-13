@@ -8,6 +8,41 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+## Poprawka: po starcie live zostawal tylko tty (zamiast Openbox + Calamares)
+
+Autostart oparty o autologin + `/root/.bash_profile` + `startx` zawodzil po cichu
+(Xorg bez sterownikow wejscia/wideo przy `--no-install-recommends`, flaga
+`/run/hackeros-installer-started` blokowala ponowna probe). Teraz:
+
+- `hackeros-installer.service` (systemd, tty1, `ConditionKernelCommandLine=boot=live`)
+  uruchamia `xinit` -> Openbox -> Calamares; kolejne proby X: autodetekcja -> fbdev -> vesa;
+  log w `/var/log/hackeros-installer.log`; dopiero gdy wszystko zawiedzie -- login na tty1.
+- Doinstalowywane sa sterowniki Xorg (`xserver-xorg-input-all`, `-video-all`, fbdev, vesa),
+  fonty, `libgl1-mesa-dri`, `udisks2`; `verifyInstaller` przerywa build, gdy brakuje
+  calamares/openbox/xinit/Xorg/libinput.
+- `default.target` nie jest juz nadpisywany w rootfs (kopiuje go Calamares na dysk);
+  live wchodzi w `multi-user.target` przez `systemd.unit=multi-user.target` w grub.cfg.
+- Menu GRUB: `HackerOS` zamiast `HACKEROS` (etykieta ISO9660 zostaje wielkimi literami).
+
+## Poprawka: kernel panic "Attempted to kill init!" na live ISO
+
+Przyczyny (wszystkie naprawione):
+
+1. **squashfs bez `/dev`, `/proc`, `/sys`, `/run`, `/tmp`** -- `mksquashfs -e dev ...`
+   wycinalo te katalogi w calosci. `/init` z initramfs nie mogl wykonac
+   `run-init ... </root/dev/console` i PID 1 umieral. Teraz: `-wildcards -e 'proc/*' ...`
+   (puste katalogi zostaja), `/dev/console` i podstawowe wezly sa odtwarzane, a po
+   zbudowaniu `verifySquashfs` sprawdza ich obecnosc (`internal/isobuild/builder.go`).
+2. **Wezly urzadzen i wlasciciele plikow gubieni przy `PullAndUnpack`** -- `TypeChar/
+   TypeBlock/TypeFifo` byly pomijane, a uid/gid nie byly przywracane (`internal/ociimage/pull.go`).
+3. **Brak gwarancji `live-boot` w initrd** -- live-build instaluje go sam, hackeros-builder
+   tylko to co na liscie. Teraz `live-boot` + `live-boot-initramfs-tools` sa dopisywane
+   (poza kontenerami i gdy projekt ich nie wyklucza przez `-live-boot`), initramfs dostaje
+   `MODULES=most` + moduly dla medium live, a po `update-initramfs` `verifyInitrd`
+   sprawdza zawartosc initrd (`internal/rootfs/builder.go`).
+4. GRUB: dodany wpis **debug** (bez `quiet splash`, z konsola szeregowa) -- przy awarii widac
+   prawdziwy komunikat.
+
 ## Co nowego w v0.5.0
 
 **`[project] -> type = containerized` przeprojektowany: Isolator zamiast Distrobox.**
