@@ -1,7 +1,12 @@
 package isobuild
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,7 +199,98 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant) error {
 			return fmt.Errorf("zapis %s: %w", path, err)
 		}
 	}
+
+	// Zasoby brandingu wskazane w branding.desc (logo.png, welcome.png,
+	// show.qml). WCZESNIEJ NIE BYLY GENEROWANE -- Calamares nie potrafi
+	// zaladowac brandingu z nieistniejacymi obrazami i konczy dzialanie, a
+	// uzytkownik zostaje bez instalatora.
+	logo, welcome, err := brandingPNGs(variant)
+	if err != nil {
+		return fmt.Errorf("generowanie obrazow brandingu: %w", err)
+	}
+	assets := map[string][]byte{
+		filepath.Join(brandingDir, "logo.png"):    logo,
+		filepath.Join(brandingDir, "welcome.png"): welcome,
+		filepath.Join(brandingDir, "show.qml"):    []byte(calamaresShowQML),
+	}
+	for path, content := range assets {
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			return fmt.Errorf("zapis %s: %w", path, err)
+		}
+	}
 	return nil
+}
+
+// calamaresShowQML to minimalna prezentacja wyswietlana podczas kopiowania
+// systemu (slideshow z branding.desc). Jeden slajd z nazwa systemu.
+const calamaresShowQML = `import QtQuick 2.0
+import calamares.slideshow 1.0
+
+Presentation {
+    id: presentation
+
+    Slide {
+        Text {
+            anchors.centerIn: parent
+            text: "Instalowanie systemu..."
+            color: "#ffffff"
+            font.pixelSize: 28
+        }
+    }
+}
+`
+
+// brandingPNGs rysuje (stdlib image/png, bez zewnetrznych plikow) logo
+// (128x128) i obraz powitalny (640x240) w kolorach wariantu.
+func brandingPNGs(variant InstallerVariant) (logo, welcome []byte, err error) {
+	accent := color.RGBA{0x3d, 0xae, 0xe9, 0xff}
+	if variant == InstallerVariantCybersecurity {
+		accent = color.RGBA{0xff, 0x3b, 0x30, 0xff}
+	}
+	bg := color.RGBA{0x1d, 0x20, 0x23, 0xff}
+
+	drawH := func(img *image.RGBA, x0, y0, w, h int, c color.Color) {
+		t := w / 5
+		fill := func(x, y, ww, hh int) {
+			draw.Draw(img, image.Rect(x, y, x+ww, y+hh), &image.Uniform{c}, image.Point{}, draw.Src)
+		}
+		fill(x0, y0, t, h)
+		fill(x0+w-t, y0, t, h)
+		fill(x0, y0+h/2-t/2, w, t)
+	}
+	encode := func(img image.Image) ([]byte, error) {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
+	l := image.NewRGBA(image.Rect(0, 0, 128, 128))
+	draw.Draw(l, l.Bounds(), &image.Uniform{bg}, image.Point{}, draw.Src)
+	draw.Draw(l, image.Rect(8, 8, 120, 120), &image.Uniform{accent}, image.Point{}, draw.Src)
+	draw.Draw(l, image.Rect(14, 14, 114, 114), &image.Uniform{bg}, image.Point{}, draw.Src)
+	drawH(l, 36, 34, 56, 60, accent)
+	if logo, err = encode(l); err != nil {
+		return nil, nil, err
+	}
+
+	w := image.NewRGBA(image.Rect(0, 0, 640, 240))
+	for y := 0; y < 240; y++ {
+		f := float64(y) / 239
+		c := color.RGBA{
+			uint8(float64(bg.R)*(1-f) + float64(accent.R)*f*0.35),
+			uint8(float64(bg.G)*(1-f) + float64(accent.G)*f*0.35),
+			uint8(float64(bg.B)*(1-f) + float64(accent.B)*f*0.35),
+			0xff,
+		}
+		draw.Draw(w, image.Rect(0, y, 640, y+1), &image.Uniform{c}, image.Point{}, draw.Src)
+	}
+	drawH(w, 270, 70, 100, 100, accent)
+	if welcome, err = encode(w); err != nil {
+		return nil, nil, err
+	}
+	return logo, welcome, nil
 }
 
 // brandingDescFor zwraca zawartosc branding.desc dopasowana do wariantu
@@ -372,7 +468,7 @@ script:
     - command: "rm -f /etc/systemd/system/hackeros-installer.service"
     - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit"
     - command: "rm -rf /etc/hackeros-installer"
-    - command: "rm -f /var/log/hackeros-installer.log"
+    - command: "rm -f /var/log/hackeros-installer.log /var/log/hackeros-installer-calamares.log"
     - command: "rm -rf /etc/calamares"
 `
 
@@ -393,6 +489,8 @@ strings:
     productUrl:           "https://github.com/HackerOS-Linux-System"
     supportUrl:           "https://github.com/HackerOS-Linux-System"
     releaseNotesUrl:      "https://github.com/HackerOS-Linux-System"
+    knownIssuesUrl:       "https://github.com/HackerOS-Linux-System"
+    donateUrl:            "https://github.com/HackerOS-Linux-System"
 
 images:
     productLogo:         "logo.png"
@@ -431,6 +529,8 @@ strings:
     productUrl:           "https://github.com/HackerOS-Linux-System"
     supportUrl:           "https://github.com/HackerOS-Linux-System"
     releaseNotesUrl:      "https://github.com/HackerOS-Linux-System"
+    knownIssuesUrl:       "https://github.com/HackerOS-Linux-System"
+    donateUrl:            "https://github.com/HackerOS-Linux-System"
 
 images:
     productLogo:         "logo.png"
@@ -486,6 +586,11 @@ StandardError=journal
 TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes
+# Plymouth (parametr "splash") trzyma tty1/DRM i maluje niebieski ekran
+# startowy -- X nie przejmie wtedy ekranu (obiaw: "niebieski gradient i
+# nic wiecej, a na tty2 wszystko dziala"). Zamykamy go jawnie przed startem.
+ExecStartPre=-/usr/bin/plymouth quit
+ExecStartPre=-/usr/bin/chvt 1
 ExecStart=/usr/local/sbin/hackeros-installer-session
 Restart=no
 
@@ -505,31 +610,58 @@ echo "=== hackeros-installer-session: $(date) ==="
 rm -f /run/hackeros-installer-x-ok
 export XDG_RUNTIME_DIR=/run/user/0
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+plymouth quit 2>/dev/null || true
 
+XRC=1
 try_x() {
     label="$1"; shift
     echo "--- proba X: $label"
     xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1 -nocursor "$@"
-    rc=$?
-    echo "--- xinit ($label) zakonczyl sie kodem $rc"
+    XRC=$?
+    echo "--- xinit ($label) zakonczyl sie kodem $XRC"
     [ -e /run/hackeros-installer-x-ok ]
 }
 
-if try_x "autodetekcja"; then exit 0; fi
-if try_x "fbdev" -config /etc/hackeros-installer/xorg-fbdev.conf; then exit 0; fi
-if try_x "vesa" -config /etc/hackeros-installer/xorg-vesa.conf; then exit 0; fi
+fallback_console() {
+    printf '\n[hackeros] %s\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/hackeros-installer-calamares.log, /var/log/Xorg.0.log\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\n\n' "$1" >/dev/tty1 2>/dev/null
+    exec /sbin/agetty --autologin root --noclear tty1 linux
+}
 
-echo "!!! Nie udalo sie uruchomic X -- wracam do konsoli. Log: $LOG (oraz /var/log/Xorg.0.log)"
-printf '\n[hackeros] Nie udalo sie uruchomic graficznego instalatora.\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/Xorg.0.log\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\n\n' >/dev/tty1 2>/dev/null
-exec /sbin/agetty --autologin root --noclear tty1 linux
+for attempt in "autodetekcja:" "fbdev:-config /etc/hackeros-installer/xorg-fbdev.conf" "vesa:-config /etc/hackeros-installer/xorg-vesa.conf"; do
+    label="${attempt%%:*}"; args="${attempt#*:}"
+    # shellcheck disable=SC2086
+    if try_x "$label" $args; then
+        # X wstal i uruchomil Calamares. Kod 0 = normalne zakonczenie
+        # (instalacja/anulowanie); inny = Calamares sie wywalil.
+        if [ "$XRC" -eq 0 ]; then exit 0; fi
+        fallback_console "Instalator (Calamares) zakonczyl sie bledem (kod $XRC)."
+    fi
+done
+
+echo "!!! Nie udalo sie uruchomic X"
+fallback_console "Nie udalo sie uruchomic graficznego instalatora (X)."
 `
 
 const installerXinitScript = `#!/bin/sh
 # Wygenerowane przez hackeros-builder.
+# Instalator nie potrzebuje akceleracji GL -- renderowanie programowe omija
+# problemy ze sterownikami (puste/niebieskie okno Qt Quick na starszym sprzecie).
+export QT_QUICK_BACKEND=software
+export QT_XCB_GL_INTEGRATION=none
+export LIBGL_ALWAYS_SOFTWARE=1
+export QT_QPA_PLATFORM=xcb
+export XDG_RUNTIME_DIR=/run/user/0
+export NO_AT_BRIDGE=1
+xsetroot -solid '#1d2023' 2>/dev/null || true
 openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
 sleep 1
 touch /run/hackeros-installer-x-ok
-exec calamares
+CALA_LOG=/var/log/hackeros-installer-calamares.log
+echo "=== calamares: $(date) ===" >>"$CALA_LOG"
+if command -v dbus-launch >/dev/null 2>&1; then
+    exec dbus-launch --exit-with-session calamares -d >>"$CALA_LOG" 2>&1
+fi
+exec calamares -d >>"$CALA_LOG" 2>&1
 `
 
 const installerXorgFbdev = `Section "Device"
@@ -621,6 +753,11 @@ var installerRequiredFiles = []string{
 	"usr/bin/xinit",
 	"usr/bin/Xorg",
 	"usr/lib/xorg/modules/input/libinput_drv.so",
+	"etc/calamares/settings.conf",
+	"etc/calamares/branding/hackeros/branding.desc",
+	"etc/calamares/branding/hackeros/logo.png",
+	"etc/calamares/branding/hackeros/welcome.png",
+	"etc/calamares/branding/hackeros/show.qml",
 }
 
 // verifyInstaller przerywa build z czytelnym komunikatem, gdy brakuje
