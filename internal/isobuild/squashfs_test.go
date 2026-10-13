@@ -59,12 +59,26 @@ func TestBuildSquashfs_KeepsEmptyRuntimeDirsAndDevConsole(t *testing.T) {
 
 func TestWriteGrubConfig_HasDebugEntry(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeGrubConfig(dir, "HACKEROS"); err != nil {
+	if err := writeGrubConfig(dir, "HackerOS", true); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "boot", "grub", "grub.cfg"))
 	cfg := string(b)
 	if strings.Count(cfg, "menuentry") != 3 || !strings.Contains(cfg, "boot=live") || !strings.Contains(cfg, "debug") {
 		t.Fatalf("niepoprawny grub.cfg:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, `menuentry "HackerOS" {`) || strings.Contains(cfg, "HACKEROS") {
+		t.Fatalf("tytul menu powinien byc \"HackerOS\":\n%s", cfg)
+	}
+	if strings.Count(cfg, "systemd.unit=multi-user.target") != 3 {
+		t.Fatalf("z instalatorem kazdy wpis ma wymuszac multi-user.target:\n%s", cfg)
+	}
+	dir2 := t.TempDir()
+	if err := writeGrubConfig(dir2, "HackerOS", false); err != nil {
+		t.Fatal(err)
+	}
+	b2, _ := os.ReadFile(filepath.Join(dir2, "boot", "grub", "grub.cfg"))
+	if strings.Contains(string(b2), "systemd.unit") {
+		t.Fatalf("bez instalatora nie wolno zmieniac targetu")
 	}
 }
