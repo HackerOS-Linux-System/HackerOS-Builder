@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/sandbox"
 	"github.com/HackerOS-Linux-System/hackeros-builder/internal/toolchain"
@@ -51,7 +52,22 @@ const (
 var installerPackages = []string{
 	"calamares",
 	"xserver-xorg",
+	"xserver-xorg-core",
+	// Bez --no-install-recommends Xorg nie ciagnie sterownikow. Bez nich X nie
+	// widzi klawiatury/myszy ("no input devices") albo ekranu ("no screens
+	// found") i zostaje sam tty. input-all = libinput+evdev, video-all =
+	// modesetting/fbdev/vesa/qxl/vmware/... (QEMU, VirtualBox, goly sprzet).
+	"xserver-xorg-input-all",
+	"xserver-xorg-video-all",
+	"xserver-xorg-video-fbdev",
+	"xserver-xorg-video-vesa",
 	"xinit",
+	"x11-xserver-utils",
+	"xkb-data",
+	"libgl1-mesa-dri",
+	"fonts-dejavu-core",
+	"udisks2",
+	"kmod",
 	"openbox",
 	"dbus-x11",
 	// "policykit-1" byl transitional package (polkitd + pkexec) usuniety w
@@ -116,9 +132,12 @@ func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant) error 
 		return fmt.Errorf("konfiguracja calamares: %w", err)
 	}
 
-	util.Infof("  instalator GUI: konfiguracja autostartu na tty1...")
+	util.Infof("  instalator GUI: konfiguracja autostartu (usluga systemd, tty1)...")
 	if err := writeInstallerAutostart(rootfsDir); err != nil {
 		return fmt.Errorf("autostart instalatora: %w", err)
+	}
+	if err := verifyInstaller(rootfsDir); err != nil {
+		return fmt.Errorf("weryfikacja instalatora: %w", err)
 	}
 
 	return nil
@@ -349,12 +368,11 @@ dontChroot: false
 timeout: 30
 script:
     - command: "mkdir -p /etc/hammer"
-    - command: "rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf"
-    - command: "rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d"
-    - command: "sh -c 'grep -q \"autostart instalatora GUI na tty1\" /root/.bash_profile 2>/dev/null && rm -f /root/.bash_profile; exit 0'"
-    - command: "rm -f /usr/local/sbin/hackeros-installer-xinit"
+    - command: "rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service"
+    - command: "rm -f /etc/systemd/system/hackeros-installer.service"
+    - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit"
     - command: "rm -rf /etc/hackeros-installer"
-    - command: "rm -f /run/hackeros-installer-started"
+    - command: "rm -f /var/log/hackeros-installer.log"
     - command: "rm -rf /etc/calamares"
 `
 
@@ -428,76 +446,105 @@ style:
    sidebarTextHighlight:    "#ff3b30"
 `
 
-// writeInstallerAutostart sprawia, ze po starcie nosnika live PIERWSZY ekran
-// jakiego uzytkownik dotyka to pelnoekranowy Calamares -- DOKLADNIE jak
-// boot-time instalator (np. trybu tekstowego Anacondy/Fedora Silverblue),
-// a NIE ikona/skrot wewnatrz pelnego srodowiska graficznego live.
+// installerServiceName to nazwa jednostki systemd uruchamiajacej instalator.
+const installerServiceName = "hackeros-installer.service"
+
+// installerServiceUnit -- jednostka systemd odpalajaca sesje instalatora na
+// tty1 (zamiast poprzedniego autologinu roota + ~/.bash_profile).
 //
-// Mechanizm: systemd override dla getty@tty1 podmienia "agetty" (zwykly
-// login) na autologin roota + natychmiastowy "startx", ktorego .xinitrc
-// odpala WYLACZNIE openbox (bez paska, bez dekoracji okien) i na nim
-// Calamares w --rootMountPoint=/ -- bez menedzera logowania, bez
-// dodatkowego pulpitu w tle. default.target jest ustawiony na
-// multi-user.target (tryb tekstowy) wlasnie po to, by nie startowal zaden
-// pelny desktop environment przed instalatorem.
-func writeInstallerAutostart(rootfsDir string) error {
-	// 1) autologin roota na tty1 (wymagane zeby cokolwiek mogl wystartowac
-	//    bez interakcji z klawiatura/myszka -- live media nie ma hasla).
-	overrideDir := filepath.Join(rootfsDir, "etc", "systemd", "system", "getty@tty1.service.d")
-	if err := os.MkdirAll(overrideDir, 0o755); err != nil {
-		return err
-	}
-	overrideConf := `[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
-`
-	if err := os.WriteFile(filepath.Join(overrideDir, "autologin.conf"), []byte(overrideConf), 0o644); err != nil {
-		return err
-	}
+// DLACZEGO NIE .bash_profile (przyczyna "po starcie jest tylko tty"):
+// poprzedni mechanizm wymagal, zeby (1) getty@tty1 zalogowal roota przez
+// autologin, (2) bash wczytal /root/.bash_profile jako login shell, (3)
+// `startx` wystartowal Xorg. Kazde ogniwo moglo cicho zawiesc (np. Xorg bez
+// sterownikow wejscia/wideo, bo apt szedl z --no-install-recommends), a
+// flaga /run/hackeros-installer-started sprawiala, ze po nieudanym starcie X
+// uzytkownik zostawal na golym tty1 BEZ zadnej diagnostyki.
+//
+// Teraz: osobna usluga z logiem (/var/log/hackeros-installer.log), kilkoma
+// probami X (autodetekcja -> fbdev -> vesa) i awaryjnym powrotem do loginu
+// na tty1 TYLKO gdy wszystkie zawioda.
+//
+// ConditionKernelCommandLine=boot=live -- usluga dziala WYLACZNIE na
+// medium live. Zainstalowany system nigdy jej nie uruchomi, nawet gdyby
+// sprzatanie w Calamares (calamaresShellprocessConf) czegos nie usunelo.
+const installerServiceUnit = `[Unit]
+Description=HackerOS installer (Openbox + Calamares)
+ConditionKernelCommandLine=boot=live
+After=systemd-user-sessions.service systemd-logind.service dbus.service plymouth-quit-wait.service getty@tty1.service
+Conflicts=getty@tty1.service
+Wants=dbus.service systemd-logind.service
 
-	// 2) profil roota: zaraz po zalogowaniu na tty1 odpal X (raz, nie w
-	//    petli przy kazdym logowaniu) z samym instalatorem -- jesli ktos
-	//    poprosi o terminal w trakcie (np. F2 na realnym sprzecie), system
-	//    nie wymusza X ponownie po wyjsciu z konsoli.
-	profileDir := filepath.Join(rootfsDir, "root")
-	if err := os.MkdirAll(profileDir, 0o755); err != nil {
-		return err
-	}
-	bashProfile := `# Wygenerowane przez hackeros-builder: autostart instalatora GUI na tty1.
-if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ] && [ ! -f /run/hackeros-installer-started ]; then
-    touch /run/hackeros-installer-started
-    exec startx /usr/local/sbin/hackeros-installer-xinit -- -nocursor
-fi
-`
-	if err := os.WriteFile(filepath.Join(profileDir, ".bash_profile"), []byte(bashProfile), 0o644); err != nil {
-		return err
-	}
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+WorkingDirectory=/root
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+ExecStart=/usr/local/sbin/hackeros-installer-session
+Restart=no
 
-	// 3) .xinitrc dedykowany instalatorowi: openbox jako goly window
-	//    manager (zeby Calamares mial dekoracje okna/mozliwosc przesuwania
-	//    na multi-monitor), bez paneli/tapety/aplikacji startowych, i
-	//    natychmiast calamares na pelnym ekranie. Gdy Calamares sie zamknie
-	//    (koniec instalacji albo "Anuluj"), sesja X konczy sie tym samym --
-	//    wraca tekstowy tty1, tak jak w trybie instalatora Anaconda/Fedora.
-	binDir := filepath.Join(rootfsDir, "usr", "local", "sbin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		return err
-	}
-	xinitScript := `#!/bin/sh
+[Install]
+WantedBy=multi-user.target
+`
+
+// installerSessionScript -- uruchamiany przez usluge. Probuje startu X z
+// kolejnymi konfiguracjami; znacznik /run/hackeros-installer-x-ok (tworzony
+// przez hackeros-installer-xinit tuz przed calamares) odroznia "X nie
+// wstal" od "X wstal, a uzytkownik zamknal/anulowal instalator".
+const installerSessionScript = `#!/bin/sh
+# Wygenerowane przez hackeros-builder.
+LOG=/var/log/hackeros-installer.log
+exec >>"$LOG" 2>&1
+echo "=== hackeros-installer-session: $(date) ==="
+rm -f /run/hackeros-installer-x-ok
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+try_x() {
+    label="$1"; shift
+    echo "--- proba X: $label"
+    xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1 -nocursor "$@"
+    rc=$?
+    echo "--- xinit ($label) zakonczyl sie kodem $rc"
+    [ -e /run/hackeros-installer-x-ok ]
+}
+
+if try_x "autodetekcja"; then exit 0; fi
+if try_x "fbdev" -config /etc/hackeros-installer/xorg-fbdev.conf; then exit 0; fi
+if try_x "vesa" -config /etc/hackeros-installer/xorg-vesa.conf; then exit 0; fi
+
+echo "!!! Nie udalo sie uruchomic X -- wracam do konsoli. Log: $LOG (oraz /var/log/Xorg.0.log)"
+printf '\n[hackeros] Nie udalo sie uruchomic graficznego instalatora.\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/Xorg.0.log\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\n\n' >/dev/tty1 2>/dev/null
+exec /sbin/agetty --autologin root --noclear tty1 linux
+`
+
+const installerXinitScript = `#!/bin/sh
 # Wygenerowane przez hackeros-builder.
 openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
+sleep 1
+touch /run/hackeros-installer-x-ok
 exec calamares
 `
-	xinitPath := filepath.Join(binDir, "hackeros-installer-xinit")
-	if err := os.WriteFile(xinitPath, []byte(xinitScript), 0o755); err != nil {
-		return err
-	}
 
-	openboxDir := filepath.Join(rootfsDir, "etc", "hackeros-installer")
-	if err := os.MkdirAll(openboxDir, 0o755); err != nil {
-		return err
-	}
-	openboxRC := `<?xml version="1.0" encoding="UTF-8"?>
+const installerXorgFbdev = `Section "Device"
+    Identifier "hackeros-fbdev"
+    Driver "fbdev"
+EndSection
+`
+
+const installerXorgVesa = `Section "Device"
+    Identifier "hackeros-vesa"
+    Driver "vesa"
+EndSection
+`
+
+const installerOpenboxRC = `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <theme><name>Clearlooks</name></theme>
   <applications>
@@ -505,23 +552,89 @@ exec calamares
   </applications>
 </openbox_config>
 `
-	if err := os.WriteFile(filepath.Join(openboxDir, "openbox-rc.xml"), []byte(openboxRC), 0o644); err != nil {
+
+// writeInstallerAutostart sprawia, ze po starcie nosnika live PIERWSZY ekran
+// to pelnoekranowy Calamares na Openboxie (bez menedzera logowania i bez
+// pulpitu). Mechanizm: usluga systemd hackeros-installer.service (patrz
+// installerServiceUnit). Rootfs NIE dostaje juz nadpisanego default.target --
+// przejscie do multi-user.target na medium live wymusza parametr jadra
+// "systemd.unit=multi-user.target" w grub.cfg (writeGrubConfig), dzieki
+// czemu zainstalowany system zachowuje wlasny, domyslny target (np.
+// graphical.target z menedzerem logowania) i nie laduje na golym tty.
+func writeInstallerAutostart(rootfsDir string) error {
+	write := func(rel string, content string, mode os.FileMode) error {
+		path := filepath.Join(rootfsDir, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(path, []byte(content), mode)
+	}
+
+	if err := write("usr/local/sbin/hackeros-installer-session", installerSessionScript, 0o755); err != nil {
+		return err
+	}
+	if err := write("usr/local/sbin/hackeros-installer-xinit", installerXinitScript, 0o755); err != nil {
+		return err
+	}
+	if err := write("etc/hackeros-installer/openbox-rc.xml", installerOpenboxRC, 0o644); err != nil {
+		return err
+	}
+	if err := write("etc/hackeros-installer/xorg-fbdev.conf", installerXorgFbdev, 0o644); err != nil {
+		return err
+	}
+	if err := write("etc/hackeros-installer/xorg-vesa.conf", installerXorgVesa, 0o644); err != nil {
+		return err
+	}
+	if err := write("etc/systemd/system/"+installerServiceName, installerServiceUnit, 0o644); err != nil {
 		return err
 	}
 
-	// 4) default.target = multi-user (tekstowy) -- to NIE jest skrot na
-	//    pulpicie: nie ma zadnego pulpitu live do wystartowania w pierwszej
-	//    kolejnosci. Pierwszy graficzny ekran jakikolwiek uzytkownik widzi
-	//    to instalator.
-	systemdDir := filepath.Join(rootfsDir, "etc", "systemd", "system")
-	if err := os.MkdirAll(systemdDir, 0o755); err != nil {
+	// systemctl enable -- reczny symlink (w chroot bez dzialajacego systemd).
+	wantsDir := filepath.Join(rootfsDir, "etc", "systemd", "system", "multi-user.target.wants")
+	if err := os.MkdirAll(wantsDir, 0o755); err != nil {
 		return err
 	}
-	defaultTargetLink := filepath.Join(systemdDir, "default.target")
-	os.Remove(defaultTargetLink) // moze juz istniec jako symlink z bazowego rootfs
-	if err := os.Symlink("/lib/systemd/system/multi-user.target", defaultTargetLink); err != nil {
-		return fmt.Errorf("ustawienie default.target: %w", err)
+	link := filepath.Join(wantsDir, installerServiceName)
+	os.Remove(link)
+	if err := os.Symlink("/etc/systemd/system/"+installerServiceName, link); err != nil {
+		return fmt.Errorf("enable %s: %w", installerServiceName, err)
 	}
 
+	// Sprzatanie po poprzednim mechanizmie (rootfs z OCI mogl go miec).
+	os.Remove(filepath.Join(rootfsDir, "root", ".bash_profile"))
+	os.RemoveAll(filepath.Join(rootfsDir, "etc", "systemd", "system", "getty@tty1.service.d"))
+	// Dawniej builder nadpisywal default.target na multi-user -- usuwamy ten
+	// override, jesli przyszedl z wczesniejszego obrazu.
+	if fi, err := os.Lstat(filepath.Join(rootfsDir, "etc", "systemd", "system", "default.target")); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if t, _ := os.Readlink(filepath.Join(rootfsDir, "etc", "systemd", "system", "default.target")); strings.HasSuffix(t, "multi-user.target") {
+			os.Remove(filepath.Join(rootfsDir, "etc", "systemd", "system", "default.target"))
+		}
+	}
+	return nil
+}
+
+// installerRequiredFiles to pliki, ktore MUSZA istniec w rootfs po
+// InjectInstaller -- inaczej instalator nie wystartuje i zostanie sam tty.
+var installerRequiredFiles = []string{
+	"usr/bin/calamares",
+	"usr/bin/openbox",
+	"usr/bin/xinit",
+	"usr/bin/Xorg",
+	"usr/lib/xorg/modules/input/libinput_drv.so",
+}
+
+// verifyInstaller przerywa build z czytelnym komunikatem, gdy brakuje
+// binarek/sterownikow potrzebnych do startu graficznego instalatora.
+func verifyInstaller(rootfsDir string) error {
+	var missing []string
+	for _, rel := range installerRequiredFiles {
+		if _, err := os.Stat(filepath.Join(rootfsDir, rel)); err != nil {
+			missing = append(missing, "/"+rel)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("w rootfs brakuje: %s -- graficzny instalator nie wystartuje (zostanie tty)",
+			strings.Join(missing, ", "))
+	}
 	return nil
 }
