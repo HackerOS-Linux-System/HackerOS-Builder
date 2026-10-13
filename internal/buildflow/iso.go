@@ -117,7 +117,11 @@ func BuildIso(opts IsoOptions) error {
 		return fmt.Errorf("aktualizacja /etc/hammer/oci.hk: %w", err)
 	}
 
-	volumeName := "HACKEROS"
+	volumeName := "HACKEROS" // etykieta ISO9660 (wielkie litery)
+	menuTitle := "HackerOS"  // nazwa w menu GRUB
+	if cfg.Project.UsesCybersecurityInstaller() {
+		menuTitle = "HackerOS Cybersecurity Edition"
+	}
 	isoWorkDir := filepath.Join(opts.WorkDir, "iso-build")
 
 	// SkipInstaller: true jezeli uzytkownik przekazal --no-installer CLI
@@ -162,6 +166,7 @@ func BuildIso(opts IsoOptions) error {
 		OutputISO:        opts.OutputISO,
 		WorkDir:          isoWorkDir,
 		VolumeName:       volumeName,
+		MenuTitle:        menuTitle,
 		SkipInstaller:    skipInstaller,
 		InstallerVariant: installerVariant,
 		InstallerHooks:   installerHooks,
