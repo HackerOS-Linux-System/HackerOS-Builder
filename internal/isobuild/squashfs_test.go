@@ -73,6 +73,9 @@ func TestWriteGrubConfig_HasDebugEntry(t *testing.T) {
 	if strings.Count(cfg, "systemd.unit=multi-user.target") != 3 {
 		t.Fatalf("z instalatorem kazdy wpis ma wymuszac multi-user.target:\n%s", cfg)
 	}
+	if strings.Contains(cfg, " splash") || strings.Count(cfg, "plymouth.enable=0") != 3 {
+		t.Fatalf("z instalatorem plymouth ma byc wylaczony:\n%s", cfg)
+	}
 	dir2 := t.TempDir()
 	if err := writeGrubConfig(dir2, "HackerOS", false); err != nil {
 		t.Fatal(err)
