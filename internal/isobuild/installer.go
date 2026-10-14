@@ -68,12 +68,6 @@ var installerPackages = []string{
 	"xserver-xorg-video-vesa",
 	"xinit",
 	"x11-xserver-utils",
-	// xmessage + xwininfo: komunikat "uruchamianie..." na czas startu
-	// Calamares (skan dyskow na starszym laptopie trwa ~45 s przy czarnym
-	// ekranie, co wygladalo jak "instalator sie nie odpala").
-	"dmz-cursor-theme",
-	"xmessage",
-	"x11-utils",
 	"xkb-data",
 	"libgl1-mesa-dri",
 	"fonts-dejavu-core",
@@ -91,6 +85,20 @@ var installerPackages = []string{
 	"gdisk",
 	"dosfstools",
 	"os-prober",
+}
+
+// installerOptionalPackages to pakiety "mile widziane", ktorych BRAK w
+// danym wydaniu Debiana NIE moze przerwac budowy (xmessage zniknal z forky:
+// "E: Package 'xmessage' has no installation candidate" przerwal caly build).
+// Kazda grupa to lista alternatyw -- instalowana jest pierwsza dostepna;
+// jesli zadna sie nie zainstaluje, tylko ostrzezenie.
+//   - komunikat "uruchamianie instalatora..." (xmessage, a w nowszych
+//     wydaniach binarka jest w x11-apps) + xwininfo (x11-utils),
+//   - motyw kursora (dmz-cursor-theme / adwaita-icon-theme).
+var installerOptionalPackages = [][]string{
+	{"x11-utils"},
+	{"xmessage", "x11-apps"},
+	{"dmz-cursor-theme", "adwaita-icon-theme", "xcursor-themes"},
 }
 
 // installerCybersecurityExtraPackages to DODATKOWE pakiety instalowane w
@@ -136,6 +144,22 @@ func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant, projec
 	}, pkgs...)
 	if err := sandbox.ExecEnv(rootfsDir, tcEnv, "apt-get", installArgs...); err != nil {
 		return fmt.Errorf("apt-get install (instalator): %w", err)
+	}
+
+	for _, group := range installerOptionalPackages {
+		installed := false
+		for _, pkg := range group {
+			args := []string{"install", "-y", "--no-install-recommends",
+				"-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", pkg}
+			if err := sandbox.ExecEnv(rootfsDir, tcEnv, "apt-get", args...); err == nil {
+				installed = true
+				break
+			}
+			util.Warnf("opcjonalny pakiet instalatora %q niedostepny -- probuje alternatywe", pkg)
+		}
+		if !installed {
+			util.Warnf("zaden z pakietow %v nie zainstalowal sie -- kontynuuje bez nich (funkcja opcjonalna)", group)
+		}
 	}
 
 	util.Infof("  instalator GUI: zapis konfiguracji Calamares...")
