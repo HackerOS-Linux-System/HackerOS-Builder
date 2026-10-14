@@ -68,6 +68,12 @@ var installerPackages = []string{
 	"xserver-xorg-video-vesa",
 	"xinit",
 	"x11-xserver-utils",
+	// xmessage + xwininfo: komunikat "uruchamianie..." na czas startu
+	// Calamares (skan dyskow na starszym laptopie trwa ~45 s przy czarnym
+	// ekranie, co wygladalo jak "instalator sie nie odpala").
+	"dmz-cursor-theme",
+	"xmessage",
+	"x11-utils",
 	"xkb-data",
 	"libgl1-mesa-dri",
 	"fonts-dejavu-core",
@@ -107,7 +113,7 @@ var installerCybersecurityExtraPackages = []string{
 // do pobierania brakujacych narzedzi (wspoldzielony z reszta buildu --
 // narzedzia pobrane w kroku "build cloud" sa tu ponownie uzywane z cache).
 // variant okresla branding/dodatkowe narzedzia -- patrz InstallerVariant.
-func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant) error {
+func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant, projectDir string) error {
 	// Toolchain: upewnij sie ze apt-get i dpkg-deb sa dostepne (sa zawsze,
 	// ale Manager.Env() daje nam sciezke z toolchain/bin/ na czele PATH
 	// co jest potrzebne jesli debootstrap byl pobrany tymczasowo).
@@ -133,7 +139,7 @@ func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant) error 
 	}
 
 	util.Infof("  instalator GUI: zapis konfiguracji Calamares...")
-	if err := writeCalamaresConfig(rootfsDir, variant); err != nil {
+	if err := writeCalamaresConfig(rootfsDir, variant, projectDir); err != nil {
 		return fmt.Errorf("konfiguracja calamares: %w", err)
 	}
 
@@ -164,7 +170,7 @@ func variantLabel(variant InstallerVariant) string {
 // users -> summary -> unpackfs (kopiowanie z /live/filesystem.squashfs) ->
 // machineid -> fstab -> localecfg -> grubcfg -> bootloader -> umountcfg ->
 // finished.
-func writeCalamaresConfig(rootfsDir string, variant InstallerVariant) error {
+func writeCalamaresConfig(rootfsDir string, variant InstallerVariant, projectDir string) error {
 	base := filepath.Join(rootfsDir, "etc", "calamares")
 	modulesDir := filepath.Join(base, "modules")
 	brandingDir := filepath.Join(base, "branding", "hackeros")
@@ -207,6 +213,16 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant) error {
 	logo, welcome, err := brandingPNGs(variant)
 	if err != nil {
 		return fmt.Errorf("generowanie obrazow brandingu: %w", err)
+	}
+	// Obrazy z projektu (debian-logo.png = logo HackerOS, welcome.png = banner
+	// HackerOS) maja pierwszenstwo przed generowanymi.
+	if project := loadProjectBranding(projectDir); len(project) > 0 {
+		if b, ok := project["logo.png"]; ok {
+			logo = b
+		}
+		if b, ok := project["welcome.png"]; ok {
+			welcome = b
+		}
 	}
 	assets := map[string][]byte{
 		filepath.Join(brandingDir, "logo.png"):    logo,
@@ -466,7 +482,7 @@ script:
     - command: "mkdir -p /etc/hammer"
     - command: "rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service"
     - command: "rm -f /etc/systemd/system/hackeros-installer.service"
-    - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit"
+    - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit /usr/local/sbin/hackeros-installer-diag"
     - command: "rm -rf /etc/hackeros-installer"
     - command: "rm -f /var/log/hackeros-installer.log /var/log/hackeros-installer-calamares.log"
     - command: "rm -rf /etc/calamares"
@@ -616,14 +632,14 @@ XRC=1
 try_x() {
     label="$1"; shift
     echo "--- proba X: $label"
-    xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1 -nocursor "$@"
+    xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1 "$@"
     XRC=$?
     echo "--- xinit ($label) zakonczyl sie kodem $XRC"
     [ -e /run/hackeros-installer-x-ok ]
 }
 
 fallback_console() {
-    printf '\n[hackeros] %s\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/hackeros-installer-calamares.log, /var/log/Xorg.0.log\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\n\n' "$1" >/dev/tty1 2>/dev/null
+    printf '\n[hackeros] %s\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/hackeros-installer-calamares.log, /var/log/Xorg.0.log\n[hackeros] Diagnostyka: hackeros-installer-diag\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\n\n' "$1" >/dev/tty1 2>/dev/null
     exec /sbin/agetty --autologin root --noclear tty1 linux
 }
 
@@ -652,16 +668,73 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export QT_QPA_PLATFORM=xcb
 export XDG_RUNTIME_DIR=/run/user/0
 export NO_AT_BRIDGE=1
-xsetroot -solid '#1d2023' 2>/dev/null || true
+# Kursor: bez "-nocursor" i z motywem (inaczej Qt/X nie pokazuja wskaznika).
+[ -d /usr/share/icons/DMZ-White ] && export XCURSOR_THEME=DMZ-White
+export XCURSOR_SIZE=24
+xsetroot -solid '#1d2023' -cursor_name left_ptr 2>/dev/null || true
 openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
 sleep 1
 touch /run/hackeros-installer-x-ok
+# Calamares na starszym sprzecie (HDD, skan partycji/os-prober) potrzebuje
+# do ~1 min zanim pokaze okno -- w tym czasie ekran bylby pusty. Pokazujemy
+# komunikat i zamykamy go, gdy tylko pojawi sie okno Calamares.
+if command -v xmessage >/dev/null 2>&1; then
+    xmessage -center -buttons "" "HackerOS - uruchamianie instalatora, prosze czekac (do ok. minuty)..." &
+    SPLASH_PID=$!
+    (
+        i=0
+        while [ "$i" -lt 240 ]; do
+            if xwininfo -root -tree 2>/dev/null | grep -qi 'calamares'; then break; fi
+            i=$((i+1)); sleep 1
+        done
+        kill "$SPLASH_PID" 2>/dev/null
+    ) &
+fi
 CALA_LOG=/var/log/hackeros-installer-calamares.log
 echo "=== calamares: $(date) ===" >>"$CALA_LOG"
 if command -v dbus-launch >/dev/null 2>&1; then
     exec dbus-launch --exit-with-session calamares -d >>"$CALA_LOG" 2>&1
 fi
 exec calamares -d >>"$CALA_LOG" 2>&1
+`
+
+// installerDiagScript -- jedno polecenie ("hackeros-installer-diag" na tty2,
+// jako root) zbierajace DOKLADNIE te linie, ktore wskazuja dlaczego
+// instalator sie nie pokazal: stan procesow, koniec logu Calamares, bledy
+// Calamares/Xorg (bez halasu xkbcomp), status uslugi i dziennik. Wynik
+// idzie na ekran I do /root/installer-diag.txt.
+const installerDiagScript = `#!/bin/sh
+OUT=/root/installer-diag.txt
+{
+echo "### czas: $(date)  cmdline: $(cat /proc/cmdline)"
+echo
+echo "### procesy (Xorg/openbox/calamares/xinit/dbus)"
+ps -eo pid,etime,stat,args | grep -E 'Xorg|openbox|calamares|xinit|dbus-launch|kpmcore' | grep -v grep
+echo
+echo "### stan uslugi"
+systemctl is-active hackeros-installer 2>&1
+systemctl status hackeros-installer --no-pager -l 2>&1 | tail -n 15
+echo
+echo "### log sesji (bez halasu xkbcomp)"
+grep -v -E 'xkbcomp|Warning:|^> |^>$|Using F23|Using last definition|AIGLX' /var/log/hackeros-installer.log 2>&1 | tail -n 40
+echo
+echo "### Calamares: bledy/ostrzezenia (ostatnie 40)"
+grep -n -i -E 'error|fatal|fail|cannot|could not|missing|not found|bad config|abort|crash|segfault|warning' /var/log/hackeros-installer-calamares.log 2>&1 | tail -n 40
+echo
+echo "### Calamares: ostatnie 40 linii logu"
+tail -n 40 /var/log/hackeros-installer-calamares.log 2>&1
+echo
+echo "### Xorg: (EE) i istotne (WW)"
+grep -E '\(EE\)|\(WW\)' /var/log/Xorg.0.log 2>&1 | grep -v -i -E 'xkb|firmware|fbdev|vesa' | tail -n 25
+echo
+echo "### branding / konfiguracja"
+ls -la /etc/calamares/branding/hackeros/ /etc/calamares/modules/ 2>&1
+echo
+echo "### dziennik uslugi (ostatnie 25)"
+journalctl -b -u hackeros-installer --no-pager 2>&1 | tail -n 25
+} 2>&1 | tee "$OUT"
+echo
+echo "[diag] zapisano w $OUT"
 `
 
 const installerXorgFbdev = `Section "Device"
@@ -706,6 +779,9 @@ func writeInstallerAutostart(rootfsDir string) error {
 		return err
 	}
 	if err := write("usr/local/sbin/hackeros-installer-xinit", installerXinitScript, 0o755); err != nil {
+		return err
+	}
+	if err := write("usr/local/sbin/hackeros-installer-diag", installerDiagScript, 0o755); err != nil {
 		return err
 	}
 	if err := write("etc/hackeros-installer/openbox-rc.xml", installerOpenboxRC, 0o644); err != nil {
