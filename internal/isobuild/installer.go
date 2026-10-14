@@ -507,6 +507,7 @@ script:
     - command: "rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service"
     - command: "rm -f /etc/systemd/system/hackeros-installer.service"
     - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit /usr/local/sbin/hackeros-installer-diag"
+    - command: "rm -f /etc/X11/xorg.conf.d/40-hackeros-input.conf"
     - command: "rm -rf /etc/hackeros-installer"
     - command: "rm -f /var/log/hackeros-installer.log /var/log/hackeros-installer-calamares.log"
     - command: "rm -rf /etc/calamares"
@@ -610,9 +611,12 @@ const installerServiceName = "hackeros-installer.service"
 const installerServiceUnit = `[Unit]
 Description=HackerOS installer (Openbox + Calamares)
 ConditionKernelCommandLine=boot=live
-After=systemd-user-sessions.service systemd-logind.service dbus.service plymouth-quit-wait.service getty@tty1.service
+# udev MUSI skonczyc koldplug przed startem X: Xorg dodaje klawiature/mysz/
+# touchpad z udev (tag ID_INPUT_*). Gdy X wystartuje za wczesnie, urzadzenia
+# wejscia nie sa jeszcze otagowane -> kursor jest, ale nie reaguje na ruch.
+After=systemd-user-sessions.service systemd-logind.service dbus.service plymouth-quit-wait.service getty@tty1.service systemd-udevd.service systemd-udev-trigger.service
 Conflicts=getty@tty1.service
-Wants=dbus.service systemd-logind.service
+Wants=dbus.service systemd-logind.service systemd-udevd.service systemd-udev-trigger.service
 
 [Service]
 Type=simple
@@ -631,6 +635,7 @@ TTYVTDisallocate=yes
 # nic wiecej, a na tty2 wszystko dziala"). Zamykamy go jawnie przed startem.
 ExecStartPre=-/usr/bin/plymouth quit
 ExecStartPre=-/usr/bin/chvt 1
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
 ExecStart=/usr/local/sbin/hackeros-installer-session
 Restart=no
 
@@ -651,6 +656,15 @@ rm -f /run/hackeros-installer-x-ok
 export XDG_RUNTIME_DIR=/run/user/0
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 plymouth quit 2>/dev/null || true
+
+# Urzadzenia wejscia (kursor, ktory sie nie rusza = X wystartowal, zanim
+# udev otagowal mysz/touchpad): doladuj sterowniki, ponow zdarzenia "add" dla
+# podsystemu input i poczekaj az udev skonczy.
+modprobe -a evdev usbhid hid_generic psmouse i2c_hid_acpi hid_multitouch 2>/dev/null || true
+udevadm trigger --subsystem-match=input --action=add 2>/dev/null || true
+udevadm settle --timeout=30 2>/dev/null || true
+echo "--- urzadzenia wejscia (/proc/bus/input/devices):"
+grep -E '^N: Name|^H: Handlers' /proc/bus/input/devices
 
 XRC=1
 try_x() {
@@ -748,6 +762,11 @@ echo
 echo "### Calamares: ostatnie 40 linii logu"
 tail -n 40 /var/log/hackeros-installer-calamares.log 2>&1
 echo
+echo "### urzadzenia wejscia: jadro i X"
+grep -E '^N: Name|^H: Handlers' /proc/bus/input/devices 2>&1
+grep -E 'Using input driver|input device|libinput|evdev|XINPUT|No input driver' /var/log/Xorg.0.log 2>&1 | tail -n 25
+udevadm info --export-db 2>/dev/null | grep -c 'ID_INPUT_MOUSE=1\|ID_INPUT_TOUCHPAD=1' | sed 's/^/urzadzen mysz\/touchpad w udev: /'
+echo
 echo "### Xorg: (EE) i istotne (WW)"
 grep -E '\(EE\)|\(WW\)' /var/log/Xorg.0.log 2>&1 | grep -v -i -E 'xkb|firmware|fbdev|vesa' | tail -n 25
 echo
@@ -759,6 +778,32 @@ journalctl -b -u hackeros-installer --no-pager 2>&1 | tail -n 25
 } 2>&1 | tee "$OUT"
 echo
 echo "[diag] zapisano w $OUT"
+`
+
+// installerXorgInput -- jawne przypisanie sterownika libinput do urzadzen
+// wejscia (klawiatura, mysz, touchpad) -- siatka bezpieczenstwa na wypadek
+// gdyby systemowy 40-libinput.conf nie zostal zainstalowany/zaladowany.
+const installerXorgInput = `Section "InputClass"
+    Identifier "hackeros libinput pointer"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "hackeros libinput keyboard"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "hackeros libinput touchpad"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+    Option "Tapping" "on"
+EndSection
 `
 
 const installerXorgFbdev = `Section "Device"
@@ -809,6 +854,9 @@ func writeInstallerAutostart(rootfsDir string) error {
 		return err
 	}
 	if err := write("etc/hackeros-installer/openbox-rc.xml", installerOpenboxRC, 0o644); err != nil {
+		return err
+	}
+	if err := write("etc/X11/xorg.conf.d/40-hackeros-input.conf", installerXorgInput, 0o644); err != nil {
 		return err
 	}
 	if err := write("etc/hackeros-installer/xorg-fbdev.conf", installerXorgFbdev, 0o644); err != nil {
