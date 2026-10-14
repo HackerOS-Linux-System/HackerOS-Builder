@@ -167,6 +167,7 @@ func BuildIso(opts IsoOptions) error {
 		WorkDir:          isoWorkDir,
 		VolumeName:       volumeName,
 		MenuTitle:        menuTitle,
+		ProjectDir:       opts.ProjectDir,
 		SkipInstaller:    skipInstaller,
 		InstallerVariant: installerVariant,
 		InstallerHooks:   installerHooks,
