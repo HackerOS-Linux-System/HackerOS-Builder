@@ -8,6 +8,28 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+## Branding instalatora z projektu + kursor
+
+- Logo i banner instalatora sa brane z projektu:
+  `config/includes.chroot_after_packages/etc/calamares/branding/debian/` --
+  `debian-logo.png` (logo HackerOS) -> `logo.png`, `welcome.png` (banner HackerOS) -> `welcome.png`.
+  Kolejnosc szukania: `includes.chroot_after_packages`, `includes.chroot`,
+  `includes.chroot_before_packages`, potem `config/installer-branding/` (kopia robiona przez skrypty
+  `build/build-hackeros-*` przed usunieciem `etc/calamares`). Brakujacy/niepoprawny PNG -> obraz generowany.
+- Kursor: usuniete `-nocursor` z X, dodany `dmz-cursor-theme`, `xsetroot -cursor_name left_ptr`.
+
+## Poprawka: pusty ekran na czas startu Calamares
+
+Log pokazal, ze Calamares startuje poprawnie, ale na starszym laptopie (HDD, skan partycji)
+pierwsze okno pojawia sie dopiero po ~45 s -- przez ten czas ekran byl pusty. Teraz sesja
+instalatora pokazuje komunikat "uruchamianie instalatora" (`xmessage`) i zamyka go, gdy pojawi sie okno Calamares.
+
+## Diagnostyka instalatora: `hackeros-installer-diag`
+
+Na medium live (tty2, root) jedno polecenie `hackeros-installer-diag` wypisuje i zapisuje do
+`/root/installer-diag.txt`: procesy (Xorg/openbox/calamares), status uslugi, log sesji bez halasu
+xkbcomp, bledy Calamares, koniec jego logu, (EE)/(WW) z Xorg.0.log i liste plikow brandingu.
+
 ## Poprawka: niebieski ekran zamiast instalatora
 
 - **Plymouth**: parametr `splash` zostawial niebieski ekran startowy na tty1/DRM, a X
