@@ -22,6 +22,10 @@ type BuildParams struct {
 	OutputISO  string // docelowa sciezka pliku .iso
 	WorkDir    string // katalog tymczasowy na squashfs/initrd/iso-tree
 	VolumeName string // etykieta woluminu ISO (np. "HACKEROS") -- ISO9660 woli wielkie litery
+	// ProjectDir to katalog projektu (zawiera config/) -- zrodlo obrazow
+	// brandingu instalatora (patrz branding.go). Puste = obrazy generowane.
+	ProjectDir string
+
 	// MenuTitle to nazwa wyswietlana w menu GRUB (np. "HackerOS"). Puste
 	// = "HackerOS". Oddzielona od VolumeName, bo etykieta woluminu ISO
 	// zostaje wielkimi literami, a w menu ma byc "HackerOS".
@@ -174,7 +178,7 @@ func Build(p BuildParams) error {
 		}
 		step++
 		util.Step(step, totalSteps, "instalator GUI (Calamares, wariant: %s)...", variantLabel(variant))
-		if err := InjectInstaller(p.RootfsDir, p.WorkDir, variant); err != nil {
+		if err := InjectInstaller(p.RootfsDir, p.WorkDir, variant, p.ProjectDir); err != nil {
 			return fmt.Errorf("instalator GUI: %w", err)
 		}
 
