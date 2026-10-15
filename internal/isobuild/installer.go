@@ -101,6 +101,23 @@ var installerOptionalPackages = [][]string{
 	{"dmz-cursor-theme", "adwaita-icon-theme", "xcursor-themes"},
 }
 
+// bootloaderPackages zwraca pakiety GRUB potrzebne do "grub-install" w systemie
+// docelowym: UEFI (grub-efi-<arch>-bin + efibootmgr) oraz, dla amd64, tez BIOS
+// (grub-pc-bin) -- Calamares sam wybiera tryb wg /sys/firmware/efi.
+func bootloaderPackages(arch string) []string {
+	base := []string{"grub-common", "grub2-common", "efibootmgr", "mtools"}
+	switch arch {
+	case "", "amd64":
+		return append(base, "grub-efi-amd64-bin", "grub-pc-bin")
+	case "arm64":
+		return append(base, "grub-efi-arm64-bin")
+	case "i386":
+		return append(base, "grub-efi-ia32-bin", "grub-pc-bin")
+	default:
+		return base
+	}
+}
+
 // installerCybersecurityExtraPackages to DODATKOWE pakiety instalowane w
 // srodowisku live/instalatora WYLACZNIE dla InstallerVariantCybersecurity --
 // przydatne do szybkiej diagnostyki sieci/sprzetu PRZED (lub zamiast)
@@ -121,16 +138,20 @@ var installerCybersecurityExtraPackages = []string{
 // do pobierania brakujacych narzedzi (wspoldzielony z reszta buildu --
 // narzedzia pobrane w kroku "build cloud" sa tu ponownie uzywane z cache).
 // variant okresla branding/dodatkowe narzedzia -- patrz InstallerVariant.
-func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant, projectDir string) error {
+func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant, projectDir, arch string) error {
 	// Toolchain: upewnij sie ze apt-get i dpkg-deb sa dostepne (sa zawsze,
 	// ale Manager.Env() daje nam sciezke z toolchain/bin/ na czele PATH
 	// co jest potrzebne jesli debootstrap byl pobrany tymczasowo).
 	tc := toolchain.New(workDir)
 	tcEnv := tc.Env()
 
-	pkgs := installerPackages
+	pkgs := append([]string{}, installerPackages...)
+	// GRUB + efibootmgr MUSZA byc w rootfs: ten sam rootfs (squashfs) jest
+	// kopiowany na dysk, a Calamares robi w nim chroot i wola grub-install.
+	// Bez tych pakietow bootloader.conf konczy sie kodem 1.
+	pkgs = append(pkgs, bootloaderPackages(arch)...)
 	if variant == InstallerVariantCybersecurity {
-		pkgs = append(append([]string{}, installerPackages...), installerCybersecurityExtraPackages...)
+		pkgs = append(pkgs, installerCybersecurityExtraPackages...)
 	}
 
 	util.Infof("  instalator GUI (%s): instalacja Calamares + Xorg (%d pakietow)...", variantLabel(variant), len(pkgs))
@@ -171,7 +192,7 @@ func InjectInstaller(rootfsDir, workDir string, variant InstallerVariant, projec
 	if err := writeInstallerAutostart(rootfsDir); err != nil {
 		return fmt.Errorf("autostart instalatora: %w", err)
 	}
-	if err := verifyInstaller(rootfsDir); err != nil {
+	if err := verifyInstaller(rootfsDir, arch); err != nil {
 		return fmt.Errorf("weryfikacja instalatora: %w", err)
 	}
 
@@ -450,8 +471,27 @@ unpack:
       destination: ""
 `
 
+// UWAGA: "extraMounts: []" (poprzednia wersja) NADPISYWALO domyslna liste
+// Calamares -- do chroota systemu docelowego nie montowano /proc, /sys, /dev
+// ani /run, wiec grub-install (i grub-probe, update-initramfs, ...) padal z
+// kodem 1 ("Nie mozna zainstalowac bootloadera ... zwrocilo kod bledu 1").
 const calamaresMountConf = `---
-extraMounts: []
+extraMounts:
+    - device: proc
+      fs: proc
+      mountPoint: /proc
+    - device: sys
+      fs: sysfs
+      mountPoint: /sys
+    - device: /dev
+      mountPoint: /dev
+      options: [ bind ]
+    - device: tmpfs
+      fs: tmpfs
+      mountPoint: /run
+    - device: /run/udev
+      mountPoint: /run/udev
+      options: [ bind ]
 extraMountsEfi:
     - device: "efivarfs"
       fs: "efivarfs"
@@ -910,9 +950,14 @@ var installerRequiredFiles = []string{
 
 // verifyInstaller przerywa build z czytelnym komunikatem, gdy brakuje
 // binarek/sterownikow potrzebnych do startu graficznego instalatora.
-func verifyInstaller(rootfsDir string) error {
+func verifyInstaller(rootfsDir, arch string) error {
 	var missing []string
-	for _, rel := range installerRequiredFiles {
+	required := append([]string{}, installerRequiredFiles...)
+	required = append(required, "usr/sbin/grub-install", "usr/bin/grub-mkconfig", "usr/sbin/efibootmgr")
+	if arch == "" || arch == "amd64" {
+		required = append(required, "usr/lib/grub/x86_64-efi/modinfo.sh", "usr/lib/grub/i386-pc/modinfo.sh")
+	}
+	for _, rel := range required {
 		if _, err := os.Stat(filepath.Join(rootfsDir, rel)); err != nil {
 			missing = append(missing, "/"+rel)
 		}
