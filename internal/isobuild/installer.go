@@ -953,13 +953,21 @@ var installerRequiredFiles = []string{
 func verifyInstaller(rootfsDir, arch string) error {
 	var missing []string
 	required := append([]string{}, installerRequiredFiles...)
-	required = append(required, "usr/sbin/grub-install", "usr/bin/grub-mkconfig", "usr/sbin/efibootmgr")
+	// Lokalizacja zalezy od wydania (/usr/bin vs /usr/sbin) -- "a|b" = ktorakolwiek.
+	required = append(required, "usr/sbin/grub-install|usr/bin/grub-install", "usr/sbin/grub-mkconfig|usr/bin/grub-mkconfig", "usr/sbin/efibootmgr|usr/bin/efibootmgr")
 	if arch == "" || arch == "amd64" {
 		required = append(required, "usr/lib/grub/x86_64-efi/modinfo.sh", "usr/lib/grub/i386-pc/modinfo.sh")
 	}
-	for _, rel := range required {
-		if _, err := os.Stat(filepath.Join(rootfsDir, rel)); err != nil {
-			missing = append(missing, "/"+rel)
+	for _, spec := range required {
+		found := false
+		for _, rel := range strings.Split(spec, "|") {
+			if _, err := os.Stat(filepath.Join(rootfsDir, rel)); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, "/"+strings.ReplaceAll(spec, "|", " lub /"))
 		}
 	}
 	if len(missing) > 0 {
