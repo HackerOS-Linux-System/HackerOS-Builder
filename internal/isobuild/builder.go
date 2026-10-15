@@ -178,7 +178,7 @@ func Build(p BuildParams) error {
 		}
 		step++
 		util.Step(step, totalSteps, "instalator GUI (Calamares, wariant: %s)...", variantLabel(variant))
-		if err := InjectInstaller(p.RootfsDir, p.WorkDir, variant, p.ProjectDir); err != nil {
+		if err := InjectInstaller(p.RootfsDir, p.WorkDir, variant, p.ProjectDir, p.Arch); err != nil {
 			return fmt.Errorf("instalator GUI: %w", err)
 		}
 
