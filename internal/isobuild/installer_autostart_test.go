@@ -161,3 +161,17 @@ func TestBootloaderPackages(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyInstaller_AcceptsEitherBinDir(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range append(append([]string{}, installerRequiredFiles...),
+		"usr/bin/grub-install", "usr/bin/grub-mkconfig", "usr/bin/efibootmgr",
+		"usr/lib/grub/x86_64-efi/modinfo.sh", "usr/lib/grub/i386-pc/modinfo.sh") {
+		p := filepath.Join(root, f)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte("x"), 0o755)
+	}
+	if err := verifyInstaller(root, "amd64"); err != nil {
+		t.Fatalf("binarki w /usr/bin powinny wystarczyc: %v", err)
+	}
+}
