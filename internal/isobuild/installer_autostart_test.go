@@ -46,7 +46,7 @@ func TestWriteInstallerAutostart_ServiceBased(t *testing.T) {
 }
 
 func TestVerifyInstaller_ReportsMissing(t *testing.T) {
-	err := verifyInstaller(t.TempDir())
+	err := verifyInstaller(t.TempDir(), "amd64")
 	if err == nil || !strings.Contains(err.Error(), "/usr/bin/calamares") {
 		t.Fatalf("oczekiwano bledu z lista brakow, jest: %v", err)
 	}
@@ -122,5 +122,42 @@ func TestWriteCalamaresConfig_UsesProjectBranding(t *testing.T) {
 	l2, _ := os.ReadFile(filepath.Join(root2, "etc/calamares/branding/hackeros/logo.png"))
 	if !strings.HasSuffix(string(l2), "ZAPAS") {
 		t.Fatal("brak fallbacku do config/installer-branding")
+	}
+}
+
+func TestInstaller_InputDevicesHandled(t *testing.T) {
+	if !strings.Contains(installerServiceUnit, "systemd-udev-trigger.service") ||
+		!strings.Contains(installerServiceUnit, "udevadm settle") {
+		t.Fatal("usluga musi czekac na udev (inaczej kursor sie nie rusza)")
+	}
+	if !strings.Contains(installerSessionScript, "udevadm trigger --subsystem-match=input") {
+		t.Fatal("sesja musi ponowic zdarzenia input przed startem X")
+	}
+	root := t.TempDir()
+	if err := writeInstallerAutostart(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "etc/X11/xorg.conf.d/40-hackeros-input.conf")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCalamaresMountConf_MountsProcSysDevRun(t *testing.T) {
+	for _, m := range []string{"mountPoint: /proc", "mountPoint: /sys", "mountPoint: /dev", "mountPoint: /run"} {
+		if !strings.Contains(calamaresMountConf, m) {
+			t.Errorf("mount.conf bez %q -- grub-install w chroocie nie zadziala", m)
+		}
+	}
+	if strings.Contains(calamaresMountConf, "extraMounts: []") {
+		t.Error("extraMounts: [] wylacza montowanie /proc,/sys,/dev,/run")
+	}
+}
+
+func TestBootloaderPackages(t *testing.T) {
+	got := strings.Join(bootloaderPackages("amd64"), " ")
+	for _, want := range []string{"grub-efi-amd64-bin", "grub-pc-bin", "efibootmgr", "grub2-common"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("brak %s w %s", want, got)
+		}
 	}
 }
