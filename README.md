@@ -8,6 +8,11 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+## Poprawka: `verifyInstaller` wymagal binarek GRUB w zlych sciezkach
+
+W forky `grub-mkconfig` i `efibootmgr` leza w innym katalogu (`/usr/bin` vs `/usr/sbin`) niz zakladala
+kontrola -- build padal mimo poprawnie zainstalowanych pakietow. Kontrola przyjmuje teraz obie lokalizacje.
+
 ## Poprawka: "Blad instalacji bootloadera" (grub-install, kod 1)
 
 - `mount.conf` mial `extraMounts: []`, co nadpisywalo domyslna liste Calamares -- w chroocie systemu
