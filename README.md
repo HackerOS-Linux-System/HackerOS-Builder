@@ -8,6 +8,29 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+## Poprawka: "Blad instalacji bootloadera" (grub-install, kod 1)
+
+- `mount.conf` mial `extraMounts: []`, co nadpisywalo domyslna liste Calamares -- w chroocie systemu
+  docelowego nie bylo `/proc`, `/sys`, `/dev`, `/run`, wiec `grub-install` padal. Przywrocona pelna lista
+  (proc, sysfs, bind /dev, tmpfs /run, bind /run/udev) + efivarfs dla UEFI.
+- Do rootfs instalatora dodane pakiety GRUB: `grub-common`, `grub2-common`, `grub-efi-amd64-bin`,
+  `grub-pc-bin`, `efibootmgr`, `mtools` (dla arm64/i386 odpowiednie `grub-efi-*-bin`);
+  `verifyInstaller` sprawdza `grub-install`, `efibootmgr` i moduly GRUB (EFI + BIOS).
+
+## Poprawka: kursor widoczny, ale nie reaguje na ruch
+
+X startowal zanim udev skonczyl koldplug urzadzen wejscia (mysz/touchpad nie mialy tagow
+`ID_INPUT_*`), wiec Xorg ich nie dodal. Teraz usluga czeka na `systemd-udev-trigger` i `udevadm settle`,
+sesja przed X laduje sterowniki (evdev, psmouse, usbhid, i2c_hid...), ponawia zdarzenia `add` dla
+podsystemu input, a `/etc/X11/xorg.conf.d/40-hackeros-input.conf` jawnie przypisuje libinput.
+`hackeros-installer-diag` pokazuje teraz tez urzadzenia wejscia widziane przez jadro i X.
+
+## Poprawka: build przerwany przez brakujacy pakiet `xmessage`
+
+W forky pakiet `xmessage` nie istnieje (`E: Package 'xmessage' has no installation candidate`).
+Pakiety "mile widziane" (xmessage/x11-apps, x11-utils, motyw kursora) sa teraz instalowane osobno
+i z alternatywami (`installerOptionalPackages`) -- brak ktoregos daje tylko ostrzezenie.
+
 ## Branding instalatora z projektu + kursor
 
 - Logo i banner instalatora sa brane z projektu:
