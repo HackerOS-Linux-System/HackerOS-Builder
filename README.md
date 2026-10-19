@@ -920,3 +920,9 @@ Pozostałe pozycje:
 ## Licencja
 
 MIT
+
+## Po instalacji: `grub>`, czarny ekran po „Ukończ”, okna instalatora
+
+- **`grub>` po instalacji** – po module `bootloader` shellprocess uruchamia w chroocie `hackeros-bootfix`: gwarantuje `/boot/grub/grub.cfg` z wpisem jądra (`grub-mkconfig`, w ostateczności plik generowany ręcznie po UUID roota), zapasowe `grub.cfg` obok obrazów EFI na ESP i `GRUB_DISTRIBUTOR="HackerOS"`. Brak poprawnego configu = błąd instalatora zamiast niebootowalnego dysku. Log: `/var/log/hackeros-bootfix.log` w zainstalowanym systemie.
+- **Czarny ekran po „Ukończ”** – dodano `finished.conf` (restart zaznaczony domyślnie, `systemctl -i reboot`); gdy Calamares zakończy się bez restartu, sesja zostawia konsolę root z podpowiedzią zamiast kończyć usługę (getty@tty1 był wyłączony), a usługa ma `ExecStopPost` startujący getty.
+- **Okna** – reguła Openbox „pełny ekran” dotyczy już tylko głównego okna `calamares`; okna dialogowe są normalne.
