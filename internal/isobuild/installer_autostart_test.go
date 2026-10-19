@@ -175,3 +175,35 @@ func TestVerifyInstaller_AcceptsEitherBinDir(t *testing.T) {
 		t.Fatalf("binarki w /usr/bin powinny wystarczyc: %v", err)
 	}
 }
+
+func TestInstaller_BootfixFinishedAndWindowRules(t *testing.T) {
+	root := t.TempDir()
+	if err := writeCalamaresConfig(root, InstallerVariantDefault, ""); err != nil {
+		t.Fatal(err)
+	}
+	read := func(rel string) string {
+		b, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("brak %s: %v", rel, err)
+		}
+		return string(b)
+	}
+	if !strings.Contains(read("etc/calamares/modules/finished.conf"), "restartNowChecked: true") {
+		t.Error("finished.conf bez restartu po zakonczeniu")
+	}
+	bf := read("usr/local/sbin/hackeros-bootfix")
+	for _, want := range []string{"grub-mkconfig -o", "configfile", "exit 1"} {
+		if !strings.Contains(bf, want) {
+			t.Errorf("bootfix bez %q", want)
+		}
+	}
+	if !strings.Contains(read("etc/calamares/modules/shellprocess.conf"), "hackeros-bootfix") {
+		t.Error("shellprocess nie wywoluje bootfix")
+	}
+	if strings.Contains(installerOpenboxRC, `class="*"`) {
+		t.Error("regula fullscreen nie moze dotyczyc wszystkich okien")
+	}
+	if strings.Contains(installerSessionScript, `if [ "$XRC" -eq 0 ]; then exit 0; fi`) {
+		t.Error("po zamknieciu Calamares nie wolno konczyc uslugi (czarny ekran)")
+	}
+}
