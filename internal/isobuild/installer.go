@@ -240,6 +240,7 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant, projectDir
 		filepath.Join(modulesDir, "fstab.conf"):        calamaresFstabConf,
 		filepath.Join(modulesDir, "bootloader.conf"):   calamaresBootloaderConf,
 		filepath.Join(modulesDir, "umount.conf"):       calamaresUmountConf,
+		filepath.Join(modulesDir, "finished.conf"):     calamaresFinishedConf,
 		filepath.Join(modulesDir, "shellprocess.conf"): calamaresShellprocessConf,
 
 		filepath.Join(brandingDir, "branding.desc"): brandingDescFor(variant),
@@ -249,6 +250,16 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant, projectDir
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("zapis %s: %w", path, err)
 		}
+	}
+
+	// Skrypt naprawczy bootloadera (wywolywany z shellprocess w chroocie
+	// systemu docelowego).
+	bootfix := filepath.Join(rootfsDir, "usr/local/sbin/hackeros-bootfix")
+	if err := os.MkdirAll(filepath.Dir(bootfix), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(bootfix, []byte(installerBootfixScript), 0o755); err != nil {
+		return fmt.Errorf("zapis %s: %w", bootfix, err)
 	}
 
 	// Zasoby brandingu wskazane w branding.desc (logo.png, welcome.png,
@@ -522,6 +533,101 @@ installEFIFallback:   true
 timeout: "10"
 `
 
+// calamaresFinishedConf: po kliknieciu "Ukoncz" instalator ma ZRESTARTOWAC
+// komputer. Wczesniej brak finished.conf = brak restartu: Calamares konczyl
+// proces, X sie zamykal, a tty1 zostawalo czarne (getty@tty1 jest wylaczony
+// przez Conflicts= uslugi instalatora).
+const calamaresFinishedConf = `---
+restartNowEnabled: true
+restartNowChecked: true
+restartNowCommand: "systemctl -i reboot"
+notifyOnFinished: false
+`
+
+// installerBootfixScript dziala W CHROOCIE zainstalowanego systemu zaraz po
+// module bootloader. Gwarantuje, ze po restarcie GRUB nie wyladuje w wierszu
+// "grub>": (1) /boot/grub/grub.cfg istnieje i zawiera wpis z jadrem (w
+// ostatecznosci generowany recznie), (2) obok obrazow EFI na ESP leza
+// zapasowe grub.cfg przekierowujace do /boot/grub/grub.cfg po UUID
+// partycji root. Log: /var/log/hackeros-bootfix.log (zostaje w systemie).
+// Kod != 0 = instalator pokaze blad zamiast cicho zostawic niebootowalny dysk.
+const installerBootfixScript = `#!/bin/sh
+LOG=/var/log/hackeros-bootfix.log
+exec >>"$LOG" 2>&1
+echo "== hackeros-bootfix $(date)"
+CFG=/boot/grub/grub.cfg
+mkdir -p /boot/grub
+
+if [ ! -f /etc/default/grub ]; then
+    cat > /etc/default/grub <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="HackerOS"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+EOF
+fi
+if grep -q '^GRUB_DISTRIBUTOR=' /etc/default/grub; then
+    sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="HackerOS"/' /etc/default/grub
+else
+    echo 'GRUB_DISTRIBUTOR="HackerOS"' >> /etc/default/grub
+fi
+# Parametry live nie moga trafic do zainstalowanego systemu.
+sed -i 's/ *boot=live//; s/ *live-media-path=[^ "]*//' /etc/default/grub
+
+has_entry() { [ -s "$CFG" ] && grep -q '^[[:space:]]*menuentry ' "$CFG" && grep -q '^[[:space:]]*linux' "$CFG"; }
+
+KVER=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -1)
+echo "jadro: ${KVER:-BRAK}"
+if [ -n "$KVER" ] && [ ! -e "/boot/initrd.img-$KVER" ]; then
+    echo "brak initrd dla $KVER -- update-initramfs"
+    update-initramfs -c -k "$KVER"
+fi
+
+has_entry || grub-mkconfig -o "$CFG"
+has_entry || GRUB_DISABLE_OS_PROBER=true grub-mkconfig -o "$CFG"
+
+ROOT_UUID=$(grub-probe --target=fs_uuid / 2>/dev/null)
+[ -n "$ROOT_UUID" ] || ROOT_UUID=$(awk '$2=="/" && $1 ~ /^UUID=/ {sub("UUID=","",$1); print $1; exit}' /etc/fstab)
+echo "root uuid: ${ROOT_UUID:-BRAK}"
+
+if ! has_entry && [ -n "$KVER" ] && [ -n "$ROOT_UUID" ]; then
+    echo "grub-mkconfig nie dal wpisu -- generuje grub.cfg recznie"
+    INITRD=""
+    [ -e "/boot/initrd.img-$KVER" ] && INITRD="    initrd /boot/initrd.img-$KVER"
+    cat > "$CFG" <<EOF
+set default=0
+set timeout=5
+menuentry "HackerOS" {
+    insmod part_gpt
+    insmod part_msdos
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root $ROOT_UUID
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet
+$INITRD
+}
+EOF
+fi
+
+# Zapasowe grub.cfg na ESP (gdy obraz EFI szuka konfiguracji obok siebie).
+if [ -d /boot/efi/EFI ] && [ -n "$ROOT_UUID" ]; then
+    for d in /boot/efi/EFI/*; do
+        [ -d "$d" ] || continue
+        if [ ! -f "$d/grub.cfg" ]; then
+            printf 'search.fs_uuid %s root\nset prefix=($root)/boot/grub\nconfigfile $prefix/grub.cfg\n' "$ROOT_UUID" > "$d/grub.cfg"
+            echo "stub ESP: $d/grub.cfg"
+        fi
+    done
+fi
+
+if has_entry; then
+    echo "OK: $CFG ma wpis z jadrem"
+    exit 0
+fi
+echo "BLAD: nie udalo sie wygenerowac grub.cfg z wpisem jadra"
+exit 1
+`
+
 const calamaresUmountConf = `---
 `
 
@@ -541,9 +647,11 @@ const calamaresUmountConf = `---
 // sprzatanie bezpiecznym: usuwamy pliki na PARTYCJI DOCELOWEJ, nie na ISO.
 const calamaresShellprocessConf = `---
 dontChroot: false
-timeout: 30
+timeout: 600
 script:
     - command: "mkdir -p /etc/hammer"
+    - command: "/usr/local/sbin/hackeros-bootfix"
+    - command: "rm -f /usr/local/sbin/hackeros-bootfix"
     - command: "rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service"
     - command: "rm -f /etc/systemd/system/hackeros-installer.service"
     - command: "rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit /usr/local/sbin/hackeros-installer-diag"
@@ -677,6 +785,7 @@ ExecStartPre=-/usr/bin/plymouth quit
 ExecStartPre=-/usr/bin/chvt 1
 ExecStartPre=-/usr/bin/udevadm settle --timeout=30
 ExecStart=/usr/local/sbin/hackeros-installer-session
+ExecStopPost=-/usr/bin/systemctl --no-block start getty@tty1.service
 Restart=no
 
 [Install]
@@ -727,7 +836,12 @@ for attempt in "autodetekcja:" "fbdev:-config /etc/hackeros-installer/xorg-fbdev
     if try_x "$label" $args; then
         # X wstal i uruchomil Calamares. Kod 0 = normalne zakonczenie
         # (instalacja/anulowanie); inny = Calamares sie wywalil.
-        if [ "$XRC" -eq 0 ]; then exit 0; fi
+        # NIE konczymy tu usluga (getty@tty1 jest wylaczony -> czarny ekran):
+        # zostawiamy konsole z podpowiedzia. Gdy w Calamares zaznaczono
+        # "Uruchom ponownie", reboot wystartowal juz wczesniej.
+        if [ "$XRC" -eq 0 ]; then
+            fallback_console "Instalator zostal zamkniety. Wpisz: reboot  (aby uruchomic ponownie komputer)."
+        fi
         fallback_console "Instalator (Calamares) zakonczyl sie bledem (kod $XRC)."
     fi
 done
@@ -862,7 +976,8 @@ const installerOpenboxRC = `<?xml version="1.0" encoding="UTF-8"?>
 <openbox_config xmlns="http://openbox.org/3.4/rc">
   <theme><name>Clearlooks</name></theme>
   <applications>
-    <application class="*"><decor>no</decor><maximized>true</maximized><fullscreen>yes</fullscreen></application>
+    <application class="calamares"><decor>no</decor><maximized>true</maximized><fullscreen>yes</fullscreen></application>
+    <application class="Calamares"><decor>no</decor><maximized>true</maximized><fullscreen>yes</fullscreen></application>
   </applications>
 </openbox_config>
 `
@@ -942,6 +1057,8 @@ var installerRequiredFiles = []string{
 	"usr/bin/Xorg",
 	"usr/lib/xorg/modules/input/libinput_drv.so",
 	"etc/calamares/settings.conf",
+	"etc/calamares/modules/finished.conf",
+	"usr/local/sbin/hackeros-bootfix",
 	"etc/calamares/branding/hackeros/branding.desc",
 	"etc/calamares/branding/hackeros/logo.png",
 	"etc/calamares/branding/hackeros/welcome.png",
