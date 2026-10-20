@@ -864,7 +864,19 @@ export NO_AT_BRIDGE=1
 [ -d /usr/share/icons/DMZ-White ] && export XCURSOR_THEME=DMZ-White
 export XCURSOR_SIZE=24
 xsetroot -solid '#1d2023' -cursor_name left_ptr 2>/dev/null || true
+# Zadnych autostartow XDG (np. KDE "Welcome Center"/plasma-welcome) w sesji
+# instalatora: puste katalogi konfiguracji + pilnowanie procesu.
+export XDG_CONFIG_HOME=/etc/hackeros-installer/xdg-home
+export XDG_CONFIG_DIRS=/etc/hackeros-installer/xdg
+unset XDG_CURRENT_DESKTOP KDE_FULL_SESSION
 openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
+(
+    while kill -0 $$ 2>/dev/null; do
+        pkill -x plasma-welcome 2>/dev/null
+        pkill -f org.kde.plasma-welcome 2>/dev/null
+        sleep 1
+    done
+) &
 sleep 1
 touch /run/hackeros-installer-x-ok
 # Calamares na starszym sprzecie (HDD, skan partycji/os-prober) potrzebuje
@@ -1010,6 +1022,14 @@ func writeInstallerAutostart(rootfsDir string) error {
 	}
 	if err := write("etc/hackeros-installer/openbox-rc.xml", installerOpenboxRC, 0o644); err != nil {
 		return err
+	}
+	for _, rel := range []string{
+		"etc/hackeros-installer/xdg/openbox/autostart",
+		"etc/hackeros-installer/xdg-home/openbox/autostart",
+	} {
+		if err := write(rel, "# pusty: brak autostartow w sesji instalatora\n", 0o644); err != nil {
+			return err
+		}
 	}
 	if err := write("etc/X11/xorg.conf.d/40-hackeros-input.conf", installerXorgInput, 0o644); err != nil {
 		return err
