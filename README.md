@@ -926,3 +926,8 @@ MIT
 - **`grub>` po instalacji** – po module `bootloader` shellprocess uruchamia w chroocie `hackeros-bootfix`: gwarantuje `/boot/grub/grub.cfg` z wpisem jądra (`grub-mkconfig`, w ostateczności plik generowany ręcznie po UUID roota), zapasowe `grub.cfg` obok obrazów EFI na ESP i `GRUB_DISTRIBUTOR="HackerOS"`. Brak poprawnego configu = błąd instalatora zamiast niebootowalnego dysku. Log: `/var/log/hackeros-bootfix.log` w zainstalowanym systemie.
 - **Czarny ekran po „Ukończ”** – dodano `finished.conf` (restart zaznaczony domyślnie, `systemctl -i reboot`); gdy Calamares zakończy się bez restartu, sesja zostawia konsolę root z podpowiedzią zamiast kończyć usługę (getty@tty1 był wyłączony), a usługa ma `ExecStopPost` startujący getty.
 - **Okna** – reguła Openbox „pełny ekran” dotyczy już tylko głównego okna `calamares`; okna dialogowe są normalne.
+
+## Welcome Center w instalatorze i niezmienność systemu
+
+- **KDE „Welcome Center” w sesji instalatora** – xinit instalatora ustawia puste `XDG_CONFIG_HOME`/`XDG_CONFIG_DIRS` (bez autostartów XDG), usuwa `XDG_CURRENT_DESKTOP` i pilnuje, by proces `plasma-welcome` nie działał, dopóki działa Calamares.
+- **Niezmienność** – `internal/isobuild/immutable.go`: `/usr`, `/boot`, `/opt` montowane tylko do odczytu (`hackeros-immutable.service`), `/usr/local` i `/etc`, `/var`, `/home` zapisywalne. Szczegóły i propozycje dla hammer: `docs/HAMMER-ATOMIC-INTEGRATION.md`.
