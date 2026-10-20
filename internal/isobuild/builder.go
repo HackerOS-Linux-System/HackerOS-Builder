@@ -165,9 +165,9 @@ func Build(p BuildParams) error {
 		return fmt.Errorf("czyszczenie %s: %w", isoTree, err)
 	}
 
-	totalSteps := 6
+	totalSteps := 7
 	if !p.SkipInstaller && len(p.InstallerHooks) > 0 {
-		totalSteps = 7
+		totalSteps = 8
 	}
 	step := 0
 
@@ -192,6 +192,12 @@ func Build(p BuildParams) error {
 	} else {
 		step++
 		util.Step(step, totalSteps, "instalator GUI pominiety (SkipInstaller)")
+	}
+
+	step++
+	util.Step(step, totalSteps, "niezmiennosc systemu (/usr, /boot, /opt tylko do odczytu)...")
+	if err := writeImmutability(p.RootfsDir); err != nil {
+		return fmt.Errorf("niezmiennosc systemu: %w", err)
 	}
 
 	// Usuwamy apt/apt-get DOKLADNIE tutaj -- PO ewentualnym wstrzynkieciu
