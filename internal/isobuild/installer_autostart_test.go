@@ -207,3 +207,71 @@ func TestInstaller_BootfixFinishedAndWindowRules(t *testing.T) {
 		t.Error("po zamknieciu Calamares nie wolno konczyc uslugi (czarny ekran)")
 	}
 }
+
+func TestInstaller_AutologinDoneMarkerAndLiveUserRemoval(t *testing.T) {
+	root := t.TempDir()
+	// bez menedzera logowania: brak modulu displaymanager w sekwencji
+	if err := writeCalamaresConfig(root, InstallerVariantDefault, ""); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := os.ReadFile(filepath.Join(root, "etc/calamares/settings.conf"))
+	if strings.Contains(string(st), "- displaymanager") {
+		t.Error("displaymanager bez zainstalowanego DM")
+	}
+	for _, want := range []string{"shellprocess@done", "shellprocess_done.conf"} {
+		if !strings.Contains(string(st), want) {
+			t.Errorf("settings.conf bez %q", want)
+		}
+	}
+	// z SDDM: modul jest w sekwencji po users i ma config
+	root2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root2, "usr/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root2, "usr/bin/sddm"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCalamaresConfig(root2, InstallerVariantDefault, ""); err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := os.ReadFile(filepath.Join(root2, "etc/calamares/settings.conf"))
+	if !strings.Contains(string(st2), "- users\n      - displaymanager") {
+		t.Errorf("brak displaymanager po users:\n%s", st2)
+	}
+	dmc, err := os.ReadFile(filepath.Join(root2, "etc/calamares/modules/displaymanager.conf"))
+	if err != nil || !strings.Contains(string(dmc), "- sddm") {
+		t.Errorf("displaymanager.conf: %v %s", err, dmc)
+	}
+	// skrypt usuwania konta live + wywolanie w shellprocess
+	if !strings.Contains(removeLiveUserScript, "userdel") {
+		t.Error("osadzony remove-live-user.sh pusty")
+	}
+	sp, _ := os.ReadFile(filepath.Join(root, "etc/calamares/modules/shellprocess.conf"))
+	if !strings.Contains(string(sp), "remove-live-user") {
+		t.Error("shellprocess nie usuwa konta live")
+	}
+	// odliczanie i wylaczenie po instalacji bez restartu
+	for _, want := range []string{"hackeros-install-done", "Komputer wylaczy sie za", "systemctl poweroff"} {
+		if !strings.Contains(installerSessionScript, want) {
+			t.Errorf("sesja bez %q", want)
+		}
+	}
+}
+
+func TestWriteImmutability_HammerFlags(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr/bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr/bin/hammer"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeImmutability(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"hammer/db/.immutable-enabled", "hammer/db/.immutable-backend"} {
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			t.Error(err)
+		}
+	}
+}
