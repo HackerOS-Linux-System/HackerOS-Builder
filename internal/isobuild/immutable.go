@@ -20,7 +20,9 @@ import (
 const immutableScript = `#!/bin/sh
 # Wygenerowane przez hackeros-builder.
 # hackeros-immutable status | lock | unlock | run -- polecenie...
-PROTECTED="${HACKEROS_PROTECTED:-/usr /boot /opt}"
+# Lista zgodna z hammer (system/immutable.h# -> ro_paths_all). Symlinki
+# (usrmerge: /bin /sbin /lib) i nieistniejace katalogi sa pomijane.
+PROTECTED="${HACKEROS_PROTECTED:-/usr /bin /sbin /lib /lib64 /lib32 /libx32 /opt /srv /boot /hammer/store /hammer/profiles /snap}"
 
 usage() {
     echo "uzycie: hackeros-immutable status|lock|unlock|run -- polecenie..." >&2
@@ -86,7 +88,7 @@ esac
 `
 
 const immutableServiceUnit = `[Unit]
-Description=HackerOS: system plikow tylko do odczytu (/usr, /boot, /opt)
+Description=HackerOS: system plikow tylko do odczytu (/usr, /boot, /opt ...)
 DefaultDependencies=no
 After=local-fs.target systemd-remount-fs.service
 Before=sysinit.target shutdown.target
@@ -99,6 +101,7 @@ ConditionPathExists=!/etc/hackeros/mutable
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/hackeros-immutable lock
+ExecStartPost=-/usr/sbin/hackeros-immutable status
 
 [Install]
 WantedBy=sysinit.target
@@ -129,5 +132,21 @@ func writeImmutability(rootfsDir string) error {
 	if err := os.Symlink("/etc/systemd/system/hackeros-immutable.service", link); err != nil {
 		return fmt.Errorf("wlaczanie hackeros-immutable.service: %w", err)
 	}
-	return os.MkdirAll(filepath.Join(rootfsDir, "usr/local"), 0o755)
+	if err := os.MkdirAll(filepath.Join(rootfsDir, "usr/local"), 0o755); err != nil {
+		return err
+	}
+	// Zgodnosc z hammer (system/immutable.h#): gdy w obrazie jest hammer,
+	// oznaczamy tryb immutable jako wlaczony (backend "remount"), dzieki
+	// czemu hammer sam odblokowuje /usr na czas transakcji
+	// (`mount -o remount,bind` dziala, bo hackeros-immutable.service robi z
+	// /usr itd. osobne punkty montowania) i blokuje go po niej.
+	if _, err := os.Stat(filepath.Join(rootfsDir, "usr/bin/hammer")); err == nil {
+		if err := write("hammer/db/.immutable-enabled", "1\n", 0o644); err != nil {
+			return err
+		}
+		if err := write("hammer/db/.immutable-backend", "remount\n", 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
