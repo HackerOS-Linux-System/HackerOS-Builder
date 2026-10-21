@@ -2,6 +2,7 @@ package isobuild
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"image"
 	"image/color"
@@ -226,22 +227,24 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant, projectDir
 		return err
 	}
 
+	dm := detectDisplayManager(rootfsDir)
 	files := map[string]string{
-		filepath.Join(base, "settings.conf"): calamaresSettingsConf,
+		filepath.Join(base, "settings.conf"): calamaresSettingsFor(dm),
 
-		filepath.Join(modulesDir, "welcome.conf"):      calamaresWelcomeConf,
-		filepath.Join(modulesDir, "locale.conf"):       calamaresLocaleConf,
-		filepath.Join(modulesDir, "keyboard.conf"):     calamaresKeyboardConf,
-		filepath.Join(modulesDir, "partition.conf"):    calamaresPartitionConf,
-		filepath.Join(modulesDir, "users.conf"):        calamaresUsersConf,
-		filepath.Join(modulesDir, "unpackfs.conf"):     calamaresUnpackfsConf,
-		filepath.Join(modulesDir, "mount.conf"):        calamaresMountConf,
-		filepath.Join(modulesDir, "machineid.conf"):    calamaresMachineidConf,
-		filepath.Join(modulesDir, "fstab.conf"):        calamaresFstabConf,
-		filepath.Join(modulesDir, "bootloader.conf"):   calamaresBootloaderConf,
-		filepath.Join(modulesDir, "umount.conf"):       calamaresUmountConf,
-		filepath.Join(modulesDir, "finished.conf"):     calamaresFinishedConf,
-		filepath.Join(modulesDir, "shellprocess.conf"): calamaresShellprocessConf,
+		filepath.Join(modulesDir, "welcome.conf"):           calamaresWelcomeConf,
+		filepath.Join(modulesDir, "locale.conf"):            calamaresLocaleConf,
+		filepath.Join(modulesDir, "keyboard.conf"):          calamaresKeyboardConf,
+		filepath.Join(modulesDir, "partition.conf"):         calamaresPartitionConf,
+		filepath.Join(modulesDir, "users.conf"):             calamaresUsersConf,
+		filepath.Join(modulesDir, "unpackfs.conf"):          calamaresUnpackfsConf,
+		filepath.Join(modulesDir, "mount.conf"):             calamaresMountConf,
+		filepath.Join(modulesDir, "machineid.conf"):         calamaresMachineidConf,
+		filepath.Join(modulesDir, "fstab.conf"):             calamaresFstabConf,
+		filepath.Join(modulesDir, "bootloader.conf"):        calamaresBootloaderConf,
+		filepath.Join(modulesDir, "umount.conf"):            calamaresUmountConf,
+		filepath.Join(modulesDir, "finished.conf"):          calamaresFinishedConf,
+		filepath.Join(modulesDir, "shellprocess_done.conf"): calamaresShellprocessDoneConf,
+		filepath.Join(modulesDir, "shellprocess.conf"):      calamaresShellprocessConf,
 
 		filepath.Join(brandingDir, "branding.desc"): brandingDescFor(variant),
 	}
@@ -260,6 +263,16 @@ func writeCalamaresConfig(rootfsDir string, variant InstallerVariant, projectDir
 	}
 	if err := os.WriteFile(bootfix, []byte(installerBootfixScript), 0o755); err != nil {
 		return fmt.Errorf("zapis %s: %w", bootfix, err)
+	}
+	rlu := filepath.Join(rootfsDir, "usr/local/sbin/hackeros-remove-live-user")
+	if err := os.WriteFile(rlu, []byte(removeLiveUserScript), 0o755); err != nil {
+		return fmt.Errorf("zapis %s: %w", rlu, err)
+	}
+	if dm != "" {
+		dmConf := filepath.Join(modulesDir, "displaymanager.conf")
+		if err := os.WriteFile(dmConf, []byte(fmt.Sprintf(calamaresDisplayManagerConf, dm)), 0o644); err != nil {
+			return fmt.Errorf("zapis %s: %w", dmConf, err)
+		}
 	}
 
 	// Zasoby brandingu wskazane w branding.desc (logo.png, welcome.png,
@@ -379,7 +392,10 @@ func brandingDescFor(variant InstallerVariant) string {
 const calamaresSettingsConf = `# Wygenerowane przez hackeros-builder -- NIE edytuj recznie w obrazie,
 # zmiany rob w config/hooks/normal/*.hook.chroot wlasnego projektu.
 modules-search: [ local ]
-instances: []
+instances:
+  - id:       done
+    module:   shellprocess
+    config:   shellprocess_done.conf
 sequence:
   - show:
       - welcome
@@ -398,9 +414,11 @@ sequence:
       - localecfg
       - keyboard
       - users
+      # @DISPLAYMANAGER@
       - bootloader
       - shellprocess
       - umount
+      - shellprocess@done
   - show:
       - finished
 branding: hackeros
@@ -628,6 +646,64 @@ echo "BLAD: nie udalo sie wygenerowac grub.cfg z wpisem jadra"
 exit 1
 `
 
+// removeLiveUserScript: usuwa konto live ("user") z zainstalowanego systemu
+// (zrodlo: Scripts/remove-live-user.sh projektu HackerOS). Gdy w obrazie jest
+// /usr/share/HackerOS/Scripts/remove-live-user.sh, uzywana jest TA wersja.
+//
+//go:embed removeliveuser.sh.txt
+var removeLiveUserScript string
+
+// calamaresShellprocessDoneConf: znacznik "instalacja zakonczona sukcesem"
+// w srodowisku LIVE (dontChroot) -- czyta go sesja instalatora po zamknieciu
+// Calamares, zeby pokazac komunikat i wylaczyc komputer.
+const calamaresShellprocessDoneConf = `---
+dontChroot: true
+timeout: 30
+script:
+    - command: "touch /run/hackeros-install-done"
+`
+
+// calamaresDisplayManagerConf: modul displaymanager zapisuje autologin
+// (checkbox "Zaloguj automatycznie" na stronie uzytkownika) w konfiguracji
+// menedzera logowania zainstalowanego systemu.
+const calamaresDisplayManagerConf = `---
+displaymanagers:
+    - %s
+basicSetup: false
+`
+
+// detectDisplayManager zwraca nazwe menedzera logowania zainstalowanego w
+// rootfs (sddm|lightdm|gdm) albo "". Modul displaymanager bez zadnego
+// zainstalowanego DM konczy sie bledem, wiec dodajemy go do sekwencji tylko
+// gdy DM istnieje.
+func detectDisplayManager(rootfsDir string) string {
+	for _, c := range []struct {
+		name  string
+		paths []string
+	}{
+		{"sddm", []string{"usr/bin/sddm"}},
+		{"lightdm", []string{"usr/sbin/lightdm", "usr/bin/lightdm"}},
+		{"gdm", []string{"usr/sbin/gdm3", "usr/sbin/gdm", "usr/bin/gdm"}},
+	} {
+		for _, p := range c.paths {
+			if _, err := os.Stat(filepath.Join(rootfsDir, p)); err == nil {
+				return c.name
+			}
+		}
+	}
+	return ""
+}
+
+// calamaresSettingsFor wstawia modul displaymanager do sekwencji (po users)
+// tylko gdy w obrazie jest menedzer logowania.
+func calamaresSettingsFor(dm string) string {
+	repl := ""
+	if dm != "" {
+		repl = "- displaymanager"
+	}
+	return strings.Replace(calamaresSettingsConf, "# @DISPLAYMANAGER@", repl, 1)
+}
+
 const calamaresUmountConf = `---
 `
 
@@ -651,6 +727,8 @@ timeout: 600
 script:
     - command: "mkdir -p /etc/hammer"
     - command: "/usr/local/sbin/hackeros-bootfix"
+    - command: "if [ -x /usr/share/HackerOS/Scripts/remove-live-user.sh ]; then /bin/sh /usr/share/HackerOS/Scripts/remove-live-user.sh; else /bin/sh /usr/local/sbin/hackeros-remove-live-user; fi"
+    - command: "rm -f /usr/local/sbin/hackeros-remove-live-user"
     - command: "rm -f /usr/local/sbin/hackeros-bootfix"
     - command: "rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service"
     - command: "rm -f /etc/systemd/system/hackeros-installer.service"
@@ -830,6 +908,33 @@ fallback_console() {
     exec /sbin/agetty --autologin root --noclear tty1 linux
 }
 
+# Po zamknieciu Calamares: gdy instalacja sie POWIODLA (znacznik z modulu
+# shellprocess@done) i NIE zazadano restartu -- komunikat na tty1 i
+# wylaczenie komputera po 10 s.
+finish_after_install() {
+    [ -e /run/hackeros-install-done ] || return 0
+    sleep 3
+    # Restart zlecony przez Calamares ("Uruchom ponownie teraz") -- nie przeszkadzamy.
+    if systemctl list-jobs 2>/dev/null | grep -Eq 'reboot|poweroff|halt'; then
+        while :; do sleep 60; done
+    fi
+    chvt 1 2>/dev/null
+    {
+        printf '\033[2J\033[H'
+        printf '\n  HackerOS zostal poprawnie zainstalowany.\n'
+        printf '  Wyjmij nosnik instalacyjny (pendrive/ISO).\n\n'
+        n=10
+        while [ "$n" -gt 0 ]; do
+            printf '\r  Komputer wylaczy sie za %2d s...  ' "$n"
+            sleep 1
+            n=$((n-1))
+        done
+        printf '\r  Wylaczanie...                         \n'
+    } >/dev/tty1 2>&1
+    systemctl poweroff
+    while :; do sleep 60; done
+}
+
 for attempt in "autodetekcja:" "fbdev:-config /etc/hackeros-installer/xorg-fbdev.conf" "vesa:-config /etc/hackeros-installer/xorg-vesa.conf"; do
     label="${attempt%%:*}"; args="${attempt#*:}"
     # shellcheck disable=SC2086
@@ -840,6 +945,7 @@ for attempt in "autodetekcja:" "fbdev:-config /etc/hackeros-installer/xorg-fbdev
         # zostawiamy konsole z podpowiedzia. Gdy w Calamares zaznaczono
         # "Uruchom ponownie", reboot wystartowal juz wczesniej.
         if [ "$XRC" -eq 0 ]; then
+            finish_after_install
             fallback_console "Instalator zostal zamkniety. Wpisz: reboot  (aby uruchomic ponownie komputer)."
         fi
         fallback_console "Instalator (Calamares) zakonczyl sie bledem (kod $XRC)."
