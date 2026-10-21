@@ -931,3 +931,9 @@ MIT
 
 - **KDE „Welcome Center” w sesji instalatora** – xinit instalatora ustawia puste `XDG_CONFIG_HOME`/`XDG_CONFIG_DIRS` (bez autostartów XDG), usuwa `XDG_CURRENT_DESKTOP` i pilnuje, by proces `plasma-welcome` nie działał, dopóki działa Calamares.
 - **Niezmienność** – `internal/isobuild/immutable.go`: `/usr`, `/boot`, `/opt` montowane tylko do odczytu (`hackeros-immutable.service`), `/usr/local` i `/etc`, `/var`, `/home` zapisywalne. Szczegóły i propozycje dla hammer: `docs/HAMMER-ATOMIC-INTEGRATION.md`.
+
+## Autologin, wyłączenie po instalacji, konto live, zgodność z hammer
+- `displaymanager` + `displaymanager.conf` dodawane automatycznie, gdy rootfs ma SDDM/LightDM/GDM (autologin z instalatora).
+- Po „Ukończ” bez restartu: komunikat o poprawnej instalacji, odliczanie 10 s na tty1 i `systemctl poweroff` (znacznik `/run/hackeros-install-done` z `shellprocess@done`). Przy zaznaczonym restarcie sesja czeka na reboot.
+- `remove-live-user.sh` (z `Scripts/`) osadzony i uruchamiany po `bootloader`; preferowana wersja `/usr/share/HackerOS/Scripts/remove-live-user.sh`.
+- Niezmienność zgodna z `hammer immutable` (lista ścieżek, flagi `/hammer/db/.immutable-*`) – patrz `docs/HAMMER-ATOMIC-INTEGRATION.md`.
