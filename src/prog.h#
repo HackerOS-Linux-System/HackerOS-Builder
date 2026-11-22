@@ -1,0 +1,106 @@
+use "bit -> progress-bar" from "pb"
+mod sysc
+mod ui
+
+pub struct Bar is
+    pub br_pb:        pb::bar::ProgressBar
+    pub br_label:     string
+    pub br_unit:      string
+    pub br_total:     int
+    pub br_current:   int
+    pub br_started:   int
+    pub br_last_ms:   int
+    pub br_last_len:  int
+    pub br_done:      bool
+    pub br_tty:       bool
+end
+
+fn track_style() -> pb::style::ProgressStyle is
+    let theme: string = pb::theme::custom_theme("[", "]", "#", "-", "")
+    return pb::style::style_bar().with_theme(theme).with_template("{{bar}}").with_width(30).with_color(false)
+end
+
+;; NewProgressBar(label, total, unit) - total <= 0 oznacza "nieznany" (sam licznik).
+pub fn new(label: string, total: int, unit: string) -> Bar is
+    let denom: int = if total > 0 then total else 1
+    let p: pb::bar::ProgressBar = pb::bar::bar_with_style(denom, label, track_style())
+    let b: Bar = Bar { br_pb: p, br_label: label, br_unit: unit, br_total: total, br_current: 0, br_started: now_ms(), br_last_ms: 0, br_last_len: 0, br_done: false, br_tty: sysc::stdout_is_tty() }
+    return render(b, true)
+end
+
+fn format_line(b: Bar) -> string is
+    let elapsed: string = ui::dim(ui::format_elapsed(now_ms() - b.br_started))
+    let label: string = ui::bold(b.br_label)
+    if b.br_total <= 0 is
+        return "  " + label + "  " + ui::cyan(to_string(b.br_current)) + " " + b.br_unit + "  " + elapsed
+    end
+    let cur: int = if b.br_current > b.br_total then b.br_total else (if b.br_current < 0 then 0 else b.br_current)
+    let raw_track: string = b.br_pb.set(cur).line()
+    let inner: string = string_slice(raw_track, 1, string_len(raw_track) - 1)
+    let mut filled: int = 0
+    let mut k: int = 0
+    while k < string_len(inner) is
+        if string_at(inner, k) == "#" is filled += 1 end
+        k += 1
+    end
+    let track: string = "[" + ui::green(string_repeat("#", filled)) + ui::dim(string_repeat("-", string_len(inner) - filled)) + "]"
+    let pct: int = (cur * 100) / b.br_total
+    let pct_txt: string = ui::pad_left(to_string(pct) + "%", 4)
+    return "  " + label + "  " + track + " " + ui::bold(pct_txt) + "  " + ui::cyan(to_string(b.br_current)) + "/" + to_string(b.br_total) + " " + b.br_unit + "  " + elapsed
+end
+
+fn render(b: Bar, force: bool) -> Bar is
+    if !b.br_tty is return b end
+    let now: int = now_ms()
+    if !force && now - b.br_last_ms < 80 is return b end
+    let line: string = format_line(b)
+    let vis: int = ui::visible_len(line)
+    let mut pad: string = ""
+    if vis < b.br_last_len is pad = string_repeat(" ", b.br_last_len - vis) end
+    io_print("\r" + line + pad)
+    io_flush()
+    return Bar { br_pb: b.br_pb, br_label: b.br_label, br_unit: b.br_unit, br_total: b.br_total, br_current: b.br_current, br_started: b.br_started, br_last_ms: now, br_last_len: vis, br_done: b.br_done, br_tty: b.br_tty }
+end
+
+fn with_current(b: Bar, cur: int) -> Bar is
+    return Bar { br_pb: b.br_pb, br_label: b.br_label, br_unit: b.br_unit, br_total: b.br_total, br_current: cur, br_started: b.br_started, br_last_ms: b.br_last_ms, br_last_len: b.br_last_len, br_done: b.br_done, br_tty: b.br_tty }
+end
+
+fn with_done(b: Bar) -> Bar is
+    return Bar { br_pb: b.br_pb, br_label: b.br_label, br_unit: b.br_unit, br_total: b.br_total, br_current: b.br_current, br_started: b.br_started, br_last_ms: b.br_last_ms, br_last_len: b.br_last_len, br_done: true, br_tty: b.br_tty }
+end
+
+pub fn set(b: Bar, cur: int) -> Bar is
+    if b.br_done is return b end
+    return render(with_current(b, cur), false)
+end
+
+pub fn add(b: Bar, delta: int) -> Bar is
+    if b.br_done is return b end
+    return render(with_current(b, b.br_current + delta), false)
+end
+
+fn newline(b: Bar, tag_plain: string, tag_colored: string) is
+    if !b.br_tty is
+        write("[INFO ] " + b.br_label + ": " + tag_plain)
+        return
+    end
+    write(" " + tag_colored)
+end
+
+pub fn finish(b: Bar) -> Bar is
+    if b.br_done is return b end
+    let cur: int = if b.br_total > 0 then b.br_total else b.br_current
+    let d: Bar = with_done(with_current(b, cur))
+    let r: Bar = render(d, true)
+    newline(r, "OK", ui::green("OK"))
+    return r
+end
+
+pub fn fail(b: Bar, reason: string) -> Bar is
+    if b.br_done is return b end
+    let d: Bar = with_done(b)
+    let r: Bar = render(d, true)
+    newline(r, "BLAD: " + reason, ui::red("BLAD: " + reason))
+    return r
+end
