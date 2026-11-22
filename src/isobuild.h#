@@ -1,0 +1,627 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod prog
+mod strx
+mod liveparse
+mod hooklang
+mod rootfs
+mod sandbox
+mod toolchain
+mod installer_assets
+
+pub struct BuildParams is
+    pub ib_rootfs:          string
+    pub ib_output_iso:      string
+    pub ib_work_dir:        string
+    pub ib_volume_name:     string
+    pub ib_project_dir:     string
+    pub ib_menu_title:      string
+    pub ib_skip_installer:  bool
+    pub ib_variant:         string
+    pub ib_installer_hooks: [liveparse::HookScript]
+    pub ib_arch:            string
+end
+
+pub fn empty_params() -> BuildParams is
+    return BuildParams { ib_rootfs: "", ib_output_iso: "", ib_work_dir: "", ib_volume_name: "", ib_project_dir: "", ib_menu_title: "", ib_skip_installer: false, ib_variant: "default", ib_installer_hooks: [], ib_arch: "" }
+end
+
+pub fn variant_label(v: string) -> string is
+    if v == "cybersecurity" is return "Cybersecurity Edition" end
+    return "default"
+end
+
+;; ============================ ARCH ============================
+fn go_arch_of_host() -> string is
+    let m: string = string_trim(shell("uname -m"))
+    if m == "x86_64" || m == "amd64" is return "amd64" end
+    if m == "aarch64" || m == "arm64" is return "arm64" end
+    if string_starts_with(m, "armv") is return "arm" end
+    if m == "i386" || m == "i686" || m == "i586" is return "386" end
+    if m == "mips" is return "mips" end
+    if m == "mips64" is return "mips64le" end
+    if m == "ppc64le" is return "ppc64le" end
+    if m == "riscv64" is return "riscv64" end
+    if m == "s390x" is return "s390x" end
+    return ""
+end
+
+fn arch_to_debian(go_arch: string) -> string is
+    if go_arch == "amd64" is return "amd64" end
+    if go_arch == "arm64" is return "arm64" end
+    if go_arch == "arm" is return "armhf" end
+    if go_arch == "386" is return "i386" end
+    if go_arch == "mips" is return "mipsel" end
+    if go_arch == "mips64le" is return "mips64el" end
+    if go_arch == "ppc64le" is return "ppc64el" end
+    if go_arch == "riscv64" is return "riscv64" end
+    if go_arch == "s390x" is return "s390x" end
+    return ""
+end
+
+pub fn warn_if_foreign_arch(arch: string) is
+    if arch == "" is return end
+    let host: string = arch_to_debian(go_arch_of_host())
+    if host == "" || arch == host is return end
+    ui::warn("[release] -> arch=" + ui::quote(arch) + " rozni sie od architektury hosta budujacego (" + ui::quote(host) + ") -- grub-mkrescue uzyje modulow GRUB Z HOSTA (hackeros-builder nie przekazuje jawnego \"-d <platforma>\"), co dla INNEJ architektury zazwyczaj oznacza ISO ktore NIE WSTANIE na docelowym sprzecie, chyba ze host ma recznie zainstalowane wielo-architekturowe pakiety GRUB (np. grub-efi-" + arch + "-bin) I samodzielnie skonfigurowany odpowiedni --target. Pelne wsparcie cross-arch ISO to osobna pozycja w ROADMAP (README.md) -- na razie [release] -> arch niezawodnie wplywa TYLKO na sam rootfs (debootstrap), nie na bootowalnosc finalnego ISO.")
+end
+
+;; ============================ NIEZMIENNOSC ============================
+fn write_rel(rootfs: string, rel: string, content: string, mode: int) -> string is
+    return fsx::write_file_p(fsx::join(rootfs, rel), content, mode)
+end
+
+pub fn write_immutability(rootfs: string) -> string is
+    let e1: string = write_rel(rootfs, "usr/sbin/hackeros-immutable", installer_assets::immutable_script(), 493)
+    if e1 != "" is return e1 end
+    let e2: string = write_rel(rootfs, "etc/systemd/system/hackeros-immutable.service", installer_assets::immutable_service_unit(), 420)
+    if e2 != "" is return e2 end
+    let wants: string = fsx::join(rootfs, "etc/systemd/system/sysinit.target.wants")
+    let me: string = fsx::mkdir_p(wants)
+    if me != "" is return me end
+    let link: string = fsx::join(wants, "hackeros-immutable.service")
+    fsx::remove(link)
+    let se: string = fsx::symlink_force("/etc/systemd/system/hackeros-immutable.service", link)
+    if se != "" is return "wlaczanie hackeros-immutable.service: " + se end
+    let ue: string = fsx::mkdir_p(fsx::join(rootfs, "usr/local"))
+    if ue != "" is return ue end
+    if fsx::exists(fsx::join(rootfs, "usr/bin/hammer")) is
+        let h1: string = write_rel(rootfs, "hammer/db/.immutable-enabled", "1\n", 420)
+        if h1 != "" is return h1 end
+        let h2: string = write_rel(rootfs, "hammer/db/.immutable-backend", "remount\n", 420)
+        if h2 != "" is return h2 end
+    end
+    return ""
+end
+
+;; ============================ BRANDING ============================
+fn branding_source_dirs(project_dir: string) -> [string] is
+    if project_dir == "" is return [] end
+    let cfg: string = fsx::join(project_dir, "config")
+    let mut dirs: [string] = []
+    let incs: [string] = ["includes.chroot_after_packages", "includes.chroot", "includes.chroot_before_packages"]
+    let mut i: int = 0
+    while i < array_len(incs) is
+        dirs = array_push(dirs, fsx::join(fsx::join(fsx::join(fsx::join(fsx::join(cfg, incs[i]), "etc"), "calamares"), "branding"), "debian"))
+        i += 1
+    end
+    return array_push(dirs, fsx::join(cfg, "installer-branding"))
+end
+
+;; png.DecodeConfig: sygnatura PNG + poprawny naglowek IHDR. "" = OK, inaczej opis bledu.
+fn png_config_error(path: string) -> string is
+    let hex: string = string_trim(shell("od -An -tx1 -N24 " + proc::sq(path) + " 2>/dev/null | tr -d ' \\n'"))
+    if string_len(hex) < 16 || string_slice(hex, 0, 16) != "89504e470d0a1a0a" is return "png: invalid format: not a PNG file" end
+    if string_len(hex) < 48 is return "unexpected EOF" end
+    if string_slice(hex, 8 * 2 + 8, 8 * 2 + 16) != "49484452" is return "png: invalid format: not a PNG file" end
+    return ""
+end
+
+;; Zwraca pary "nazwa_docelowa=sciezka_zrodla" dla znalezionych plikow brandingu projektu.
+fn load_project_branding(project_dir: string) -> [string] is
+    let mut out: [string] = []
+    let pairs: [string] = ["debian-logo.png:logo.png", "welcome.png:welcome.png"]
+    let mut i: int = 0
+    while i < array_len(pairs) is
+        let pr: [string] = string_split(pairs[i], ":")
+        i += 1
+        let mut found: bool = false
+        let dirs: [string] = branding_source_dirs(project_dir)
+        let mut d: int = 0
+        while d < array_len(dirs) && !found is
+            let path: string = fsx::join(dirs[d], pr[0])
+            d += 1
+            if file_exists(path) is
+                let pe: string = png_config_error(path)
+                if pe != "" is
+                    ui::warn("branding: " + path + " nie jest poprawnym PNG (" + pe + ") -- pomijam")
+                else is
+                    ui::info("  branding instalatora: " + path + " -> " + pr[1])
+                    out = array_push(out, pr[1] + "=" + path)
+                    found = true
+                end
+            end
+        end
+        if !found is
+            ui::warn("branding: nie znaleziono " + pr[0] + " w projekcie (szukano w " + proc::format_args(dirs) + ") -- uzywam obrazu generowanego")
+        end
+    end
+    return out
+end
+
+fn write_b64_png(b64: string, dest: string) -> string is
+    let tmp: string = proc::tmp_path("b64")
+    fs_write(tmp, b64)
+    let rc: int = sysc::sh("base64 -d " + proc::sq(tmp) + " > " + proc::sq(dest) + " 2>/dev/null")
+    fsx::remove(tmp)
+    if rc != 0 is return "base64 -d zakonczone kodem " + to_string(rc) end
+    if !fsx::set_mode(dest, 420) is return "chmod " + dest + ": blad" end
+    return ""
+end
+
+;; ============================ INSTALATOR ============================
+pub fn installer_packages() -> [string] is
+    return ["calamares", "xserver-xorg", "xserver-xorg-core", "xserver-xorg-input-all", "xserver-xorg-video-all", "xserver-xorg-video-fbdev", "xserver-xorg-video-vesa", "xinit", "x11-xserver-utils", "xkb-data", "libgl1-mesa-dri", "fonts-dejavu-core", "udisks2", "kmod", "openbox", "dbus-x11", "polkitd", "pkexec", "network-manager", "parted", "gdisk", "dosfstools", "os-prober"]
+end
+
+;; grupy alternatyw oddzielone "|", pakiety w grupie przecinkiem
+fn installer_optional_groups() -> [string] is
+    return ["x11-utils", "xmessage,x11-apps", "dmz-cursor-theme,adwaita-icon-theme,xcursor-themes"]
+end
+
+pub fn bootloader_packages(arch: string) -> [string] is
+    let base: [string] = ["grub-common", "grub2-common", "efibootmgr", "mtools"]
+    if arch == "" || arch == "amd64" is return strx::concat(base, ["grub-efi-amd64-bin", "grub-pc-bin"]) end
+    if arch == "arm64" is return strx::concat(base, ["grub-efi-arm64-bin"]) end
+    if arch == "i386" is return strx::concat(base, ["grub-efi-ia32-bin", "grub-pc-bin"]) end
+    return base
+end
+
+pub fn detect_display_manager(rootfs: string) -> string is
+    let cands: [string] = ["sddm:usr/bin/sddm", "lightdm:usr/sbin/lightdm,usr/bin/lightdm", "gdm:usr/sbin/gdm3,usr/sbin/gdm,usr/bin/gdm"]
+    let mut i: int = 0
+    while i < array_len(cands) is
+        let parts: [string] = string_split(cands[i], ":")
+        i += 1
+        let paths: [string] = string_split(parts[1], ",")
+        let mut j: int = 0
+        while j < array_len(paths) is
+            if fsx::exists(fsx::join(rootfs, paths[j])) is return parts[0] end
+            j += 1
+        end
+    end
+    return ""
+end
+
+fn calamares_settings_for(dm: string) -> string is
+    let repl: string = if dm != "" then "- displaymanager" else ""
+    return string_replace_first(installer_assets::calamares_settings_conf(), "# @DISPLAYMANAGER@", repl)
+end
+
+fn string_replace_first(s: string, old_s: string, repl: string) -> string is
+    let p: int = string_find(s, old_s)
+    if p < 0 is return s end
+    return string_slice(s, 0, p) + repl + string_slice(s, p + string_len(old_s), string_len(s))
+end
+
+pub fn write_calamares_config(rootfs: string, variant: string, project_dir: string) -> string is
+    let base: string = fsx::join(fsx::join(rootfs, "etc"), "calamares")
+    let modules_dir: string = fsx::join(base, "modules")
+    let branding_dir: string = fsx::join(fsx::join(base, "branding"), "hackeros")
+    let e1: string = fsx::mkdir_p(modules_dir)
+    if e1 != "" is return e1 end
+    let e2: string = fsx::mkdir_p(branding_dir)
+    if e2 != "" is return e2 end
+    let dm: string = detect_display_manager(rootfs)
+    let files: [string] = [
+        fsx::join(base, "settings.conf"), calamares_settings_for(dm),
+        fsx::join(modules_dir, "welcome.conf"), installer_assets::calamares_welcome_conf(),
+        fsx::join(modules_dir, "locale.conf"), installer_assets::calamares_locale_conf(),
+        fsx::join(modules_dir, "keyboard.conf"), installer_assets::calamares_keyboard_conf(),
+        fsx::join(modules_dir, "partition.conf"), installer_assets::calamares_partition_conf(),
+        fsx::join(modules_dir, "users.conf"), installer_assets::calamares_users_conf(),
+        fsx::join(modules_dir, "unpackfs.conf"), installer_assets::calamares_unpackfs_conf(),
+        fsx::join(modules_dir, "mount.conf"), installer_assets::calamares_mount_conf(),
+        fsx::join(modules_dir, "machineid.conf"), installer_assets::calamares_machineid_conf(),
+        fsx::join(modules_dir, "fstab.conf"), installer_assets::calamares_fstab_conf(),
+        fsx::join(modules_dir, "bootloader.conf"), installer_assets::calamares_bootloader_conf(),
+        fsx::join(modules_dir, "umount.conf"), installer_assets::calamares_umount_conf(),
+        fsx::join(modules_dir, "finished.conf"), installer_assets::calamares_finished_conf(),
+        fsx::join(modules_dir, "shellprocess_done.conf"), installer_assets::calamares_shellprocess_done_conf(),
+        fsx::join(modules_dir, "shellprocess.conf"), installer_assets::calamares_shellprocess_conf(),
+        fsx::join(branding_dir, "branding.desc"), if variant == "cybersecurity" then installer_assets::calamares_branding_desc_cybersecurity() else installer_assets::calamares_branding_desc(),
+    ]
+    let mut i: int = 0
+    while i < array_len(files) is
+        let we: string = fsx::write_file(files[i], files[i + 1], 420)
+        if we != "" is return "zapis " + files[i] + ": " + we end
+        i += 2
+    end
+    let bootfix: string = fsx::join(rootfs, "usr/local/sbin/hackeros-bootfix")
+    let be: string = fsx::mkdir_p(fsx::dirname(bootfix))
+    if be != "" is return be end
+    let bw: string = fsx::write_file(bootfix, installer_assets::installer_bootfix_script(), 493)
+    if bw != "" is return "zapis " + bootfix + ": " + bw end
+    let rlu: string = fsx::join(rootfs, "usr/local/sbin/hackeros-remove-live-user")
+    let rw: string = fsx::write_file(rlu, installer_assets::remove_live_user_script(), 493)
+    if rw != "" is return "zapis " + rlu + ": " + rw end
+    if dm != "" is
+        let dm_conf: string = fsx::join(modules_dir, "displaymanager.conf")
+        let dw: string = fsx::write_file(dm_conf, string_replace(installer_assets::calamares_display_manager_conf(), "@DM@", dm), 420)
+        if dw != "" is return "zapis " + dm_conf + ": " + dw end
+    end
+    let logo_b64: string = if variant == "cybersecurity" then installer_assets::branding_logo_b64_cybersecurity() else installer_assets::branding_logo_b64_default()
+    let welcome_b64: string = if variant == "cybersecurity" then installer_assets::branding_welcome_b64_cybersecurity() else installer_assets::branding_welcome_b64_default()
+    let logo_path: string = fsx::join(branding_dir, "logo.png")
+    let welcome_path: string = fsx::join(branding_dir, "welcome.png")
+    let le: string = write_b64_png(logo_b64, logo_path)
+    if le != "" is return "generowanie obrazow brandingu: " + le end
+    let we2: string = write_b64_png(welcome_b64, welcome_path)
+    if we2 != "" is return "generowanie obrazow brandingu: " + we2 end
+    let proj: [string] = load_project_branding(project_dir)
+    let mut k: int = 0
+    while k < array_len(proj) is
+        let kv: [string] = string_split(proj[k], "=")
+        k += 1
+        let dst: string = fsx::join(branding_dir, kv[0])
+        let ce: string = fsx::copy_file(kv[1], dst, 420)
+        if ce != "" is return "zapis " + dst + ": " + ce end
+    end
+    let qe: string = fsx::write_file(fsx::join(branding_dir, "show.qml"), installer_assets::calamares_show_q_m_l(), 420)
+    if qe != "" is return "zapis " + fsx::join(branding_dir, "show.qml") + ": " + qe end
+    return ""
+end
+
+pub fn write_installer_autostart(rootfs: string) -> string is
+    let w: [string] = [
+        "usr/local/sbin/hackeros-installer-session", installer_assets::installer_session_script(), "493",
+        "usr/local/sbin/hackeros-installer-xinit", installer_assets::installer_xinit_script(), "493",
+        "usr/local/sbin/hackeros-installer-diag", installer_assets::installer_diag_script(), "493",
+        "etc/hackeros-installer/openbox-rc.xml", installer_assets::installer_openbox_r_c(), "420",
+        "etc/hackeros-installer/xdg/openbox/autostart", "# pusty: brak autostartow w sesji instalatora\n", "420",
+        "etc/hackeros-installer/xdg-home/openbox/autostart", "# pusty: brak autostartow w sesji instalatora\n", "420",
+        "etc/X11/xorg.conf.d/40-hackeros-input.conf", installer_assets::installer_xorg_input(), "420",
+        "etc/hackeros-installer/xorg-fbdev.conf", installer_assets::installer_xorg_fbdev(), "420",
+        "etc/hackeros-installer/xorg-vesa.conf", installer_assets::installer_xorg_vesa(), "420",
+        "etc/systemd/system/hackeros-installer.service", installer_assets::installer_service_unit(), "420",
+    ]
+    let mut i: int = 0
+    while i < array_len(w) is
+        let e: string = write_rel(rootfs, w[i], w[i + 1], str_to_int(w[i + 2]))
+        if e != "" is return e end
+        i += 3
+    end
+    let wants: string = fsx::join(rootfs, "etc/systemd/system/multi-user.target.wants")
+    let me: string = fsx::mkdir_p(wants)
+    if me != "" is return me end
+    let link: string = fsx::join(wants, "hackeros-installer.service")
+    fsx::remove(link)
+    let se: string = fsx::symlink_force("/etc/systemd/system/hackeros-installer.service", link)
+    if se != "" is return "enable hackeros-installer.service: " + se end
+    fsx::remove(fsx::join(rootfs, "root/.bash_profile"))
+    fsx::remove_all(fsx::join(rootfs, "etc/systemd/system/getty@tty1.service.d"))
+    let dt: string = fsx::join(rootfs, "etc/systemd/system/default.target")
+    if fsx::is_symlink(dt) is
+        if string_ends_with(fsx::readlink(dt), "multi-user.target") is fsx::remove(dt) end
+    end
+    return ""
+end
+
+pub fn verify_installer(rootfs: string, arch: string) -> string is
+    let mut required: [string] = ["usr/bin/calamares", "usr/bin/openbox", "usr/bin/xinit", "usr/bin/Xorg", "usr/lib/xorg/modules/input/libinput_drv.so", "etc/calamares/settings.conf", "etc/calamares/modules/finished.conf", "usr/local/sbin/hackeros-bootfix", "etc/calamares/branding/hackeros/branding.desc", "etc/calamares/branding/hackeros/logo.png", "etc/calamares/branding/hackeros/welcome.png", "etc/calamares/branding/hackeros/show.qml"]
+    required = strx::concat(required, ["usr/sbin/grub-install|usr/bin/grub-install", "usr/sbin/grub-mkconfig|usr/bin/grub-mkconfig", "usr/sbin/efibootmgr|usr/bin/efibootmgr"])
+    if arch == "" || arch == "amd64" is
+        required = strx::concat(required, ["usr/lib/grub/x86_64-efi/modinfo.sh", "usr/lib/grub/i386-pc/modinfo.sh"])
+    end
+    let mut missing: [string] = []
+    let mut i: int = 0
+    while i < array_len(required) is
+        let alts: [string] = string_split(required[i], "|")
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < array_len(alts) is
+            if fsx::exists(fsx::join(rootfs, alts[j])) is found = true end
+            j += 1
+        end
+        if !found is missing = array_push(missing, "/" + string_replace(required[i], "|", " lub /")) end
+        i += 1
+    end
+    if array_len(missing) > 0 is
+        return "w rootfs brakuje: " + array_join(missing, ", ") + " -- graficzny instalator nie wystartuje (zostanie tty)"
+    end
+    return ""
+end
+
+pub fn inject_installer(rootfs: string, work_dir: string, variant: string, project_dir: string, arch: string) -> string is
+    let tc: toolchain::Manager = toolchain::new_manager(work_dir)
+    let tc_env: [string] = toolchain::env(tc)
+    let mut pkgs: [string] = strx::concat(installer_packages(), bootloader_packages(arch))
+    if variant == "cybersecurity" is
+        pkgs = strx::concat(pkgs, ["nmap", "net-tools", "tcpdump", "dnsutils"])
+    end
+    ui::info("  instalator GUI (" + variant_label(variant) + "): instalacja Calamares + Xorg (" + to_string(array_len(pkgs)) + " pakietow)...")
+    let ue: string = sandbox::exec_env(rootfs, tc_env, ["apt-get", "update"])
+    if ue != "" is return "apt-get update: " + ue end
+    let base: [string] = ["apt-get", "install", "-y", "--no-install-recommends", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+    let ie: string = sandbox::exec_env(rootfs, tc_env, strx::concat(base, pkgs))
+    if ie != "" is return "apt-get install (instalator): " + ie end
+    let groups: [string] = installer_optional_groups()
+    let mut g: int = 0
+    while g < array_len(groups) is
+        let group: [string] = string_split(groups[g], ",")
+        g += 1
+        let mut installed: bool = false
+        let mut p: int = 0
+        while p < array_len(group) && !installed is
+            let pkg: string = group[p]
+            p += 1
+            if sandbox::exec_env(rootfs, tc_env, strx::concat(base, [pkg])) == "" is
+                installed = true
+            else is
+                ui::warn("opcjonalny pakiet instalatora " + ui::quote(pkg) + " niedostepny -- probuje alternatywe")
+            end
+        end
+        if !installed is
+            ui::warn("zaden z pakietow " + proc::format_args(group) + " nie zainstalowal sie -- kontynuuje bez nich (funkcja opcjonalna)")
+        end
+    end
+    ui::info("  instalator GUI: zapis konfiguracji Calamares...")
+    let ce: string = write_calamares_config(rootfs, variant, project_dir)
+    if ce != "" is return "konfiguracja calamares: " + ce end
+    ui::info("  instalator GUI: konfiguracja autostartu (usluga systemd, tty1)...")
+    let ae: string = write_installer_autostart(rootfs)
+    if ae != "" is return "autostart instalatora: " + ae end
+    let ve: string = verify_installer(rootfs, arch)
+    if ve != "" is return "weryfikacja instalatora: " + ve end
+    return ""
+end
+
+;; ============================ HOOKI INSTALATORA ============================
+fn run_installer_hooks(rootfs: string, work_dir: string, hooks: [liveparse::HookScript]) -> string is
+    if array_len(hooks) == 0 is return "" end
+    let tc: toolchain::Manager = toolchain::new_manager(work_dir)
+    let tc_env: [string] = toolchain::env(tc)
+    let mut order: [string] = []
+    let mut i: int = 0
+    while i < array_len(hooks) is
+        let pkg: string = hooklang::interpreter_package(hooks[i].hs_interp)
+        i += 1
+        if pkg != "" && !strx::contains(order, pkg) is order = array_push(order, pkg) end
+    end
+    if array_len(order) > 0 is
+        order = strx::sort_strings(order)
+        ui::info("  interpretery hookow instalatora: instalacja " + array_join(order, ", ") + "...")
+        let args: [string] = strx::concat(["apt-get", "install", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"], order)
+        let ie: string = sandbox::exec_env(rootfs, tc_env, args)
+        if ie != "" is return "przygotowanie interpreterow hookow instalatora: instalacja interpreterow hookow instalatora (" + proc::format_args(order) + "): " + ie end
+    end
+    let mut bar: prog::Bar = prog::new("hooki instalatora", array_len(hooks), "hookow")
+    let mut k: int = 0
+    while k < array_len(hooks) is
+        let h: liveparse::HookScript = hooks[k]
+        ui::substep("[" + to_string(k + 1) + "/" + to_string(array_len(hooks)) + "] " + h.hs_name + "  " + ui::magenta("(" + hooklang::label(h.hs_interp) + ")"))
+        let tmp_name: string = "/tmp-hackeros-installer-hook-" + h.hs_name
+        let dest: string = fsx::join(rootfs, tmp_name)
+        let ce: string = fsx::copy_file(h.hs_path, dest, 493)
+        if ce != "" is
+            bar = prog::fail(bar, h.hs_name)
+            return "kopiowanie hooka instalatora " + h.hs_name + ": " + ce
+        end
+        let err: string = sandbox::exec_hook(rootfs, tmp_name)
+        fsx::remove(dest)
+        if err != "" is
+            bar = prog::fail(bar, h.hs_name)
+            if h.hs_interp != "" && !hooklang::is_recognized(h.hs_interp) is
+                return "wykonanie hooka instalatora " + h.hs_name + " (interpreter " + ui::quote(h.hs_interp) + " z shebang) nie powiodlo sie: " + err + " -- " + ui::quote(h.hs_interp) + " NIE jest jednym z jezykow z automatyczna instalacja interpretera; jesli to prawidlowy interpreter, doinstaluj go recznie we wczesniejszym hooku instalatora (numeracja prefiksow decyduje o kolejnosci). Jezyki z automatyczna instalacja: " + array_join(hooklang::supported_languages(), "; ")
+            end
+            return "wykonanie hooka instalatora " + h.hs_name + ": " + err
+        end
+        bar = prog::add(bar, 1)
+        k += 1
+    end
+    bar = prog::finish(bar)
+    return ""
+end
+
+;; ============================ SQUASHFS / JADRO / GRUB / ISO ============================
+fn required_squash_entries() -> [string] is
+    return ["squashfs-root/dev", "squashfs-root/dev/console", "squashfs-root/dev/null", "squashfs-root/proc", "squashfs-root/sys", "squashfs-root/run", "squashfs-root/tmp", "squashfs-root/etc", "squashfs-root/usr"]
+end
+
+pub fn mounts_under(dir: string) -> [string] is
+    let abs: string = fsx::real_path(fsx::abs(dir))
+    if !file_exists("/proc/self/mountinfo") is return [] end
+    let raw: string = shell("awk '{{print $5}}' /proc/self/mountinfo 2>/dev/null")
+    let lines: [string] = fsx::non_empty_lines(raw)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let mp: string = string_replace(lines[i], "\\040", " ")
+        if mp == abs || string_starts_with(mp, abs + "/") is out = array_push(out, mp) end
+        i += 1
+    end
+    return out
+end
+
+fn prepare_runtime_skeleton(rootfs: string) -> string is
+    let mounts: [string] = mounts_under(rootfs)
+    if array_len(mounts) > 0 is
+        return "pod " + rootfs + " sa nadal zamontowane systemy plikow (" + array_join(mounts, ", ") + ") -- odmontuj je przed budowa squashfs (inaczej do obrazu trafilaby zawartosc hosta)"
+    end
+    let warns: [string] = fsx::ensure_dev_skeleton(rootfs)
+    let mut i: int = 0
+    while i < array_len(warns) is
+        ui::warn("rootfs skeleton: " + warns[i])
+        i += 1
+    end
+    if !fsx::is_char_dev(fsx::join(fsx::join(rootfs, "dev"), "console")) is
+        return "brak wezla znakowego " + rootfs + "/dev/console i nie udalo sie go utworzyc (uruchom hackeros-builder jako root) -- bez niego initramfs nie wystartuje systemu (kernel panic: Attempted to kill init!)"
+    end
+    return ""
+end
+
+pub fn verify_squashfs(squash_path: string) -> string is
+    let lst: string = proc::tmp_path("sqlist")
+    let rc: int = sysc::sh("unsquashfs -l " + proc::sq(squash_path) + " 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > " + proc::sq(lst))
+    if rc != 0 is
+        fsx::remove(lst)
+        return "weryfikacja squashfs (unsquashfs -l): exit status " + to_string(rc)
+    end
+    let req: [string] = required_squash_entries()
+    let mut missing: [string] = []
+    let mut i: int = 0
+    while i < array_len(req) is
+        if sysc::sh("grep -Fxq " + proc::sq(req[i]) + " " + proc::sq(lst)) != 0 is
+            missing = array_push(missing, strx::trim_prefix(req[i], "squashfs-root"))
+        end
+        i += 1
+    end
+    fsx::remove(lst)
+    if array_len(missing) > 0 is
+        return "filesystem.squashfs nie zawiera wymaganych wpisow: " + array_join(strx::sort_strings(missing), ", ") + " -- taki obraz konczy sie panika jadra \"Attempted to kill init!\" przy starcie"
+    end
+    ui::info("  squashfs zweryfikowany: /dev (z /dev/console), /proc, /sys, /run, /tmp obecne")
+    return ""
+end
+
+fn build_squashfs(rootfs: string, iso_tree: string) -> string is
+    let live_dir: string = fsx::join(iso_tree, "live")
+    let e: string = fsx::mkdir_p(live_dir)
+    if e != "" is return e end
+    let squash_path: string = fsx::join(live_dir, "filesystem.squashfs")
+    let pe: string = prepare_runtime_skeleton(rootfs)
+    if pe != "" is return pe end
+    let args: [string] = ["mksquashfs", rootfs, squash_path, "-comp", "xz", "-noappend", "-wildcards", "-e", "proc/*", "sys/*", "run/*", "tmp/*"]
+    let r: string = proc::run_streaming("", args)
+    if r != "" is return r end
+    return verify_squashfs(squash_path)
+end
+
+pub fn kernel_versions_with_initrd(boot_dir: string) -> [string] is
+    let vm: [string] = fsx::glob_prefix(boot_dir, "vmlinuz-")
+    let ir: [string] = fsx::glob_prefix(boot_dir, "initrd.img-")
+    let mut have: [string] = []
+    let mut i: int = 0
+    while i < array_len(ir) is
+        have = array_push(have, strx::trim_prefix(fsx::basename(ir[i]), "initrd.img-"))
+        i += 1
+    end
+    let mut versions: [string] = []
+    let mut j: int = 0
+    while j < array_len(vm) is
+        let v: string = strx::trim_prefix(fsx::basename(vm[j]), "vmlinuz-")
+        if strx::contains(have, v) is versions = array_push(versions, v) end
+        j += 1
+    end
+    return strx::sort_strings(versions)
+end
+
+fn copy_plain(src: string, dst: string) -> string is
+    let rc: int = sysc::sh("cat " + proc::sq(src) + " > " + proc::sq(dst) + " 2>/dev/null")
+    if rc != 0 is return "kopiowanie " + src + " -> " + dst + ": blad" end
+    return ""
+end
+
+fn copy_kernel_and_initrd(rootfs: string, iso_tree: string) -> string is
+    let boot_dir: string = fsx::join(rootfs, "boot")
+    let live_dir: string = fsx::join(iso_tree, "live")
+    let versions: [string] = kernel_versions_with_initrd(boot_dir)
+    if array_len(versions) == 0 is
+        return "nie znaleziono w " + boot_dir + " ani jednej PELNEJ pary vmlinuz-<wersja>/initrd.img-<wersja> (sam vmlinuz bez initrd, lub sam initrd bez vmlinuz, sie nie licza -- boot musialby uzyc niedopasowanej pary, co konczy sie panika \"Attempted to kill init!\" na starcie live-medium)"
+    end
+    let chosen: string = versions[array_len(versions) - 1]
+    if array_len(versions) > 1 is
+        ui::warn("w " + boot_dir + " znaleziono " + to_string(array_len(versions)) + " roznych wersji jadra z kompletna para vmlinuz/initrd (" + array_join(versions, ", ") + ") -- wybieram najnowsza (" + chosen + "); jesli to nieoczekiwane, sprawdz czy projekt (package-lists lub hooks) nie instaluje przypadkiem DWOCH jader (np. standardowego linux-image-amd64 jako zaleznosc posrednia I wlasnego kernela hookiem)")
+    end
+    let ke: string = copy_plain(fsx::join(boot_dir, "vmlinuz-" + chosen), fsx::join(live_dir, "vmlinuz"))
+    if ke != "" is return "kopiowanie jadra: " + ke end
+    let ie: string = copy_plain(fsx::join(boot_dir, "initrd.img-" + chosen), fsx::join(live_dir, "initrd.img"))
+    if ie != "" is return "kopiowanie initrd: " + ie end
+    return ""
+end
+
+pub fn write_grub_config(iso_tree: string, menu_title: string, installer: bool) -> string is
+    let grub_dir: string = fsx::join(fsx::join(iso_tree, "boot"), "grub")
+    let e: string = fsx::mkdir_p(grub_dir)
+    if e != "" is return e end
+    let unit: string = if installer then " systemd.unit=multi-user.target plymouth.enable=0" else ""
+    let splash: string = if installer then "" else " splash"
+    let t: string = menu_title
+    let cfg: string = "set timeout=5\nset default=0\nmenuentry \"" + t + "\" {{\n    linux /live/vmlinuz boot=live live-media-path=/live" + unit + " quiet" + splash + "\n    initrd /live/initrd.img\n}}\nmenuentry \"" + t + " (safe graphics)\" {{\n    linux /live/vmlinuz boot=live live-media-path=/live" + unit + " quiet nomodeset\n    initrd /live/initrd.img\n}}\nmenuentry \"" + t + " (debug - bez quiet/splash)\" {{\n    linux /live/vmlinuz boot=live live-media-path=/live" + unit + " nomodeset debug ignore_loglevel earlyprintk=vga console=tty0 console=ttyS0,115200\n    initrd /live/initrd.img\n}}\n"
+    return fsx::write_file(fsx::join(grub_dir, "grub.cfg"), cfg, 420)
+end
+
+pub fn write_xorriso_wrapper(dir: string) -> string is
+    let real: string = proc::look_path("xorriso")
+    if real == "" is return "!nie znaleziono 'xorriso' w PATH: exec: \"xorriso\": executable file not found in $PATH" end
+    let path: string = fsx::join(dir, "xorriso-iso-level-wrapper.sh")
+    let script: string = "#!/bin/sh\nexec " + proc::sq(real) + " -compliance iso_9660_level=3 \"$@\"\n"
+    let e: string = fsx::write_file(path, script, 493)
+    if e != "" is return "!zapis wrappera do " + path + ": " + e end
+    return path
+end
+
+fn run_grub_mkrescue(iso_tree: string, output: string, volume: string) -> string is
+    let e: string = fsx::mkdir_p(fsx::dirname(output))
+    if e != "" is return e end
+    let w: string = write_xorriso_wrapper(fsx::dirname(output))
+    if string_starts_with(w, "!") is return "przygotowanie wrappera xorriso (iso-level 3): " + string_slice(w, 1, string_len(w)) end
+    return proc::run_streaming("", ["grub-mkrescue", "--xorriso=" + w, "-o", output, iso_tree, "--", "-volid", volume])
+end
+
+;; ============================ BUILD ============================
+pub fn build(p: BuildParams) -> string is
+    ui::section("Budowa ISO")
+    warn_if_foreign_arch(p.ib_arch)
+    let iso_tree: string = fsx::join(p.ib_work_dir, "iso-tree")
+    let ce: string = fsx::remove_all(iso_tree)
+    if ce != "" is return "czyszczenie " + iso_tree + ": " + ce end
+    let mut total: int = 7
+    if !p.ib_skip_installer && array_len(p.ib_installer_hooks) > 0 is total = 8 end
+    let mut step: int = 0
+    if !p.ib_skip_installer is
+        let variant: string = if p.ib_variant == "" then "default" else p.ib_variant
+        step += 1
+        ui::step(step, total, "instalator GUI (Calamares, wariant: " + variant_label(variant) + ")...")
+        let ie: string = inject_installer(p.ib_rootfs, p.ib_work_dir, variant, p.ib_project_dir, p.ib_arch)
+        if ie != "" is return "instalator GUI: " + ie end
+        if array_len(p.ib_installer_hooks) > 0 is
+            step += 1
+            ui::step(step, total, "hooki instalatora (config/hooks/installer/, " + to_string(array_len(p.ib_installer_hooks)) + ")...")
+            let he: string = run_installer_hooks(p.ib_rootfs, p.ib_work_dir, p.ib_installer_hooks)
+            if he != "" is return "hooki instalatora: " + he end
+        end
+    else is
+        step += 1
+        ui::step(step, total, "instalator GUI pominiety (SkipInstaller)")
+    end
+    step += 1
+    ui::step(step, total, "niezmiennosc systemu (/usr, /boot, /opt tylko do odczytu)...")
+    let we: string = write_immutability(p.ib_rootfs)
+    if we != "" is return "niezmiennosc systemu: " + we end
+    step += 1
+    ui::step(step, total, "usuwanie apt/apt-get (finalny dysk uzytkownika ma byc bez nich; baza dpkg pozostaje dla hammer)...")
+    let re: string = rootfs::remove_apt_tooling(p.ib_rootfs)
+    if re != "" is return "usuwanie apt/apt-get: " + re end
+    step += 1
+    ui::step(step, total, "tworzenie squashfs z rootfs...")
+    let se: string = build_squashfs(p.ib_rootfs, iso_tree)
+    if se != "" is return "squashfs: " + se end
+    step += 1
+    ui::step(step, total, "kopiowanie jadra i initrd...")
+    let ke: string = copy_kernel_and_initrd(p.ib_rootfs, iso_tree)
+    if ke != "" is return "kernel/initrd: " + ke end
+    step += 1
+    ui::step(step, total, "generowanie konfiguracji GRUB (BIOS+UEFI)...")
+    let menu_title: string = if p.ib_menu_title == "" then "HackerOS" else p.ib_menu_title
+    let ge: string = write_grub_config(iso_tree, menu_title, !p.ib_skip_installer)
+    if ge != "" is return "grub config: " + ge end
+    step += 1
+    ui::step(step, total, "budowanie hybrydowego ISO (grub-mkrescue)...")
+    let me: string = run_grub_mkrescue(iso_tree, p.ib_output_iso, p.ib_volume_name)
+    if me != "" is return "grub-mkrescue: " + me end
+    ui::info("ISO zbudowane: " + ui::underline(p.ib_output_iso))
+    return ""
+end
