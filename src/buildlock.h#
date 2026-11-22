@@ -1,0 +1,40 @@
+mod sysc
+mod fsx
+
+pub struct Lock is
+    pub lk_fd:   int
+    pub lk_path: string
+end
+
+pub struct LockRes is
+    pub lr_lock: Lock
+    pub lr_err:  string
+end
+
+pub fn lock_file_name() -> string is return ".hackeros-builder.lock" end
+
+pub fn acquire(work_dir: string) -> LockRes is
+    let none: Lock = Lock { lk_fd: -1, lk_path: "" }
+    let e: string = fsx::mkdir_p(work_dir)
+    if e != "" is return LockRes { lr_lock: none, lr_err: "buildlock: nie mozna utworzyc " + work_dir + ": " + e } end
+    let lock_path: string = fsx::join(work_dir, lock_file_name())
+    let fd: int = sysc::flock_try(lock_path)
+    if fd == -2 is
+        return LockRes { lr_lock: none, lr_err: "buildlock: nie mozna otworzyc " + lock_path + ": permission denied" }
+    end
+    if fd == -1 is
+        return LockRes { lr_lock: none, lr_err: "buildlock: katalog roboczy " + ui_quote(work_dir) + " jest juz uzywany przez inny build hackeros-builder (nie mozna uzyskac blokady " + lock_path + ": resource temporarily unavailable). Uzyj innego --workdir dla rownoleglych buildow, albo zaczekaj na zakonczenie poprzedniego" }
+    end
+    fs_write(lock_path, to_string(sysc::pid()) + "\n")
+    return LockRes { lr_lock: Lock { lk_fd: fd, lk_path: lock_path }, lr_err: "" }
+end
+
+fn ui_quote(s: string) -> string is
+    return "\"" + string_replace(string_replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+end
+
+;; Zwalnia blokade (bezpieczne dla pustej blokady i wielokrotnego wolania).
+pub fn release(l: Lock) is
+    if l.lk_fd < 0 is return end
+    sysc::flock_release(l.lk_fd)
+end
