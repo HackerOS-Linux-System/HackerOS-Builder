@@ -1,0 +1,168 @@
+use "std -> env"
+mod sysc
+mod ui
+mod fsx
+mod proc
+mod buildflow
+mod usage_asset
+
+fn version() -> string is return "0.10.0" end
+
+fn is_valid_subcommand(s: string) -> bool is
+    return s == "cloud" || s == "iso" || s == "all" || s == "container"
+end
+
+fn print_usage() is
+    let mut t: string = usage_asset::usage_template()
+    t = string_replace(t, "@S1@", ui::bold("hackeros-builder"))
+    t = string_replace(t, "@S2@", version())
+    t = string_replace(t, "@S3@", ui::bold("Uzycie:"))
+    t = string_replace(t, "@S4@", ui::bold("Komendy:"))
+    t = string_replace(t, "@S5@", ui::bold("Opcje globalne:"))
+    t = string_replace(t, "@S6@", ui::bold("Struktura projektu (identyczna jak live-build, plus config/config.hk):"))
+    io_print(t)
+    io_flush()
+end
+
+fn fail(msg: string) is
+    ui::error_box("hackeros-builder", msg)
+    sysc::die(1)
+end
+
+fn run_clean(abs_work: string, abs_iso: string, all: bool) is
+    if fsx::exists(abs_work) is
+        ui::info("Usuwanie katalogu roboczego: " + abs_work)
+        let e: string = fsx::remove_all(abs_work)
+        if e != "" is fail("nie mozna usunac katalogu roboczego " + abs_work + ": " + e) end
+    else is
+        ui::info("Katalog roboczy " + abs_work + " juz nie istnieje -- pomijam")
+    end
+    if !all is
+        write(ui::green("Wyczyszczono.") + " (uzyj 'clean --all' by usunac rowniez wynikowy plik .iso)")
+        return
+    end
+    if fsx::exists(abs_iso) is
+        ui::info("Usuwanie wynikowego pliku ISO: " + abs_iso)
+        if sysc::make_unlink(abs_iso) != 0 is fail("nie mozna usunac " + abs_iso + ": operation not permitted") end
+    else is
+        ui::info("Plik ISO " + abs_iso + " juz nie istnieje -- pomijam")
+    end
+    write(ui::green("Wyczyszczono (--all):") + " katalog roboczy i plik ISO")
+end
+
+fn need_arg(args: [string], i: int, flag: string) -> string is
+    if i >= array_len(args) is
+        fail("opcja " + flag + " wymaga argumentu")
+    end
+    return args[i]
+end
+
+fn main() is
+    ui::init()
+    let args: [string] = env::args()
+    let mut verbose: bool = false
+    let mut project_dir: string = "."
+    let mut work_dir: string = "./build"
+    let mut output_iso: string = "./output.iso"
+    let mut insecure: bool = false
+    let mut skip_preflight: bool = false
+    let mut no_installer: bool = false
+    let mut clean_all: bool = false
+    let mut local_only: bool = false
+    let mut positional: [string] = []
+    let mut i: int = 1
+    while i < array_len(args) is
+        let a: string = args[i]
+        if a == "-v" || a == "--verbose" is
+            verbose = true
+        else if a == "-p" || a == "--project" is
+            i += 1
+            project_dir = need_arg(args, i, "--project")
+        else if a == "-w" || a == "--workdir" is
+            i += 1
+            work_dir = need_arg(args, i, "--workdir")
+        else if a == "-o" || a == "--output" is
+            i += 1
+            output_iso = need_arg(args, i, "--output")
+        else if a == "--insecure-registry" is
+            insecure = true
+        else if a == "--skip-preflight" is
+            skip_preflight = true
+        else if a == "--no-installer" is
+            no_installer = true
+        else if a == "--local-only" is
+            local_only = true
+        else if a == "--all" is
+            clean_all = true
+        else if a == "-h" || a == "--help" || a == "help" is
+            print_usage()
+            sysc::die(0)
+        else if a == "-V" || a == "--version" is
+            write("hackeros-builder " + version())
+            sysc::die(0)
+        else is
+            positional = array_push(positional, a)
+        end
+        i += 1
+    end
+    ui::set_verbose(verbose)
+    if insecure is
+        ui::warn("--insecure-registry jest wlaczone -- weryfikacja TLS dla registry OCI jest WYLACZONA. Uzywaj tylko dla zaufanych, wewnetrznych registry testowych.")
+    end
+    if array_len(positional) == 1 && positional[0] == "clean" is
+        if sysc::euid() != 0 is
+            fail("hackeros-builder clean wymaga uprawnien roota (pliki w katalogu roboczym sa wlasnoscia roota)")
+        end
+        run_clean(fsx::abs(work_dir), fsx::abs(output_iso), clean_all)
+        sysc::die(0)
+    end
+    let mut subcommand: string = ""
+    if array_len(positional) == 2 && positional[0] == "build" is
+        subcommand = positional[1]
+    else if array_len(positional) == 1 is
+        subcommand = positional[0]
+    else if array_len(positional) == 0 is
+        print_usage()
+        sysc::die(1)
+    else is
+        fail("nieprawidlowa liczba argumentow (" + to_string(array_len(positional)) + ") -- oczekiwano 'build <cloud|iso|all>' albo skroconej formy '<cloud|iso|all>'. Zobacz --help.")
+    end
+    if !is_valid_subcommand(subcommand) is
+        fail("nieznana komenda " + ui::quote(subcommand) + " -- poprawne opcje to: cloud, iso, all (z opcjonalnym prefiksem 'build'). Zobacz --help.")
+    end
+    let abs_project: string = fsx::abs(project_dir)
+    let abs_work: string = fsx::abs(work_dir)
+    let abs_iso: string = fsx::abs(output_iso)
+    let config_path: string = fsx::join(fsx::join(abs_project, "config"), "config.hk")
+    if !fsx::exists(config_path) is
+        fail("nie znaleziono " + config_path + "\n  Sprawdzane w katalogu projektu: " + abs_project + "\n  Jesli odpalasz z wnetrza katalogu 'config/', wyjdz jeden poziom wyzej:\n    cd .. && sudo hackeros-builder " + subcommand + "\n  albo wskaz katalog projektu explicite:\n    sudo hackeros-builder " + subcommand + " --project /sciezka/do/projektu")
+    end
+    if sysc::euid() != 0 is
+        fail("hackeros-builder wymaga uprawnien roota (debootstrap/chroot/mount)")
+    end
+    if subcommand == "cloud" is
+        let r: buildflow::CloudResult = buildflow::build_cloud(buildflow::CloudOptions { co_project_dir: abs_project, co_work_dir: abs_work, co_insecure: insecure, co_skip_preflight: skip_preflight, co_skip_lock: false })
+        if r.cr_err != "" is fail(r.cr_err) end
+        write("")
+        write(ui::green("Obraz OCI wypchniety:") + " " + r.cr_repository + ":" + r.cr_tag)
+        write("Origin refspec dla hammer: " + r.cr_refspec)
+    else if subcommand == "iso" is
+        let e: string = buildflow::build_iso(buildflow::IsoOptions { io_project_dir: abs_project, io_work_dir: abs_work, io_output_iso: abs_iso, io_repository: "", io_tag: "", io_insecure: insecure, io_skip_preflight: skip_preflight, io_skip_installer: no_installer })
+        if e != "" is fail(e) end
+        write("")
+        write(ui::green("ISO zbudowane:") + " " + abs_iso)
+    else if subcommand == "all" is
+        let e2: string = buildflow::build_all(buildflow::AllOptions { ao_project_dir: abs_project, ao_work_dir: abs_work, ao_output_iso: abs_iso, ao_insecure: insecure, ao_skip_installer: no_installer })
+        if e2 != "" is fail(e2) end
+        write("")
+        write(ui::green("Build all zakonczony.") + " ISO: " + abs_iso)
+    else is
+        let c: buildflow::ContainerResult = buildflow::build_container(buildflow::ContainerOptions { ct_project_dir: abs_project, ct_work_dir: abs_work, ct_local_only: local_only, ct_insecure: insecure, ct_skip_preflight: skip_preflight, ct_skip_lock: false })
+        if c.cn_err != "" is fail(c.cn_err) end
+        write("")
+        write(ui::green("Kontener roboczy gotowy:") + " " + c.cn_archive)
+        write("Zaladuj:  podman load -i " + c.cn_archive + "   (albo: docker load -i " + c.cn_archive + ")")
+        write("Uruchom:  podman run -it --rm " + c.cn_repository + ":" + c.cn_tag)
+        if c.cn_pushed is write("Wypchniety rowniez do registry: " + c.cn_repository + ":" + c.cn_tag) end
+    end
+end
