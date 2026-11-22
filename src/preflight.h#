@@ -1,0 +1,76 @@
+mod proc
+mod strx
+
+fn cloud_tools() -> [string] is
+    return [
+        "unshare|util-linux|sandbox: izolacja namespace mount/PID/UTS dla operacji w chroot",
+        "dpkg-deb|dpkg|toolchain: rozpakowywanie .deb narzedzi build-time bez instalacji na hoscie",
+        "curl|curl|obraz OCI: rozmowa z registry (push/pull blobow i manifestow)",
+        "tar|tar|obraz OCI: pakowanie/rozpakowywanie warstw",
+        "gzip|gzip|obraz OCI: kompresja warstw",
+        "sha256sum|coreutils|obraz OCI: skroty SHA256 warstw i konfiguracji",
+        "find|findutils|obraz OCI: migawki drzewa rootfs miedzy warstwami",
+    ]
+end
+
+fn iso_tools() -> [string] is
+    return [
+        "mksquashfs|squashfs-tools|build iso: pakowanie rootfs do filesystem.squashfs",
+        "grub-mkrescue|grub-pc-bin lub grub-efi-amd64-bin|build iso: budowa hybrydowego ISO BIOS+UEFI",
+        "xorriso|xorriso|build iso: tworzenie obrazu ISO (uzywane wewnetrznie przez grub-mkrescue)",
+        "curl|curl|obraz OCI: sciaganie warstw z registry",
+        "tar|tar|obraz OCI: rozpakowywanie warstw",
+        "gzip|gzip|obraz OCI: dekompresja warstw",
+        "sha256sum|coreutils|obraz OCI: weryfikacja skrotow SHA256 warstw",
+    ]
+end
+
+pub fn check_cloud() -> string is return check_tools(cloud_tools()) end
+pub fn check_iso() -> string is return check_tools(iso_tools()) end
+pub fn check_all() -> string is return check_tools(strx::concat(cloud_tools(), iso_tools())) end
+
+fn pad16(s: string) -> string is
+    let n: int = string_len(s)
+    if n >= 16 is return s end
+    return s + string_repeat(" ", 16 - n)
+end
+
+;; "" gdy wszystko jest, inaczej komunikat z lista brakujacych narzedzi (posortowana po nazwie binarki).
+pub fn check_tools(tools: [string]) -> string is
+    let mut seen: [string] = []
+    let mut missing_bins: [string] = []
+    let mut i: int = 0
+    while i < array_len(tools) is
+        let f: [string] = string_split(tools[i], "|")
+        i += 1
+        if !strx::contains(seen, f[0]) is
+            seen = array_push(seen, f[0])
+            if !proc::tool_exists(f[0]) is missing_bins = array_push(missing_bins, f[0]) end
+        end
+    end
+    if array_len(missing_bins) == 0 is return "" end
+    let sorted: [string] = strx::sort_strings(missing_bins)
+    let mut msg: string = "brakuje " + to_string(array_len(sorted)) + " wymaganych narzedzi w $PATH:\n"
+    let mut pkgs: [string] = []
+    let mut k: int = 0
+    while k < array_len(sorted) is
+        let mut j: int = 0
+        while j < array_len(tools) is
+            let f: [string] = string_split(tools[j], "|")
+            if f[0] == sorted[k] is
+                msg = msg + "  - " + pad16(f[0]) + " (uzywane przez: " + f[2] + ")\n"
+                if !strx::contains(pkgs, f[1]) is pkgs = array_push(pkgs, f[1]) end
+                j = array_len(tools)
+            end
+            j += 1
+        end
+        k += 1
+    end
+    msg = msg + "\nZainstaluj brakujace pakiety:\n  sudo apt install"
+    let mut p: int = 0
+    while p < array_len(pkgs) is
+        msg = msg + " " + pkgs[p]
+        p += 1
+    end
+    return msg
+end
