@@ -1,0 +1,135 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+
+pub fn noninteractive_env() -> [string] is
+    return [
+        "DEBIAN_FRONTEND=noninteractive",
+        "DEBCONF_NONINTERACTIVE_SEEN=true",
+        "DEBCONF_NOWARNINGS=yes",
+        "LC_ALL=C",
+        "LANG=C",
+        "LANGUAGE=C",
+        "NEEDRESTART_MODE=a",
+        "NEEDRESTART_SUSPEND=1",
+        "UCF_FORCE_CONFFOLD=1",
+        "APT_LISTCHANGES_FRONTEND=none",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]
+end
+
+pub fn default_hook_timeout_secs() -> int is return 1200 end
+
+;; time.Duration.String() dla calych sekund: 45s, 1m30s, 20m0s, 1h0m0s
+pub fn format_duration(secs: int) -> string is
+    if secs < 60 is return to_string(secs) + "s" end
+    let h: int = secs / 3600
+    let m: int = (secs % 3600) / 60
+    let s: int = secs % 60
+    if h > 0 is return to_string(h) + "h" + to_string(m) + "m" + to_string(s) + "s" end
+    return to_string(m) + "m" + to_string(s) + "s"
+end
+
+;; Skrypt montujacy proc/sys/dev i robiacy chroot - identyczny jak w wersji Go.
+pub fn mount_and_chroot_script(rootfs: string, args: [string]) -> string is
+    let q_rootfs: string = proc::sq(rootfs)
+    let q_cmd: string = proc::sq(args[0])
+    let mut q_args: string = ""
+    let mut i: int = 1
+    while i < array_len(args) is
+        if i > 1 is q_args = q_args + " " end
+        q_args = q_args + proc::sq(args[i])
+        i += 1
+    end
+    return "set -e\nROOTFS=" + q_rootfs + "\nmount -t proc    proc       \"$ROOTFS/proc\"\nmount -t sysfs   sysfs      \"$ROOTFS/sys\"\nmount --bind     /dev       \"$ROOTFS/dev\"\nmount --bind     /dev/pts   \"$ROOTFS/dev/pts\"\n_cleanup() {{\n    umount -l \"$ROOTFS/dev/pts\" 2>/dev/null || true\n    umount -l \"$ROOTFS/dev\"     2>/dev/null || true\n    umount -l \"$ROOTFS/sys\"     2>/dev/null || true\n    umount -l \"$ROOTFS/proc\"    2>/dev/null || true\n}}\ntrap _cleanup EXIT\nexec chroot \"$ROOTFS\" " + q_cmd + " " + q_args + "\n"
+end
+
+fn ensure_mount_points(rootfs: string) -> string is
+    let subs: [string] = ["proc", "sys", "dev", "dev/pts"]
+    let mut i: int = 0
+    while i < array_len(subs) is
+        let e: string = fsx::mkdir_p(fsx::join(rootfs, subs[i]))
+        if e != "" is return "sandbox: mkdir " + subs[i] + " w rootfs: " + e end
+        i += 1
+    end
+    return ""
+end
+
+;; Linia polecenia: [timeout -s KILL N] unshare ... sh -e -c <script>
+pub fn unshare_line(rootfs: string, extra_env: [string], timeout_secs: int, args: [string]) -> string is
+    let script: string = mount_and_chroot_script(rootfs, args)
+    let env: [string] = strx_concat(noninteractive_env(), extra_env)
+    let mut line: string = proc::prefix("", env)
+    ;; sciezki rozwiazujemy w PATH hosta (z toolchain), bo `env PATH=...` zmieniloby ich wyszukiwanie
+    let unshare_bin: string = proc::look_path("unshare")
+    let timeout_bin: string = proc::look_path("timeout")
+    if timeout_secs > 0 is line = line + (if timeout_bin == "" then "timeout" else timeout_bin) + " -s KILL " + to_string(timeout_secs) + " " end
+    line = line + (if unshare_bin == "" then "unshare" else unshare_bin) + " --mount --pid --fork --uts --kill-child sh -e -c " + proc::sq(script)
+    return line
+end
+
+fn strx_concat(a: [string], b: [string]) -> [string] is
+    let mut out: [string] = a
+    let mut i: int = 0
+    while i < array_len(b) is
+        out = array_push(out, b[i])
+        i += 1
+    end
+    return out
+end
+
+fn exec_internal(rootfs: string, extra_env: [string], stdin_data: string, has_stdin: bool, timeout_secs: int, args: [string]) -> string is
+    let e: string = ensure_mount_points(rootfs)
+    if e != "" is return e end
+    let mut line: string = unshare_line(rootfs, extra_env, timeout_secs, args)
+    let mut inp: string = ""
+    if has_stdin is
+        inp = proc::tmp_path("sbin")
+        fs_write(inp, stdin_data)
+        line = line + " <" + proc::sq(inp)
+    end
+    let rc: int = sysc::sh(line)
+    if has_stdin is fsx::remove(inp) end
+    if timeout_secs > 0 && rc == 137 is
+        return "przekroczono limit czasu (" + format_duration(timeout_secs) + ") na wykonanie " + ui::quote(args[0])
+    end
+    if rc != 0 is
+        return "sandbox: exec " + ui::quote(args[0]) + " w " + rootfs + " nie powiodl sie: exit status " + to_string(rc)
+    end
+    return ""
+end
+
+;; args[0] = komenda w chroot, reszta = argumenty. "" = OK.
+pub fn exec(rootfs: string, args: [string]) -> string is
+    return exec_internal(rootfs, [], "", false, 0, args)
+end
+
+pub fn exec_env(rootfs: string, extra_env: [string], args: [string]) -> string is
+    return exec_internal(rootfs, extra_env, "", false, 0, args)
+end
+
+pub fn exec_with_stdin(rootfs: string, stdin_data: string, args: [string]) -> string is
+    return exec_internal(rootfs, [], stdin_data, true, 0, args)
+end
+
+;; Hook z limitem czasu (HACKEROS_HOOK_TIMEOUT_SECONDS nadpisuje domyslne 20 minut).
+pub fn exec_hook(rootfs: string, hook_path: string) -> string is
+    let mut t: int = default_hook_timeout_secs()
+    let v: string = env_get("HACKEROS_HOOK_TIMEOUT_SECONDS")
+    if v != "" is
+        let n: int = str_to_int(v)
+        if n > 0 && to_string(n) == v is t = n end
+    end
+    return exec_internal(rootfs, [], "", false, t, [hook_path])
+end
+
+;; ExecWithLines: uruchamia w tle (stdout -> log zadania, stderr na terminal). Wolajacy polluje zadanie.
+pub fn start_with_lines(rootfs: string, extra_env: [string], args: [string]) -> proc::Job is
+    let e: string = ensure_mount_points(rootfs)
+    if e != "" is
+        ;; zadanie, ktore od razu konczy sie bledem
+        return proc::job_start_out("echo " + proc::sq(e) + " >&2; exit 1")
+    end
+    return proc::job_start_out(unshare_line(rootfs, extra_env, 0, args))
+end
