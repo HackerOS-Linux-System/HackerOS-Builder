@@ -1,0 +1,742 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod jsonx
+mod strx
+mod prog
+mod net
+mod registry
+
+pub struct Image is
+    pub im_dir:        string
+    pub im_layers:     [string]
+    pub im_digests:    [string]
+    pub im_diffids:    [string]
+    pub im_sizes:      [int]
+    pub im_cfg_path:   string
+    pub im_cfg_digest: string
+    pub im_cfg_size:   int
+    pub im_man_path:   string
+    pub im_man_size:   int
+end
+
+pub struct ImageRes is
+    pub ir_img: Image
+    pub ir_err: string
+end
+
+fn empty_image() -> Image is
+    return Image { im_dir: "", im_layers: [], im_digests: [], im_diffids: [], im_sizes: [], im_cfg_path: "", im_cfg_digest: "", im_cfg_size: 0, im_man_path: "", im_man_size: 0 }
+end
+
+pub fn max_pull_attempts() -> int is return 4 end
+pub fn container_default_path() -> string is return "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" end
+
+fn first_line(s: string) -> string is
+    let t: string = string_trim(s)
+    let nl: int = string_find(t, "\n")
+    if nl < 0 is return t end
+    return string_slice(t, 0, nl)
+end
+
+;; ============================ WARSTWY ============================
+
+;; createLayerTarball: pakuje CALE drzewo rootfs do tar.gz (wpisy bez prefiksu "./", katalogi z "/" na koncu).
+pub fn create_layer_tarball(rootfs: string, dest: string) -> string is
+    let list: string = proc::tmp_path("top") + ".list"
+    let rcf: string = proc::tmp_path("tarrc")
+    sysc::sh("cd " + proc::sq(rootfs) + " && find . -mindepth 1 -maxdepth 1 -printf '%P\\0' | LC_ALL=C sort -z > " + proc::sq(list))
+    let rc: int = if fsx::file_size_of(list) == 0 then run_empty_layer(dest) else run_tar_layer(rootfs, list, dest, rcf)
+    let trc: string = string_trim(proc::read_file_or_empty(rcf))
+    sysc::sh("rm -f " + proc::sq(list) + " " + proc::sq(rcf))
+    if rc != 0 || (trc != "" && str_to_int(trc) > 1) is
+        fsx::remove(dest)
+        return "tar rootfs " + rootfs + ": blad (kod gzip " + to_string(rc) + ", kod tar " + trc + ")"
+    end
+    return ""
+end
+
+fn run_empty_layer(dest: string) -> int is
+    return sysc::sh("head -c 10240 /dev/zero | gzip -n -c > " + proc::sq(dest))
+end
+
+fn run_tar_layer(rootfs: string, list: string, dest: string, rcf: string) -> int is
+    let tar: string = "tar --create --format=gnu --sort=name --hard-dereference --null --verbatim-files-from -C " + proc::sq(rootfs) + " -T " + proc::sq(list)
+    return sysc::sh("{ " + tar + " 2>/dev/null; echo $? > " + proc::sq(rcf) + "; } | gzip -n -c > " + proc::sq(dest))
+end
+
+;; validateLayerTarball: "" gdy warstwa jest poprawnym, niepustym tar.gz
+pub fn validate_layer(path: string) -> string is
+    if !file_exists(path) is return "otwarcie: open " + path + ": no such file or directory" end
+    let lst: string = proc::tmp_path("val") + ".lst"
+    let se: string = proc::tmp_path("vale")
+    let rc: int = sysc::sh("gzip -t " + proc::sq(path) + " 2>" + proc::sq(se))
+    if rc != 0 is
+        let e: string = first_line(proc::read_file_or_empty(se))
+        sysc::sh("rm -f " + proc::sq(lst) + " " + proc::sq(se))
+        if string_contains(e, "not in gzip format") is return "naglowek gzip: gzip: invalid header" end
+        return "weryfikacja trailera gzip: " + e
+    end
+    let trc: int = sysc::sh("tar -tzf " + proc::sq(path) + " > " + proc::sq(lst) + " 2>" + proc::sq(se))
+    let terr: string = first_line(proc::read_file_or_empty(se))
+    let n_txt: string = string_trim(shell("wc -l < " + proc::sq(lst) + " 2>/dev/null"))
+    sysc::sh("rm -f " + proc::sq(lst) + " " + proc::sq(se))
+    let entries: int = if n_txt == "" then 0 else str_to_int(n_txt)
+    if trc != 0 is return "naglowek tar wpisu #" + to_string(entries + 1) + ": " + terr end
+    if entries == 0 is
+        return "warstwa jest pusta (0 wpisow) -- prawdopodobnie rootfs nie zostal poprawnie zbudowany"
+    end
+    return ""
+end
+
+;; ============================ OBRAZ ============================
+
+fn sha256_stdin_of(cmd: string) -> string is
+    let out: string = shell(cmd + " | sha256sum")
+    let f: [string] = string_split(string_trim(out), " ")
+    return f[0]
+end
+
+;; Buduje metadane obrazu (config + manifest) z gotowych warstw tar.gz. container_defaults: Cmd/Env/WorkingDir.
+pub fn build_image(layer_paths: [string], container_defaults: bool) -> ImageRes is
+    let dir: string = proc::tmp_path("img")
+    let e: string = fsx::mkdir_p(dir)
+    if e != "" is return ImageRes { ir_img: empty_image(), ir_err: e } end
+    let mut digests: [string] = []
+    let mut diffids: [string] = []
+    let mut sizes: [int] = []
+    let mut i: int = 0
+    while i < array_len(layer_paths) is
+        let p: string = layer_paths[i]
+        let dg: string = net::sha256_file(p)
+        if dg == "" is return ImageRes { ir_img: empty_image(), ir_err: "tarball.LayerFromFile(" + p + "): nie mozna policzyc sha256" } end
+        let df: string = sha256_stdin_of("gzip -dc " + proc::sq(p))
+        digests = array_push(digests, "sha256:" + dg)
+        diffids = array_push(diffids, "sha256:" + df)
+        sizes = array_push(sizes, fsx::file_size_of(p))
+        i += 1
+    end
+    let mut diff_json: string = ""
+    let mut hist_json: string = ""
+    let mut k: int = 0
+    while k < array_len(diffids) is
+        if k > 0 is
+            diff_json = diff_json + ","
+            hist_json = hist_json + ","
+        end
+        diff_json = diff_json + "\"" + diffids[k] + "\""
+        hist_json = hist_json + "{{\"created\":\"1970-01-01T00:00:00Z\"}}"
+        k += 1
+    end
+    let mut cfg_sect: string = "{{}}"
+    if container_defaults is
+        cfg_sect = "{{\"Cmd\":[\"/bin/bash\"],\"Env\":[" + jsonx::quote(container_default_path()) + "],\"WorkingDir\":\"/root\"}}"
+    end
+    let cfg: string = "{{\"architecture\":\"amd64\",\"config\":" + cfg_sect + ",\"created\":\"1970-01-01T00:00:00Z\",\"history\":[" + hist_json + "],\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[" + diff_json + "]}}}}"
+    let cfg_path: string = fsx::join(dir, "config.json")
+    fs_write(cfg_path, cfg)
+    let cfg_hex: string = net::sha256_file(cfg_path)
+    let cfg_size: int = fsx::file_size_of(cfg_path)
+    let mut layers_json: string = ""
+    let mut j: int = 0
+    while j < array_len(digests) is
+        if j > 0 is layers_json = layers_json + "," end
+        layers_json = layers_json + "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":" + to_string(sizes[j]) + ",\"digest\":\"" + digests[j] + "\"}}"
+        j += 1
+    end
+    let man: string = "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":" + to_string(cfg_size) + ",\"digest\":\"sha256:" + cfg_hex + "\"}},\"layers\":[" + layers_json + "]}}"
+    let man_path: string = fsx::join(dir, "manifest.json")
+    fs_write(man_path, man)
+    let img: Image = Image { im_dir: dir, im_layers: layer_paths, im_digests: digests, im_diffids: diffids, im_sizes: sizes, im_cfg_path: cfg_path, im_cfg_digest: "sha256:" + cfg_hex, im_cfg_size: cfg_size, im_man_path: man_path, im_man_size: fsx::file_size_of(man_path) }
+    return ImageRes { ir_img: img, ir_err: "" }
+end
+
+pub fn image_free(img: Image) is
+    if img.im_dir != "" is fsx::remove_all(img.im_dir) end
+end
+
+;; ============================ PUSH ============================
+
+fn chunk_size() -> int is return 8388608 end
+
+fn abs_location(reg: registry::Reg, loc: string) -> string is
+    if string_starts_with(loc, "http://") || string_starts_with(loc, "https://") is return loc end
+    return reg.rg_base + loc
+end
+
+fn with_digest(loc: string, digest: string) -> string is
+    if string_contains(loc, "?") is return loc + "&digest=" + digest end
+    return loc + "?digest=" + digest
+end
+
+fn transient(r: registry::Resp) -> bool is
+    return r.rs_err != "" || r.rs_status == 429 || r.rs_status >= 500
+end
+
+;; Zadanie z ponowieniami dla bledow przejsciowych (jak wewnetrzny retry ggcr).
+fn request_retry(reg: registry::Reg, method: string, url: string, headers: [string], body: string, follow: bool, tmo: int) -> registry::Resp is
+    let mut attempt: int = 1
+    let mut r: registry::Resp = registry::request(reg, method, url, headers, body, follow, tmo)
+    while transient(r) && attempt < 3 is
+        registry::resp_free(r)
+        sleep_ms(1000 * attempt)
+        attempt += 1
+        r = registry::request(reg, method, url, headers, body, follow, tmo)
+    end
+    return r
+end
+
+pub struct BlobRes is
+    pub bl_err: string
+    pub bl_bar: prog::Bar
+end
+
+;; Wysyla jeden blob (pomija istniejacy). Aktualizuje pasek o liczbe bajtow warstwy.
+fn push_blob(reg: registry::Reg, digest: string, file: string, size: int, bar: prog::Bar, base_done: int, count_in_bar: bool) -> BlobRes is
+    let mut b: prog::Bar = bar
+    let hu: string = registry::blob_url(reg, digest)
+    let head: registry::Resp = request_retry(reg, "HEAD", hu, [], "", false, 60)
+    let exists: bool = head.rs_status == 200
+    registry::resp_free(head)
+    if exists is
+        if count_in_bar is b = prog::set(b, base_done + size) end
+        return BlobRes { bl_err: "", bl_bar: b }
+    end
+    let up_url: string = reg.rg_base + "/v2/" + reg.rg_repo + "/blobs/uploads/"
+    let post: registry::Resp = request_retry(reg, "POST", up_url, ["Content-Length: 0"], "", false, 300)
+    if post.rs_err != "" is
+        registry::resp_free(post)
+        return BlobRes { bl_err: post.rs_err, bl_bar: b }
+    end
+    if post.rs_status != 202 is
+        let e: string = registry::status_error("POST", up_url, post)
+        registry::resp_free(post)
+        return BlobRes { bl_err: e, bl_bar: b }
+    end
+    let mut loc: string = abs_location(reg, registry::header_of(post, "location"))
+    registry::resp_free(post)
+    if loc == "" is return BlobRes { bl_err: "POST " + up_url + ": brak naglowka Location", bl_bar: b } end
+    if size <= chunk_size() is
+        let put: registry::Resp = request_retry(reg, "PUT", with_digest(loc, digest), ["Content-Type: application/octet-stream"], file, false, 600)
+        if put.rs_err != "" is
+            registry::resp_free(put)
+            return BlobRes { bl_err: put.rs_err, bl_bar: b }
+        end
+        if put.rs_status != 201 && put.rs_status != 200 is
+            let e2: string = registry::status_error("PUT", loc, put)
+            registry::resp_free(put)
+            return BlobRes { bl_err: e2, bl_bar: b }
+        end
+        registry::resp_free(put)
+        if count_in_bar is b = prog::set(b, base_done + size) end
+        return BlobRes { bl_err: "", bl_bar: b }
+    end
+    let chunk_file: string = proc::tmp_path("chunk")
+    let mut off: int = 0
+    let mib: int = 1048576
+    let cs_mib: int = chunk_size() / mib
+    while off < size is
+        let n: int = if size - off < chunk_size() then size - off else chunk_size()
+        let rc: int = sysc::sh("dd if=" + proc::sq(file) + " of=" + proc::sq(chunk_file) + " bs=" + to_string(mib) + " skip=" + to_string(off / mib) + " count=" + to_string(cs_mib) + " 2>/dev/null")
+        if rc != 0 is
+            fsx::remove(chunk_file)
+            return BlobRes { bl_err: "odczyt fragmentu " + file + ": dd zakonczone kodem " + to_string(rc), bl_bar: b }
+        end
+        let hdrs: [string] = ["Content-Type: application/octet-stream", "Content-Range: " + to_string(off) + "-" + to_string(off + n - 1)]
+        let patch: registry::Resp = request_retry(reg, "PATCH", loc, hdrs, chunk_file, false, 600)
+        if patch.rs_err != "" is
+            registry::resp_free(patch)
+            fsx::remove(chunk_file)
+            return BlobRes { bl_err: patch.rs_err, bl_bar: b }
+        end
+        if patch.rs_status != 202 is
+            let e3: string = registry::status_error("PATCH", loc, patch)
+            registry::resp_free(patch)
+            fsx::remove(chunk_file)
+            return BlobRes { bl_err: e3, bl_bar: b }
+        end
+        let nloc: string = registry::header_of(patch, "location")
+        registry::resp_free(patch)
+        if nloc != "" is loc = abs_location(reg, nloc) end
+        off = off + n
+        if count_in_bar is b = prog::set(b, base_done + off) end
+    end
+    fsx::remove(chunk_file)
+    let fin: registry::Resp = request_retry(reg, "PUT", with_digest(loc, digest), ["Content-Length: 0", "Content-Type: application/octet-stream"], "", false, 600)
+    if fin.rs_err != "" is
+        registry::resp_free(fin)
+        return BlobRes { bl_err: fin.rs_err, bl_bar: b }
+    end
+    if fin.rs_status != 201 && fin.rs_status != 200 is
+        let e4: string = registry::status_error("PUT", loc, fin)
+        registry::resp_free(fin)
+        return BlobRes { bl_err: e4, bl_bar: b }
+    end
+    registry::resp_free(fin)
+    return BlobRes { bl_err: "", bl_bar: b }
+end
+
+;; pushWithProgress: "" = OK, inaczej "push do <ref> nie powiodl sie: <blad>"
+fn push_with_progress(r: registry::RegRef, img: Image, token: string, insecure: bool, total_bytes: int) -> string is
+    let mut bar: prog::Bar = prog::new("push OCI", total_bytes, "bajtow")
+    let lg: registry::LoginRes = registry::login(r, token, "push,pull", insecure)
+    if lg.lg_err != "" is
+        bar = prog::fail(bar, "push do registry")
+        return "push do " + r.rf_orig + " nie powiodl sie: " + lg.lg_err
+    end
+    let reg: registry::Reg = lg.lg_reg
+    let mut done: int = 0
+    let mut i: int = 0
+    while i < array_len(img.im_layers) is
+        let br: BlobRes = push_blob(reg, img.im_digests[i], img.im_layers[i], img.im_sizes[i], bar, done, true)
+        bar = br.bl_bar
+        if br.bl_err != "" is
+            bar = prog::fail(bar, "push do registry")
+            registry::logout(reg)
+            return "push do " + r.rf_orig + " nie powiodl sie: " + br.bl_err
+        end
+        done = done + img.im_sizes[i]
+        i += 1
+    end
+    let cr: BlobRes = push_blob(reg, img.im_cfg_digest, img.im_cfg_path, img.im_cfg_size, bar, done, false)
+    bar = cr.bl_bar
+    if cr.bl_err != "" is
+        bar = prog::fail(bar, "push do registry")
+        registry::logout(reg)
+        return "push do " + r.rf_orig + " nie powiodl sie: " + cr.bl_err
+    end
+    let mu: string = registry::manifest_url(reg, r.rf_ref)
+    let mr: registry::Resp = request_retry(reg, "PUT", mu, ["Content-Type: application/vnd.docker.distribution.manifest.v2+json"], img.im_man_path, false, 300)
+    if mr.rs_err != "" is
+        registry::resp_free(mr)
+        bar = prog::fail(bar, "push do registry")
+        registry::logout(reg)
+        return "push do " + r.rf_orig + " nie powiodl sie: " + mr.rs_err
+    end
+    if mr.rs_status != 201 && mr.rs_status != 200 is
+        let me: string = registry::status_error("PUT", mu, mr)
+        registry::resp_free(mr)
+        bar = prog::fail(bar, "push do registry")
+        registry::logout(reg)
+        return "push do " + r.rf_orig + " nie powiodl sie: " + me
+    end
+    registry::resp_free(mr)
+    registry::logout(reg)
+    bar = prog::finish(bar)
+    return ""
+end
+
+pub struct PushRes is
+    pub pu_ref: string
+    pub pu_err: string
+end
+
+fn push_fail(msg: string) -> PushRes is return PushRes { pu_ref: "", pu_err: msg } end
+
+pub fn total_size(paths: [string]) -> int is
+    let mut t: int = 0
+    let mut i: int = 0
+    while i < array_len(paths) is
+        t = t + fsx::file_size_of(paths[i])
+        i += 1
+    end
+    return t
+end
+
+;; BuildAndPushLayers
+pub fn build_and_push_layers(layer_paths: [string], repository: string, tag: string, token: string, insecure: bool) -> PushRes is
+    if array_len(layer_paths) == 0 is
+        return push_fail("brak warstw OCI do wypchniecia -- rootfs.Builder.Build() nie zaraportowal ani jednej zmiany, co nie powinno sie zdarzyc dla swiezo zbudowanego rootfs (sprawdz czy debootstrap faktycznie utworzyl jakiekolwiek pliki w RootfsDir)")
+    end
+    ui::info("Walidacja " + to_string(array_len(layer_paths)) + " warstw(y) OCI przed wypchnieciem...")
+    let mut i: int = 0
+    while i < array_len(layer_paths) is
+        let ve: string = validate_layer(layer_paths[i])
+        if ve != "" is
+            return push_fail("warstwa " + to_string(i + 1) + "/" + to_string(array_len(layer_paths)) + " (" + layer_paths[i] + ") jest uszkodzona: " + ve + " -- NIE wypychamy ZADNEJ warstwy do registry (obraz musi byc spojny w calosci)")
+        end
+        i += 1
+    end
+    let total: int = total_size(layer_paths)
+    ui::info("Budowanie obrazu OCI z " + to_string(array_len(layer_paths)) + " warstw (razem " + ui::format_bytes(total) + ")...")
+    let ir: ImageRes = build_image(layer_paths, false)
+    if ir.ir_err != "" is return push_fail("budowanie obrazu OCI: " + ir.ir_err) end
+    let ref_str: string = repository + ":" + tag
+    let r: registry::RegRef = registry::parse_reference(ref_str)
+    if r.rf_err != "" is
+        image_free(ir.ir_img)
+        return push_fail("nieprawidlowa referencja obrazu " + ui::quote(ref_str) + ": " + r.rf_err)
+    end
+    ui::info("Wypychanie obrazu do " + ref_str + "...")
+    let pe: string = push_with_progress(r, ir.ir_img, token, insecure, total)
+    image_free(ir.ir_img)
+    if pe != "" is return push_fail(pe) end
+    ui::info("Obraz wypchniety: " + ref_str + " (" + to_string(array_len(layer_paths)) + " warstw)")
+    return PushRes { pu_ref: ref_str, pu_err: "" }
+end
+
+;; BuildAndPush: jedna warstwa z calego rootfs
+pub fn build_and_push(rootfs: string, repository: string, tag: string, token: string, work_dir: string, insecure: bool) -> PushRes is
+    ui::info("Pakowanie rootfs do warstwy OCI...")
+    let layer: string = fsx::join(work_dir, "layer.tar.gz")
+    let ce: string = create_layer_tarball(rootfs, layer)
+    if ce != "" is return push_fail("tworzenie warstwy tar: " + ce) end
+    let ve: string = validate_layer(layer)
+    if ve != "" is
+        fsx::remove(layer)
+        return push_fail("zbudowana warstwa OCI jest uszkodzona (" + layer + "): " + ve + " -- NIE wypychamy jej do registry; sprawdz miejsce na dysku w " + work_dir + " i uruchom build ponownie")
+    end
+    ui::info("Budowanie obrazu OCI (v1.Image)...")
+    let ir: ImageRes = build_image([layer], false)
+    if ir.ir_err != "" is
+        fsx::remove(layer)
+        return push_fail("budowanie obrazu OCI: " + ir.ir_err)
+    end
+    let ref_str: string = repository + ":" + tag
+    let r: registry::RegRef = registry::parse_reference(ref_str)
+    if r.rf_err != "" is
+        image_free(ir.ir_img)
+        fsx::remove(layer)
+        return push_fail("nieprawidlowa referencja obrazu " + ui::quote(ref_str) + ": " + r.rf_err)
+    end
+    ui::info("Wypychanie obrazu do " + ref_str + "...")
+    let total: int = fsx::file_size_of(layer)
+    let pe: string = push_with_progress(r, ir.ir_img, token, insecure, total)
+    image_free(ir.ir_img)
+    fsx::remove(layer)
+    if pe != "" is return push_fail(pe) end
+    return PushRes { pu_ref: ref_str, pu_err: "" }
+end
+
+;; ============================ LOKALNE ARCHIWUM (docker-save) ============================
+
+;; SaveLocalArchive: "" = OK
+pub fn save_local_archive(rootfs: string, repository: string, tag: string, work_dir: string, output: string) -> string is
+    let me: string = fsx::mkdir_p(work_dir)
+    if me != "" is return "tworzenie katalogu roboczego " + work_dir + ": " + me end
+    ui::info("Pakowanie rootfs do warstwy OCI (kontener lokalny)...")
+    let layer: string = fsx::join(work_dir, "layer.tar.gz")
+    let ce: string = create_layer_tarball(rootfs, layer)
+    if ce != "" is return "tworzenie warstwy tar: " + ce end
+    let ve: string = validate_layer(layer)
+    if ve != "" is
+        fsx::remove(layer)
+        return "zbudowana warstwa OCI jest uszkodzona (" + layer + "): " + ve + " -- NIE zapisujemy lokalnego archiwum; sprawdz miejsce na dysku w " + work_dir + " i uruchom build ponownie"
+    end
+    ui::info("Budowanie obrazu OCI (v1.Image)...")
+    let ir: ImageRes = build_image([layer], true)
+    if ir.ir_err != "" is
+        fsx::remove(layer)
+        return "budowanie obrazu OCI: " + ir.ir_err
+    end
+    let ref_str: string = repository + ":" + tag
+    let r: registry::RegRef = registry::parse_reference(ref_str)
+    if r.rf_err != "" is
+        image_free(ir.ir_img)
+        fsx::remove(layer)
+        return "nieprawidlowa referencja obrazu " + ui::quote(ref_str) + ": " + r.rf_err
+    end
+    let de: string = fsx::mkdir_p(fsx::dirname(output))
+    if de != "" is
+        image_free(ir.ir_img)
+        fsx::remove(layer)
+        return "tworzenie katalogu docelowego " + fsx::dirname(output) + ": " + de
+    end
+    ui::info("Zapis lokalnego archiwum kontenera -> " + output)
+    let we: string = write_docker_archive(ir.ir_img, ref_str, output)
+    image_free(ir.ir_img)
+    fsx::remove(layer)
+    if we != "" is return "zapis archiwum " + output + ": " + we end
+    ui::info("Archiwum kontenera zapisane: " + output + " (" + ref_str + ")")
+    return ""
+end
+
+;; tarball.WriteToFile: config, warstwy <hex>.tar.gz, manifest.json (format "docker save")
+fn write_docker_archive(img: Image, ref_str: string, output: string) -> string is
+    let stage: string = fsx::join(img.im_dir, "stage")
+    let e: string = fsx::mkdir_p(stage)
+    if e != "" is return e end
+    let cfg_name: string = img.im_cfg_digest
+    sysc::sh("cp " + proc::sq(img.im_cfg_path) + " " + proc::sq(fsx::join(stage, cfg_name)))
+    let mut names: [string] = [cfg_name]
+    let mut layer_json: string = ""
+    let mut i: int = 0
+    while i < array_len(img.im_layers) is
+        let hex: string = strx::trim_prefix(img.im_digests[i], "sha256:")
+        let fname: string = hex + ".tar.gz"
+        sysc::sh("ln -sf " + proc::sq(fsx::abs(img.im_layers[i])) + " " + proc::sq(fsx::join(stage, fname)))
+        names = array_push(names, fname)
+        if i > 0 is layer_json = layer_json + "," end
+        layer_json = layer_json + jsonx::quote(fname)
+        i += 1
+    end
+    let manifest: string = "[{{\"Config\":" + jsonx::quote(cfg_name) + ",\"RepoTags\":[" + jsonx::quote(ref_str) + "],\"Layers\":[" + layer_json + "]}}]"
+    fs_write(fsx::join(stage, "manifest.json"), manifest)
+    names = array_push(names, "manifest.json")
+    let tmp_out: string = output + ".tmp"
+    let rc: int = sysc::sh("tar --create --force-local --dereference --owner=0 --group=0 --numeric-owner --mode=u=rw,go=r -C " + proc::sq(stage) + " -f " + proc::sq(tmp_out) + " " + proc::join_args(names) + " 2>/dev/null")
+    if rc != 0 is
+        fsx::remove(tmp_out)
+        return "tar zakonczone kodem " + to_string(rc)
+    end
+    let mv: string = proc::run_or_error(["mv", "-f", tmp_out, output])
+    if mv != "" is return mv end
+    return ""
+end
+
+;; ============================ PULL ============================
+
+pub fn is_retryable_transfer_err(msg: string) -> bool is
+    let m: string = string_lower(msg)
+    let needles: [string] = ["unexpected eof", "connection reset", "broken pipe", "timeout", "tls handshake", "i/o timeout", "eof", "temporary failure", "unexpected status code 429", "unexpected status code 500", "unexpected status code 502", "unexpected status code 503", "unexpected status code 504"]
+    let mut i: int = 0
+    while i < array_len(needles) is
+        if string_contains(m, needles[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
+pub struct LayerDesc is
+    pub ld_digest: string
+    pub ld_size:   int
+end
+
+pub struct ManifestRes is
+    pub mr_layers: [LayerDesc]
+    pub mr_err:    string
+end
+
+fn get_manifest_body(reg: registry::Reg, ref: string) -> string is
+    let url: string = registry::manifest_url(reg, ref)
+    let r: registry::Resp = request_retry(reg, "GET", url, [registry::accept_manifests()], "", true, 120)
+    if r.rs_err != "" is
+        registry::resp_free(r)
+        return "!" + r.rs_err
+    end
+    if r.rs_status != 200 is
+        let e: string = registry::status_error("GET", url, r)
+        registry::resp_free(r)
+        return "!" + e
+    end
+    let body: string = registry::read_body(r)
+    registry::resp_free(r)
+    return body
+end
+
+;; Rozwiazuje manifest (w razie indeksu wybiera linux/amd64) do listy warstw.
+fn resolve_layers(reg: registry::Reg, ref: string) -> ManifestRes is
+    let none: [LayerDesc] = []
+    let mut body: string = get_manifest_body(reg, ref)
+    if string_starts_with(body, "!") is return ManifestRes { mr_layers: none, mr_err: string_slice(body, 1, string_len(body)) } end
+    if jsonx::has(body, "manifests") && !jsonx::has(body, "layers") is
+        let n: int = jsonx::array_len_at(body, "manifests")
+        let mut chosen: string = ""
+        let mut i: int = 0
+        while i < n is
+            let p: string = "manifests." + to_string(i)
+            if jsonx::get(body, p + ".platform.os") == "linux" && jsonx::get(body, p + ".platform.architecture") == "amd64" && chosen == "" is
+                chosen = jsonx::get(body, p + ".digest")
+            end
+            i += 1
+        end
+        if chosen == "" is
+            return ManifestRes { mr_layers: none, mr_err: "no child with platform linux/amd64 in index " + reg.rg_repo + ":" + ref }
+        end
+        body = get_manifest_body(reg, chosen)
+        if string_starts_with(body, "!") is return ManifestRes { mr_layers: none, mr_err: string_slice(body, 1, string_len(body)) } end
+    end
+    let ln: int = jsonx::array_len_at(body, "layers")
+    if ln == 0 is return ManifestRes { mr_layers: none, mr_err: "manifest nie zawiera warstw" } end
+    let mut layers: [LayerDesc] = []
+    let mut k: int = 0
+    while k < ln is
+        let p2: string = "layers." + to_string(k)
+        let sz: string = jsonx::get(body, p2 + ".size")
+        layers = array_push(layers, LayerDesc { ld_digest: jsonx::get(body, p2 + ".digest"), ld_size: if sz == "" then 0 else str_to_int(sz) })
+        k += 1
+    end
+    return ManifestRes { mr_layers: layers, mr_err: "" }
+end
+
+struct DlRes is
+    dr_err: string
+    dr_bar: prog::Bar
+end
+
+;; Pobiera blob do pliku (z paskiem postepu opartym na rozmiarze pliku) i weryfikuje sha256.
+fn download_blob(reg: registry::Reg, digest: string, dest: string, size: int, bar: prog::Bar, base_done: int) -> DlRes is
+    let mut b: prog::Bar = bar
+    let url: string = registry::blob_url(reg, digest)
+    let mut cmd: string = "curl -sS --connect-timeout 10 --speed-time 60 --speed-limit 1 -L"
+    if reg.rg_insecure is cmd = cmd + " -k" end
+    if reg.rg_cfg != "" is cmd = cmd + " -K " + proc::sq(reg.rg_cfg) end
+    cmd = cmd + " -o " + proc::sq(dest) + " -w '%{{http_code}}' " + proc::sq(url)
+    let job: proc::Job = proc::job_start_rc(cmd)
+    while !proc::job_done(job) is
+        b = prog::set(b, base_done + fsx::file_size_of(dest))
+        sleep_ms(100)
+    end
+    let rc: int = proc::job_code(job)
+    let log: string = string_trim(proc::read_file_or_empty(job.job_log))
+    proc::job_cleanup(job)
+    if rc != 0 is
+        fsx::remove(dest)
+        return DlRes { dr_err: "GET " + url + ": " + transport_msg(rc, log), dr_bar: b }
+    end
+    let code: string = if string_len(log) >= 3 then string_slice(log, string_len(log) - 3, string_len(log)) else log
+    if code != "200" is
+        fsx::remove(dest)
+        return DlRes { dr_err: "GET " + url + ": unexpected status code " + code, dr_bar: b }
+    end
+    let actual: string = net::sha256_file(dest)
+    let want: string = strx::trim_prefix(digest, "sha256:")
+    if actual != want is
+        fsx::remove(dest)
+        return DlRes { dr_err: "suma sha256 warstwy " + digest + " nie zgadza sie: otrzymano sha256:" + actual, dr_bar: b }
+    end
+    b = prog::set(b, base_done + size)
+    return DlRes { dr_err: "", dr_bar: b }
+end
+
+fn transport_msg(rc: int, log: string) -> string is
+    if rc == 28 is return "i/o timeout: " + log end
+    if rc == 18 is return "unexpected EOF: " + log end
+    if rc == 56 || rc == 52 || rc == 55 is return "connection reset by peer / unexpected EOF: " + log end
+    if rc == 35 || rc == 58 || rc == 60 is return "tls handshake error: " + log end
+    if rc == 6 is return "temporary failure in name resolution: " + log end
+    return log + " (curl " + to_string(rc) + ")"
+end
+
+;; Nakladanie warstwy: whiteouty (.wh.*) wykonane przed wypakowaniem, reszta przez tar (-m: mtime = teraz, jak w Go).
+pub fn apply_layer(layer_file: string, dest: string) -> string is
+    let names: [string] = fsx::non_empty_lines(shell("tar -tf " + proc::sq(layer_file) + " 2>/dev/null"))
+    let mut i: int = 0
+    while i < array_len(names) is
+        let nm: string = names[i]
+        i += 1
+        let base: string = fsx::basename(nm)
+        let dir: string = fsx::dirname(nm)
+        if base == ".wh..wh..opq" is
+            let target: string = fsx::join(dest, dir)
+            if fsx::is_dir(target) is
+                sysc::sh("find " + proc::sq(target) + " -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null")
+            end
+        else if string_starts_with(base, ".wh.") is
+            fsx::remove_all(fsx::join(fsx::join(dest, dir), strx::trim_prefix(base, ".wh.")))
+        end
+    end
+    let owner: string = if sysc::euid() == 0 then "--same-owner" else "--no-same-owner"
+    let se: string = proc::tmp_path("tarx")
+    let rc: int = sysc::sh("tar -xf " + proc::sq(layer_file) + " -C " + proc::sq(dest) + " --numeric-owner " + owner + " -p -m --exclude='.wh.*' 2>" + proc::sq(se))
+    let errtxt: string = proc::read_file_or_empty(se)
+    fsx::remove(se)
+    if rc == 0 is return "" end
+    let lines: [string] = fsx::non_empty_lines(errtxt)
+    let mut fatal: string = ""
+    let mut j: int = 0
+    while j < array_len(lines) is
+        let l: string = lines[j]
+        j += 1
+        if string_contains(l, "Cannot mknod") is
+            ui::warn("Nie mozna utworzyc wezla urzadzenia: " + l)
+        else if string_contains(l, "Exiting with failure status") || string_contains(l, "Cannot change ownership") && sysc::euid() != 0 is
+            ;; pomijamy (jak ignorowanie bledow uprawnien w Go)
+        else if fatal == "" is
+            fatal = l
+        end
+    end
+    if fatal != "" is return "czytanie tar: " + fatal end
+    return ""
+end
+
+fn pull_once(r: registry::RegRef, token: string, insecure: bool, dest: string) -> string is
+    let lg: registry::LoginRes = registry::login(r, token, "pull", insecure)
+    if lg.lg_err != "" is return "pobieranie " + r.rf_orig + " nie powiodlo sie: " + lg.lg_err end
+    let reg: registry::Reg = lg.lg_reg
+    let mr: ManifestRes = resolve_layers(reg, r.rf_ref)
+    if mr.mr_err != "" is
+        registry::logout(reg)
+        return "pobieranie " + r.rf_orig + " nie powiodlo sie: " + mr.mr_err
+    end
+    let re: string = fsx::remove_all(dest)
+    if re != "" is
+        registry::logout(reg)
+        return "czyszczenie " + dest + ": " + re
+    end
+    let me: string = fsx::mkdir_p(dest)
+    if me != "" is
+        registry::logout(reg)
+        return "tworzenie " + dest + ": " + me
+    end
+    let layers: [LayerDesc] = mr.mr_layers
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < array_len(layers) is
+        total = total + layers[i].ld_size
+        i += 1
+    end
+    ui::info("Rozpakowywanie " + to_string(array_len(layers)) + " warstw(y) (razem " + ui::format_bytes(total) + ")...")
+    let mut bar: prog::Bar = prog::new("pull OCI", total, "bajtow")
+    let tmp: string = proc::tmp_path("pull")
+    fsx::mkdir_p(tmp)
+    let mut done: int = 0
+    let mut k: int = 0
+    while k < array_len(layers) is
+        let lf: string = fsx::join(tmp, "layer-" + to_string(k) + ".blob")
+        let dr: DlRes = download_blob(reg, layers[k].ld_digest, lf, layers[k].ld_size, bar, done)
+        bar = dr.dr_bar
+        if dr.dr_err != "" is
+            bar = prog::fail(bar, "warstwa " + to_string(k + 1) + "/" + to_string(array_len(layers)))
+            fsx::remove_all(tmp)
+            registry::logout(reg)
+            return "rozpakowywanie warstwy " + to_string(k + 1) + "/" + to_string(array_len(layers)) + ": " + dr.dr_err
+        end
+        let ae: string = apply_layer(lf, dest)
+        fsx::remove(lf)
+        if ae != "" is
+            bar = prog::fail(bar, "warstwa " + to_string(k + 1) + "/" + to_string(array_len(layers)))
+            fsx::remove_all(tmp)
+            registry::logout(reg)
+            return "rozpakowywanie warstwy " + to_string(k + 1) + "/" + to_string(array_len(layers)) + ": " + ae
+        end
+        done = done + layers[k].ld_size
+        k += 1
+    end
+    fsx::remove_all(tmp)
+    registry::logout(reg)
+    bar = prog::finish(bar)
+    return ""
+end
+
+;; PullAndUnpack: "" = OK
+pub fn pull_and_unpack(repository: string, tag: string, token: string, dest: string, insecure: bool) -> string is
+    let ref_str: string = repository + ":" + tag
+    let r: registry::RegRef = registry::parse_reference(ref_str)
+    if r.rf_err != "" is return "nieprawidlowa referencja obrazu " + ui::quote(ref_str) + ": " + r.rf_err end
+    let mut last_err: string = ""
+    let mut attempt: int = 1
+    while attempt <= max_pull_attempts() is
+        if attempt > 1 is
+            ui::warn("Sciaganie obrazu nie powiodlo sie (proba " + to_string(attempt - 1) + "/" + to_string(max_pull_attempts()) + "): " + last_err + " -- ponawiam za 3s...")
+            sleep_ms(retry_backoff_ms())
+        end
+        ui::info("Sciagam obraz OCI: " + ref_str + " (proba " + to_string(attempt) + "/" + to_string(max_pull_attempts()) + ")")
+        let e: string = pull_once(r, token, insecure, dest)
+        if e == "" is
+            ui::info("Obraz rozpakowany do " + dest)
+            return ""
+        end
+        last_err = e
+        if !is_retryable_transfer_err(e) is return e end
+        attempt += 1
+    end
+    return "sciaganie obrazu " + ref_str + " nie powiodlo sie po " + to_string(max_pull_attempts()) + " probach (ostatni blad): " + last_err
+end
+
+fn retry_backoff_ms() -> int is
+    let v: string = env_get("HACKEROS_PULL_BACKOFF_MS")
+    if v != "" is return str_to_int(v) end
+    return 3000
+end
