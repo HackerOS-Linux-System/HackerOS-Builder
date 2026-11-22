@@ -1,0 +1,41 @@
+mod download
+mod testutil
+
+#[test]
+fn test_checksums_finds_matching_entry() is
+    let r: [string] = download::parse_checksums_file("abc123  oci-mode.tar.gz\nddd  other.tar.gz\n", "oci-mode.tar.gz")
+    testutil::eq_s(r[1], "1")
+    testutil::eq_s(r[0], "abc123")
+end
+
+#[test]
+fn test_checksums_binary_mode_prefix() is
+    let r: [string] = download::parse_checksums_file("abc123 *oci-mode.tar.gz\n", "oci-mode.tar.gz")
+    testutil::eq_s(r[1], "1")
+end
+
+#[test]
+fn test_checksums_not_found_and_empty() is
+    testutil::eq_s(download::parse_checksums_file("abc other\n", "x")[1], "0")
+    testutil::eq_s(download::parse_checksums_file("", "x")[1], "0")
+end
+
+#[test]
+fn test_checksums_ignores_malformed_lines() is
+    let r: [string] = download::parse_checksums_file("jedno\n\na b c d\nabc x\n", "x")
+    testutil::eq_s(r[0], "abc")
+end
+
+#[test]
+fn test_release_tag_scraping() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/p.html", "<a href=\"/HackerOS-Linux-System/Isolator/releases/tag/v0.2.1\">v0.2.1</a><a href='/HackerOS-Linux-System/Isolator/releases/tag/v0.1.0'>")
+    testutil::eq_s(download::find_release_tag(d + "/p.html", "Isolator"), "v0.2.1")
+    testutil::eq_s(download::find_release_tag(d + "/p.html", "hammer"), "")
+end
+
+#[test]
+fn test_fallback_versions() is
+    testutil::eq_s(download::hammer_fallback_version(), "v0.6.0")
+    testutil::eq_s(download::isolator_fallback_version(), "v0.1.0")
+end
