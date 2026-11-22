@@ -1,0 +1,155 @@
+mod config
+mod testutil
+
+fn sample(extra: string) -> string is
+    return "[account]\n-> type => user\n-> name => MichaL\n\n[auth]\n-> token => tok123\n\n[release]\n-> name => trixie\n" + extra
+end
+
+fn load_text(txt: string, auth: bool) -> config::CfgLoad is
+    let dir: string = testutil::tmpdir()
+    testutil::put(dir + "/config.hk", txt)
+    return config::load(dir + "/config.hk", auth)
+end
+
+#[test]
+fn test_load_valid() is
+    let r: config::CfgLoad = load_text(sample(""), true)
+    testutil::eq_s(r.cl_err, "")
+    testutil::eq_s(r.cl_cfg.cfg_account_type, "user")
+    testutil::eq_s(r.cl_cfg.cfg_token, "tok123")
+    testutil::eq_s(r.cl_cfg.cfg_release, "trixie")
+end
+
+#[test]
+fn test_load_missing_required_section() is
+    let r: config::CfgLoad = load_text("[account]\n-> type => user\n-> name => x\n", true)
+    testutil::contains(r.cl_err, "brak wymaganej sekcji [auth]")
+end
+
+#[test]
+fn test_load_missing_required_key() is
+    let r: config::CfgLoad = load_text("[account]\n-> type => user\n[auth]\n-> token => t\n[release]\n-> name => trixie\n", true)
+    testutil::contains(r.cl_err, "brak wymaganego klucza 'name' w sekcji [account]")
+end
+
+#[test]
+fn test_load_invalid_account_type() is
+    let r: config::CfgLoad = load_text("[account]\n-> type => alien\n-> name => x\n[auth]\n-> token => t\n[release]\n-> name => trixie\n", true)
+    testutil::contains(r.cl_err, "'user' lub 'organisation'")
+end
+
+#[test]
+fn test_require_auth_false_allows_empty_token() is
+    let r: config::CfgLoad = load_text("[account]\n-> type => user\n-> name => x\n[auth]\n-> token => \"\"\n[release]\n-> name => trixie\n", false)
+    testutil::eq_s(r.cl_err, "")
+    let r2: config::CfgLoad = load_text("[account]\n-> type => user\n-> name => x\n[auth]\n-> token => \"\"\n[release]\n-> name => trixie\n", true)
+    testutil::contains(r2.cl_err, "token nie moze byc puste")
+end
+
+#[test]
+fn test_is_known_release() is
+    let mut c: config::Config = config::empty_config()
+    c.cfg_release = "trixie"
+    testutil::is_true(config::is_known_release(c), "trixie znane")
+    c.cfg_release = "plan9"
+    testutil::is_true(!config::is_known_release(c), "plan9 nieznane")
+end
+
+#[test]
+fn test_image_repository_lowercases_account() is
+    let mut c: config::Config = config::empty_config()
+    c.cfg_account_name = "MichaL"
+    testutil::eq_s(config::image_repository(c, "ghcr.io", "x"), "ghcr.io/michal/x")
+end
+
+#[test]
+fn test_project_types() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> type => cybersecurity\n-> installer => cybersecurity\n"), true)
+    testutil::eq_s(r.cl_err, "")
+    testutil::eq_s(r.cl_cfg.pj_type, "cybersecurity")
+    testutil::is_true(config::is_cybersecurity(r.cl_cfg), "is_cybersecurity")
+    testutil::is_true(config::uses_cybersecurity_installer(r.cl_cfg), "installer")
+    let r2: config::CfgLoad = load_text(sample("\n[project]\n-> type => containerized\n"), true)
+    testutil::is_true(config::is_containerized(r2.cl_cfg), "containerized")
+    testutil::is_true(!config::is_atomic_build(r2.cl_cfg), "kontener nie jest atomowy")
+end
+
+#[test]
+fn test_unknown_project_type_lists_options() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> type => weird\n"), true)
+    testutil::contains(r.cl_err, "default, cybersecurity, normal, official, independent, container, containerized")
+end
+
+#[test]
+fn test_unknown_installer_type() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> installer => weird\n"), true)
+    testutil::contains(r.cl_err, "default, cybersecurity, none")
+end
+
+#[test]
+fn test_helpers_defaults() is
+    let c: config::Config = config::empty_config()
+    testutil::is_true(config::is_atomic_build(c), "default jest atomowy")
+    testutil::is_true(config::use_builtin_installer(c), "instalator domyslnie wlaczony")
+    testutil::eq_s(config::image_tag(c), "latest")
+end
+
+#[test]
+fn test_mirror_and_arch() is
+    let r: config::CfgLoad = load_text(sample("-> mirror => http://mirror.example/debian\n-> arch => arm64\n"), true)
+    testutil::eq_s(config::effective_mirror(r.cl_cfg), "http://mirror.example/debian")
+    testutil::eq_s(config::effective_arch(r.cl_cfg), "arm64")
+    let r2: config::CfgLoad = load_text(sample(""), true)
+    testutil::eq_s(config::effective_mirror(r2.cl_cfg), "http://deb.debian.org/debian")
+    testutil::eq_s(config::effective_arch(r2.cl_cfg), "amd64")
+end
+
+#[test]
+fn test_unknown_arch_parses() is
+    let r: config::CfgLoad = load_text(sample("-> arch => z80\n"), true)
+    testutil::eq_s(r.cl_err, "")
+    testutil::is_true(!config::is_known_arch(r.cl_cfg), "z80 nieznana")
+end
+
+#[test]
+fn test_cybersecurity_packages() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> cybersecurity_packages => [nmap, \" wireshark \", hydra]\n"), true)
+    testutil::eq_s(r.cl_err, "")
+    testutil::eq_s(array_join(r.cl_cfg.pj_cyber_pkgs, ","), "nmap,wireshark,hydra")
+    let r2: config::CfgLoad = load_text(sample("\n[project]\n-> cybersecurity_packages => []\n"), true)
+    testutil::eq_i(array_len(r2.cl_cfg.pj_cyber_pkgs), 0)
+end
+
+#[test]
+fn test_cybersecurity_packages_must_be_array() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> cybersecurity_packages => nmap\n"), true)
+    testutil::contains(r.cl_err, "musi byc tablica")
+end
+
+#[test]
+fn test_sign_and_verify() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> sign => true\n-> verify_signature => yes\n-> cosign_key => /k/cosign.key\n"), true)
+    testutil::is_true(r.cl_cfg.pj_sign, "sign")
+    testutil::is_true(r.cl_cfg.pj_verify_signature, "verify")
+    testutil::eq_s(r.cl_cfg.pj_cosign_key, "/k/cosign.key")
+    let r2: config::CfgLoad = load_text(sample(""), true)
+    testutil::is_true(!r2.cl_cfg.pj_sign, "sign domyslnie false")
+end
+
+#[test]
+fn test_isolator_version() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> isolator_version => v0.3.1\n"), true)
+    testutil::eq_s(r.cl_cfg.pj_isolator_version, "v0.3.1")
+end
+
+#[test]
+fn test_selinux_flag() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> selinux => true\n"), true)
+    testutil::eq_s(r.cl_cfg.pj_mac, "selinux")
+end
+
+#[test]
+fn test_numeric_tag_formats_like_go() is
+    let r: config::CfgLoad = load_text(sample("\n[project]\n-> tag => 1.0\n"), true)
+    testutil::eq_s(r.cl_cfg.pj_tag, "1")
+end
