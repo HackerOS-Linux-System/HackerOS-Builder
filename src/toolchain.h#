@@ -1,0 +1,167 @@
+mod proc
+mod fsx
+mod ui
+mod strx
+
+pub struct Manager is
+    pub tc_work_dir: string
+    pub tc_bin_dir:  string
+end
+
+fn tool_names() -> [string] is return ["debootstrap", "mksquashfs", "grub-mkrescue", "xorriso"] end
+
+fn tool_packages(bin: string) -> [string] is
+    if bin == "debootstrap" is return ["debootstrap"] end
+    if bin == "mksquashfs" is return ["squashfs-tools"] end
+    if bin == "grub-mkrescue" is return ["grub-common", "grub-pc-bin", "grub-efi-amd64-bin"] end
+    return ["xorriso"]
+end
+
+fn tool_used_by(bin: string) -> string is
+    if bin == "debootstrap" is return "build cloud: tworzenie bazowego rootfs Debiana" end
+    if bin == "mksquashfs" is return "build iso: pakowanie rootfs do filesystem.squashfs" end
+    if bin == "grub-mkrescue" is return "build iso: budowa hybrydowego ISO BIOS+UEFI" end
+    return "build iso: tworzenie obrazu ISO (uzywane przez grub-mkrescue)"
+end
+
+pub fn bin_subdir() -> string is return "toolchain/bin" end
+
+pub fn new_manager(work_dir: string) -> Manager is
+    return Manager { tc_work_dir: work_dir, tc_bin_dir: fsx::join(work_dir, bin_subdir()) }
+end
+
+;; PATH z toolchain/bin na poczatku
+pub fn env(m: Manager) -> [string] is
+    return ["PATH=" + m.tc_bin_dir + ":" + env_get("PATH")]
+end
+
+pub fn bin_path(m: Manager, binary: string) -> string is
+    let p: string = fsx::join(m.tc_bin_dir, binary)
+    if file_exists(p) is return p end
+    return ""
+end
+
+fn tool_available(m: Manager, binary: string) -> bool is
+    if file_exists(fsx::join(m.tc_bin_dir, binary)) is return true end
+    return proc::tool_exists(binary)
+end
+
+fn copy_binaries(src_dir: string, dst_dir: string) -> int is
+    if !fsx::is_dir(src_dir) is return 0 end
+    let out: string = shell("find " + proc::sq(src_dir) + " -mindepth 1 -maxdepth 1 ! -type d -perm /111 2>/dev/null | LC_ALL=C sort")
+    let files: [string] = fsx::non_empty_lines(out)
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(files) is
+        let dst: string = fsx::join(dst_dir, fsx::basename(files[i]))
+        if proc::run_or_error(["cp", "-L", files[i], dst]) == "" is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+fn install_debootstrap_data(m: Manager, extract_dir: string) -> string is
+    let share_dir: string = fsx::join(fsx::join(fsx::join(m.tc_work_dir, "toolchain"), "share"), "debootstrap")
+    let e: string = fsx::mkdir_p(share_dir)
+    if e != "" is return e end
+    let src_share: string = fsx::join(fsx::join(fsx::join(extract_dir, "usr"), "share"), "debootstrap")
+    if !fsx::is_dir(src_share) is return "brak " + src_share + " w rozpakowanym debootstrap" end
+    let ce: string = proc::run_or_error(["cp", "-a", src_share + "/.", share_dir])
+    if ce != "" is return "kopiowanie debootstrap share: " + ce end
+    let orig: string = fsx::join(m.tc_bin_dir, "debootstrap")
+    let real: string = fsx::join(m.tc_bin_dir, "debootstrap.real")
+    let re: string = proc::run_or_error(["mv", "-f", orig, real])
+    if re != "" is return "rename debootstrap -> debootstrap.real: " + re end
+    let wrapper: string = "#!/bin/sh\n# Wrapper debootstrap wygenerowany przez hackeros-builder toolchain.\n# Ustawia DEBOOTSTRAP_DIR tak by debootstrap znalazl skrypty suite\n# (scripts/bookworm, scripts/trixie itp.) rozpakowane do katalogu roboczego\n# buildu, NIE szukal ich w /usr/share/debootstrap (ktory moze nie istniec\n# jesli debootstrap nie jest zainstalowany na hoscie).\nexport DEBOOTSTRAP_DIR=" + ui::quote(share_dir) + "\nexec " + ui::quote(real) + " \"$@\"\n"
+    let we: string = fsx::write_file(orig, wrapper, 493)
+    if we != "" is return "zapis wrappera debootstrap: " + we end
+    return ""
+end
+
+fn download_and_extract(m: Manager, bin: string) -> string is
+    let pkgs: [string] = tool_packages(bin)
+    let tmp: string = fsx::join(m.tc_bin_dir, ".tmp-" + bin)
+    let e: string = fsx::mkdir_p(tmp)
+    if e != "" is return "mkdir " + tmp + ": " + e end
+    let r: string = download_and_extract_in(m, bin, pkgs, tmp)
+    fsx::remove_all(tmp)
+    return r
+end
+
+fn download_and_extract_in(m: Manager, bin: string, pkgs: [string], tmp: string) -> string is
+    let dl: string = proc::run_streaming(tmp, strx::concat(["apt-get", "download"], pkgs))
+    if dl != "" is return "apt-get download " + proc::format_args(pkgs) + ": " + dl end
+    let debs: [string] = fsx::glob_prefix(tmp, "")
+    let mut deb_files: [string] = []
+    let mut i: int = 0
+    while i < array_len(debs) is
+        if string_ends_with(debs[i], ".deb") is deb_files = array_push(deb_files, debs[i]) end
+        i += 1
+    end
+    if array_len(deb_files) == 0 is return "brak pobranych plikow .deb w " + tmp end
+    let extract_dir: string = fsx::join(tmp, "extracted")
+    let me: string = fsx::mkdir_p(extract_dir)
+    if me != "" is return me end
+    let mut d: int = 0
+    while d < array_len(deb_files) is
+        let x: string = proc::run_streaming("", ["dpkg-deb", "--extract", deb_files[d], extract_dir])
+        if x != "" is return "dpkg-deb --extract " + fsx::basename(deb_files[d]) + ": " + x end
+        d += 1
+    end
+    let bin_dirs: [string] = [
+        fsx::join(fsx::join(extract_dir, "usr"), "bin"),
+        fsx::join(fsx::join(extract_dir, "usr"), "sbin"),
+        fsx::join(extract_dir, "bin"),
+        fsx::join(extract_dir, "sbin"),
+        fsx::join(fsx::join(fsx::join(extract_dir, "usr"), "lib"), "grub"),
+    ]
+    let mut copied: int = 0
+    let mut b: int = 0
+    while b < array_len(bin_dirs) is
+        copied = copied + copy_binaries(bin_dirs[b], m.tc_bin_dir)
+        b += 1
+    end
+    if bin == "debootstrap" is
+        let de: string = install_debootstrap_data(m, extract_dir)
+        if de != "" is return "debootstrap data: " + de end
+    end
+    if copied == 0 is return "nie skopiowano zadnych binarek dla " + bin + " -- sprawdz nazwy pakietow apt" end
+    if !file_exists(fsx::join(m.tc_bin_dir, bin)) is
+        return "binarka " + ui::quote(bin) + " nie znaleziona w toolchain/bin/ po rozpakowaniu -- sprawdz czy pakiet " + proc::format_args(pkgs) + " rzeczywiscie ja dostarcza"
+    end
+    return ""
+end
+
+;; PrepareAll: "" = OK
+pub fn prepare_all(m: Manager) -> string is
+    let e: string = fsx::mkdir_p(m.tc_bin_dir)
+    if e != "" is return "toolchain: tworzenie " + m.tc_bin_dir + ": " + e end
+    let names: [string] = tool_names()
+    let mut missing: [string] = []
+    let mut i: int = 0
+    while i < array_len(names) is
+        if tool_available(m, names[i]) is
+            ui::debug("toolchain: " + names[i] + " -- dostepne w PATH lub cache, pomijam pobieranie")
+        else is
+            missing = array_push(missing, names[i])
+        end
+        i += 1
+    end
+    if array_len(missing) == 0 is
+        ui::info("toolchain: wszystkie narzedzia dostepne (bez pobierania)")
+        return ""
+    end
+    ui::info("toolchain: brakuje " + to_string(array_len(missing)) + " narzedzi -- pobieranie tymczasowe do " + bin_subdir() + "/")
+    ui::info("  (narzedzia sa pobierane jako .deb i rozpakowywane lokalnie,")
+    ui::info("   NIE sa instalowane na systemie hosta -- zero konfliktow zaleznosci)")
+    let mut k: int = 0
+    while k < array_len(missing) is
+        let t: string = missing[k]
+        ui::info("  pobieranie: " + t + " (pakiety: " + array_join(tool_packages(t), ", ") + ")...")
+        let r: string = download_and_extract(m, t)
+        if r != "" is return "toolchain: nie mozna przygotowac narzedzia " + ui::quote(t) + ": " + r end
+        ui::info("  ok: " + t + " -> " + bin_subdir() + "/")
+        k += 1
+    end
+    return ""
+end
