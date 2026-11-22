@@ -1,0 +1,236 @@
+mod ui
+mod fsx
+mod proc
+mod sandbox
+mod hkgen
+mod hk
+mod buildflow
+mod config
+mod testutil
+mod prog
+mod track
+mod sysc
+mod strx
+mod toolchain
+
+#[test]
+fn test_format_bytes() is
+    testutil::eq_s(ui::format_bytes(512), "512 B")
+    testutil::eq_s(ui::format_bytes(1536), "1.5 KB")
+    testutil::eq_s(ui::format_bytes(1048576), "1.0 MB")
+    testutil::eq_s(ui::format_bytes(5368709120), "5.0 GB")
+end
+
+#[test]
+fn test_format_elapsed() is
+    testutil::eq_s(ui::format_elapsed(4000), "4s")
+    testutil::eq_s(ui::format_elapsed(125000), "2m05s")
+    testutil::eq_s(ui::format_elapsed(600000), "10m00s")
+end
+
+#[test]
+fn test_wrap_text() is
+    let l: [string] = ui::wrap_text("aaa bbb ccc ddd", 7)
+    testutil::eq_s(array_join(l, "|"), "aaa bbb|ccc ddd")
+    testutil::eq_s(array_join(ui::wrap_text("a\n\nb", 10), "|"), "a||b")
+end
+
+#[test]
+fn test_visible_len_ignores_ansi() is
+    testutil::eq_i(ui::visible_len("\x1b[1m\x1b[36mabc\x1b[0m"), 3)
+    testutil::eq_i(ui::visible_len("zażółć"), 6)
+end
+
+#[test]
+fn test_quote_like_go() is
+    testutil::eq_s(ui::quote("a\"b"), "\"a\\\"b\"")
+end
+
+#[test]
+fn test_fsx_path_helpers() is
+    testutil::eq_s(fsx::clean("/a/b/../c//d/./"), "/a/c/d")
+    testutil::eq_s(fsx::clean("a/../.."), "..")
+    testutil::eq_s(fsx::clean(""), ".")
+    testutil::eq_s(fsx::join("/x/", "/y"), "/x/y")
+    testutil::eq_s(fsx::dirname("/a/b/c"), "/a/b")
+    testutil::eq_s(fsx::dirname("file"), ".")
+    testutil::eq_s(fsx::basename("/a/b/c/"), "c")
+    testutil::eq_i(fsx::oct("755"), 493)
+    testutil::eq_i(fsx::oct("4755"), 2541)
+    testutil::eq_i(fsx::makedev(5, 1), 1281)
+end
+
+#[test]
+fn test_mkdir_all_mode_applies_umask() is
+    let d: string = testutil::tmpdir()
+    testutil::eq_s(fsx::mkdir_all_mode(d + "/a/b", 511), "")
+    testutil::eq_s(fsx::stat_mode_octal(d + "/a/b"), "755")
+    shell("chmod 700 '" + d + "/a/b'")
+    testutil::eq_s(fsx::mkdir_all_mode(d + "/a/b", 511), "")
+    testutil::eq_s(fsx::stat_mode_octal(d + "/a/b"), "700")
+end
+
+#[test]
+fn test_remove_all_refuses_root() is
+    testutil::contains(fsx::remove_all("/"), "odmowa")
+    testutil::contains(fsx::remove_all(""), "odmowa")
+end
+
+#[test]
+fn test_ensure_dev_skeleton() is
+    let root: string = testutil::tmpdir()
+    let w: [string] = fsx::ensure_dev_skeleton(root)
+    testutil::eq_s(fsx::stat_mode_octal(root + "/tmp"), "1777")
+    testutil::is_true(fsx::is_dir(root + "/proc") && fsx::is_dir(root + "/sys") && fsx::is_dir(root + "/run"), "punkty montowania")
+    if sysc::euid() == 0 is
+        testutil::eq_i(array_len(w), 0)
+        testutil::is_true(fsx::is_char_dev(root + "/dev/console") && fsx::is_char_dev(root + "/dev/null"), "wezly urzadzen")
+    end
+end
+
+#[test]
+fn test_proc_run_captures_output_and_code() is
+    let r: proc::RunResult = proc::run(["sh", "-c", "echo out; echo err >&2; exit 3"])
+    testutil::eq_i(r.rr_code, 3)
+    testutil::eq_s(r.rr_stdout, "out\n")
+    testutil::eq_s(r.rr_stderr, "err\n")
+end
+
+#[test]
+fn test_proc_run_or_error() is
+    testutil::eq_s(proc::run_or_error(["true"]), "")
+    testutil::contains(proc::run_or_error(["sh", "-c", "echo boom >&2; exit 2"]), "kodem 2")
+    testutil::contains(proc::run_or_error(["definitely-not-a-binary-xyz"]), "nie znaleziono programu")
+end
+
+#[test]
+fn test_proc_quoting_is_injection_safe() is
+    let d: string = testutil::tmpdir()
+    let evil: string = "a'; touch " + d + "/pwned; echo '"
+    proc::run(["echo", evil])
+    testutil::is_true(!fsx::exists(d + "/pwned"), "argumenty sa cytowane")
+end
+
+#[test]
+fn test_run_with_stdin() is
+    let d: string = testutil::tmpdir()
+    testutil::eq_s(proc::run_with_stdin("", "dane\n", ["sh", "-c", "cat > " + d + "/got"]), "")
+    testutil::eq_s(fs_read(d + "/got"), "dane\n")
+    testutil::contains(proc::run_with_stdin("", "x", ["sh", "-c", "exit 4"]), "exit status 4")
+end
+
+#[test]
+fn test_job_counts_real_output_lines() is
+    let j: proc::Job = proc::job_start_rc("printf 'I: Retrieving a\\nI: Retrieving b\\rI: Unpacking c\\nnoise\\n'")
+    testutil::eq_i(proc::job_wait(j), 0)
+    testutil::eq_i(proc::job_count(j, ["I: Retrieving ", "I: Unpacking "]), 3)
+    proc::job_cleanup(j)
+end
+
+#[test]
+fn test_job_failure_code_and_tail() is
+    let r: track::TrackRes = track::run_line("echo line1; echo line2; exit 7", "x", 0, "u", ["line"], "t", "fail")
+    testutil::eq_i(r.tk_rc, 7)
+    testutil::contains(r.tk_tail, "line2")
+end
+
+#[test]
+fn test_sandbox_format_duration() is
+    testutil::eq_s(sandbox::format_duration(45), "45s")
+    testutil::eq_s(sandbox::format_duration(90), "1m30s")
+    testutil::eq_s(sandbox::format_duration(1200), "20m0s")
+    testutil::eq_s(sandbox::format_duration(3600), "1h0m0s")
+end
+
+#[test]
+fn test_sandbox_script_mounts_and_cleans() is
+    let s: string = sandbox::mount_and_chroot_script("/r", ["apt-get", "install", "-y", "a b"])
+    testutil::contains(s, "mount -t proc")
+    testutil::contains(s, "mount --bind     /dev/pts")
+    testutil::contains(s, "trap _cleanup EXIT")
+    testutil::contains(s, "exec chroot \"$ROOTFS\" 'apt-get' 'install' '-y' 'a b'")
+end
+
+#[test]
+fn test_sandbox_line_env_and_timeout() is
+    let l: string = sandbox::unshare_line("/r", ["X=1"], 30, ["ls"])
+    testutil::contains(l, "'DEBIAN_FRONTEND=noninteractive'")
+    testutil::contains(l, "'X=1'")
+    testutil::contains(l, "-s KILL 30")
+    testutil::contains(l, "--mount --pid --fork --uts --kill-child")
+    testutil::is_true(!string_contains(sandbox::unshare_line("/r", [], 0, ["ls"]), "timeout"), "bez limitu brak timeout")
+end
+
+#[test]
+fn test_hkgen_defaults_and_origin() is
+    let mut p: hkgen::HammerConfigParams = hkgen::empty_params()
+    p.hc_os_name = "debian"
+    p.hc_require_gpg = true
+    p.hc_origin = "docker://ghcr.io/a/b:t"
+    let out: string = hk::serialize(hkgen::generate(p))
+    testutil::contains(out, "[sysroot]\n-> path => /")
+    testutil::contains(out, "-> repo_path => /ostree/repo")
+    testutil::contains(out, "-> osname => debian")
+    testutil::contains(out, "-> require_gpg => true")
+    testutil::contains(out, "[origin]\n-> refspec => docker://ghcr.io/a/b:t")
+    testutil::is_true(!string_contains(hk::serialize(hkgen::generate(hkgen::empty_params())), "[origin]"), "bez origin brak sekcji")
+end
+
+#[test]
+fn test_hkgen_written_file_parses_back() is
+    let d: string = testutil::tmpdir()
+    let mut p: hkgen::HammerConfigParams = hkgen::empty_params()
+    p.hc_origin = "docker://x/y:z"
+    fsx::mkdir_p(d + "/etc/hammer")
+    testutil::eq_s(hkgen::write_hammer_config(d + "/etc/hammer/oci.hk", p), "")
+    let r: hk::HkParse = hk::load_file(d + "/etc/hammer/oci.hk")
+    testutil::eq_s(r.hp_err, "")
+    testutil::eq_s(hk::as_string(hk::get_path(r.hp_doc, "origin.refspec")), "docker://x/y:z")
+end
+
+#[test]
+fn test_image_name_and_tag_from_project_section() is
+    let mut c: config::Config = config::empty_config()
+    c.pj_name = "moj-obraz"
+    c.pj_tag = "v2"
+    let nt: buildflow::NameTag = buildflow::resolve_image_name_and_tag(c, "/some/dir")
+    testutil::eq_s(nt.nt_name, "moj-obraz")
+    testutil::eq_s(nt.nt_tag, "v2")
+end
+
+#[test]
+fn test_image_name_and_tag_fallbacks() is
+    let nt: buildflow::NameTag = buildflow::resolve_image_name_and_tag(config::empty_config(), "/some/projekt-x")
+    testutil::eq_s(nt.nt_name, "projekt-x")
+    testutil::eq_s(nt.nt_tag, "latest")
+end
+
+#[test]
+fn test_image_tag_never_uses_release() is
+    let mut c: config::Config = config::empty_config()
+    c.cfg_release = "trixie"
+    testutil::is_true(buildflow::resolve_image_name_and_tag(c, "/p").nt_tag != "trixie", "tag != release")
+end
+
+#[test]
+fn test_strx_sort_and_helpers() is
+    testutil::eq_s(array_join(strx::sort_strings(["b", "a10", "a2", "B"]), ","), "B,a10,a2,b")
+    testutil::eq_s(array_join(strx::fields("  a \t b\nc "), ","), "a,b,c")
+    testutil::eq_s(strx::trim_prefix("sha256:abc", "sha256:"), "abc")
+end
+
+#[test]
+fn test_toolchain_uses_cached_binaries_without_download() is
+    let wd: string = testutil::tmpdir()
+    let m: toolchain::Manager = toolchain::new_manager(wd)
+    fsx::mkdir_p(m.tc_bin_dir)
+    let names: [string] = ["debootstrap", "mksquashfs", "grub-mkrescue", "xorriso"]
+    let mut i: int = 0
+    while i < array_len(names) is
+        testutil::put(m.tc_bin_dir + "/" + names[i], "#!/bin/sh\n")
+        i += 1
+    end
+    testutil::eq_s(toolchain::prepare_all(m), "")
+    testutil::eq_s(toolchain::bin_path(m, "debootstrap"), m.tc_bin_dir + "/debootstrap")
+    testutil::contains(toolchain::env(m)[0], "toolchain/bin:")
+end
