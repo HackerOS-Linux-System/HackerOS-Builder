@@ -1,0 +1,43 @@
+mod hooklang
+mod testutil
+
+#[test]
+fn test_always_present_needs_no_install() is
+    let l: [string] = ["", "sh", "bash", "dash", "ash"]
+    let mut i: int = 0
+    while i < array_len(l) is
+        testutil::eq_s(hooklang::interpreter_package(l[i]), "")
+        testutil::is_true(hooklang::always_present(l[i]), "always_present " + l[i])
+        i += 1
+    end
+end
+
+#[test]
+fn test_known_languages() is
+    testutil::eq_s(hooklang::interpreter_package("python3"), "python3")
+    testutil::eq_s(hooklang::interpreter_package("python"), "python-is-python3")
+    testutil::eq_s(hooklang::interpreter_package("ruby"), "ruby")
+    testutil::eq_s(hooklang::interpreter_package("lua5.4"), "lua5.4")
+    testutil::eq_s(hooklang::interpreter_package("perl"), "perl")
+    testutil::eq_s(hooklang::interpreter_package("node"), "nodejs")
+    testutil::eq_s(hooklang::interpreter_package("Rscript"), "r-base-core")
+end
+
+#[test]
+fn test_unknown_interpreter() is
+    testutil::eq_s(hooklang::interpreter_package("brainfuck"), "")
+    testutil::is_true(!hooklang::is_recognized("brainfuck"), "nierozpoznany")
+    testutil::is_true(hooklang::is_recognized("python3"), "python3 rozpoznany")
+    testutil::is_true(hooklang::is_recognized("sh"), "sh rozpoznany")
+end
+
+#[test]
+fn test_label() is
+    testutil::eq_s(hooklang::label(""), "brak shebang/binarny")
+    testutil::eq_s(hooklang::label("ruby"), "ruby")
+end
+
+#[test]
+fn test_supported_languages_not_empty() is
+    testutil::is_true(array_len(hooklang::supported_languages()) > 5, "lista jezykow")
+end
