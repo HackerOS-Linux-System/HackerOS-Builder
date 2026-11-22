@@ -1,0 +1,67 @@
+mod proc
+mod prog
+mod ui
+mod fsx
+
+pub struct TrackRes is
+    pub tk_rc:   int
+    pub tk_tail: string
+end
+
+;; Czeka na zadanie, zlicza linie zaczynajace sie od prefiksow i aktualizuje pasek.
+;; W trybie verbose kazda nowa linia jest wypisywana jak Debugf (tag + ": " + linia).
+pub fn follow(job: proc::Job, bar0: prog::Bar, prefixes: [string], tag: string) -> prog::Bar is
+    let mut bar: prog::Bar = bar0
+    let verbose: bool = ui::is_verbose()
+    let mut printed: int = 0
+    let mut last: int = -1
+    while !proc::job_done(job) is
+        let n: int = proc::job_count(job, prefixes)
+        if n != last is
+            bar = prog::set(bar, n)
+            last = n
+        end
+        if verbose is
+            let fresh: string = proc::job_lines_from(job, printed)
+            let lines: [string] = fsx::non_empty_lines(fresh)
+            let mut i: int = 0
+            while i < array_len(lines) is
+                ui::debug(tag + ": " + string_trim(lines[i]))
+                i += 1
+            end
+            printed = printed + array_len(lines)
+        end
+        sleep_ms(150)
+    end
+    if verbose is
+        let rest: [string] = fsx::non_empty_lines(proc::job_lines_from(job, printed))
+        let mut k: int = 0
+        while k < array_len(rest) is
+            ui::debug(tag + ": " + string_trim(rest[k]))
+            k += 1
+        end
+    end
+    let fin: int = proc::job_count(job, prefixes)
+    return prog::set(bar, fin)
+end
+
+;; Uruchamia linie shella jako zadanie i sledzi jej postep. Zwraca kod wyjscia i ogon logu.
+pub fn run_line(cmdline: string, label: string, total: int, unit: string, prefixes: [string], tag: string, fail_reason: string) -> TrackRes is
+    let bar: prog::Bar = prog::new(label, total, unit)
+    let job: proc::Job = proc::job_start_rc(cmdline)
+    return finish_job(job, bar, prefixes, tag, fail_reason)
+end
+
+;; Jak run_line, ale dla juz wystartowanego zadania (np. sandbox::start_with_lines).
+pub fn finish_job(job: proc::Job, bar0: prog::Bar, prefixes: [string], tag: string, fail_reason: string) -> TrackRes is
+    let bar: prog::Bar = follow(job, bar0, prefixes, tag)
+    let rc: int = proc::job_code(job)
+    let tail: string = proc::job_tail(job, 12)
+    proc::job_cleanup(job)
+    if rc != 0 is
+        let f: prog::Bar = prog::fail(bar, fail_reason)
+        return TrackRes { tk_rc: rc, tk_tail: tail }
+    end
+    let ok: prog::Bar = prog::finish(bar)
+    return TrackRes { tk_rc: 0, tk_tail: tail }
+end
