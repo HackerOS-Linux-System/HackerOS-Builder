@@ -1,0 +1,55 @@
+extern static [c] is
+    fn system(cmd: string) -> int
+    fn exit(code: int)
+    fn isatty(fd: int) -> int
+    fn dprintf(fd: int, fmt: string, s: string) -> int
+    fn flock(fd: int, op: int) -> int
+    fn open(path: string, flags: int, mode: int) -> int
+    fn close(fd: int) -> int
+    fn symlink(target: string, linkpath: string) -> int
+    fn chmod(path: string, mode: int) -> int
+    fn mknod(path: string, mode: int, dev: int) -> int
+    fn getpid() -> int
+    fn geteuid() -> int
+    fn unlink(path: string) -> int
+    fn usleep(us: int) -> int
+end
+
+pub fn die(code: int) is exit(code) end
+pub fn pid() -> int is return getpid() end
+pub fn euid() -> int is return geteuid() end
+pub fn stdout_is_tty() -> bool is return isatty(1) != 0 end
+
+;; wait-status -> kod wyjscia (system() zwraca status << 8)
+pub fn sh(cmd: string) -> int is
+    let st: int = system(cmd)
+    if st < 0 is return -1 end
+    if st % 256 != 0 is return 128 + (st % 128) end
+    return (st / 256) % 256
+end
+
+pub fn eprint(s: string) is
+    dprintf(2, "%s\n", s)
+end
+
+;; zwraca fd (>=0) po zdobyciu LOCK_EX|LOCK_NB, -1 gdy zajety, -2 gdy nie da sie otworzyc pliku
+pub fn flock_try(path: string) -> int is
+    let fd: int = open(path, 524354, 420)
+    if fd < 0 is return -2 end
+    if flock(fd, 6) != 0 is
+        close(fd)
+        return -1
+    end
+    return fd
+end
+
+pub fn flock_release(fd: int) is
+    flock(fd, 8)
+    close(fd)
+end
+
+pub fn make_symlink(target: string, path: string) -> int is return symlink(target, path) end
+pub fn make_chmod(path: string, mode: int) -> int is return chmod(path, mode) end
+pub fn make_mknod(path: string, mode: int, dev: int) -> int is return mknod(path, mode, dev) end
+pub fn make_unlink(path: string) -> int is return unlink(path) end
+pub fn sleep_us(us: int) is usleep(us) end
