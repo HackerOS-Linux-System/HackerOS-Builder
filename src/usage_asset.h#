@@ -1,0 +1,75 @@
+pub fn usage_template() -> string is
+    return "@S1@ @S2@ -- budowanie niemutowalnych obrazow Debiana (OCI/bootc-style)
+
+@S3@
+  hackeros-builder [opcje] build <cloud|iso|all|container>
+  hackeros-builder [opcje] <cloud|iso|all|container>          (forma skrocona, bez \"build\")
+  hackeros-builder clean                            Usun katalog roboczy (--workdir).
+  hackeros-builder clean --all                      Jak wyzej + usun wynikowy plik .iso (--output).
+
+@S4@
+  build cloud          Zbuduj rootfs (debootstrap + hooks + package-lists)
+                        i wypchnij go jako obraz OCI do registry.
+  build iso             Sciagnij obraz OCI z registry i zbuduj z niego
+                        hybrydowy obraz ISO (bootowalny BIOS+UEFI), gotowy
+                        do instalacji -- boot startuje PROSTO w graficzny
+                        instalator (Calamares), bez posredniego pulpitu live.
+  build all              Wykonaj 'build cloud', nastepnie 'build iso'.
+  build container        Zbuduj kontener roboczy (podman/docker), NIE obraz
+                        atomowy/bootc -- bez hammer, bez ISO. Wynik to
+                        lokalne archiwum .tar (wczytywalne przez 'podman
+                        load'/'docker load') plus opcjonalny push do
+                        registry jesli [account]/[auth] sa ustawione w
+                        config.hk. Gdy [project] -> type = containerized,
+                        dodatkowo wbudowuje Isolator (podman-owy menedzer
+                        pakietow HackerOS) do /usr/bin/ -- kontener startuje
+                        gotowy do 'isolator install <pakiet>'. Patrz
+                        [project] -> type = container/containerized.
+  clean                  Usun katalog roboczy (rootfs/oci/iso/...).
+  clean --all             Jak 'clean', plus usun wynikowy plik .iso.
+
+@S5@
+  -v, --verbose            Wlacz logi DEBUG.
+  -p, --project <dir>      Katalog projektu (musi zawierac 'config/config.hk').
+                           Domyslnie: katalog biezacy.
+  -w, --workdir <dir>      Katalog roboczy na pliki tymczasowe.
+                           Domyslnie: ./build
+                           UWAGA: rownolegle buildy MUSZA uzywac roznych
+                           --workdir -- ten sam katalog jest chroniony
+                           lockiem (flock) i drugi build poczeka/odmowi.
+  -o, --output <plik>      Sciezka wynikowego pliku .iso (tylko dla 'build iso'
+                           i 'build all'). Domyslnie: ./output.iso
+  --insecure-registry      Wylacz weryfikacje TLS przy polaczeniu z registry
+                           OCI. Uzyj TYLKO dla self-signed/wewnetrznych
+                           registry testowych -- nigdy w produkcji.
+  --skip-preflight         Pomin sprawdzenie dostepnosci wymaganych narzedzi
+                           (debootstrap, mksquashfs, grub-mkrescue, ...) na
+                           starcie. Przydatne w CI gdzie te sprawdzenie jest
+                           juz zrobione osobno.
+  --no-installer           (tylko 'build iso'/'build all') Nie wstrzykuj
+                           graficznego instalatora (Calamares) do ISO --
+                           wynikowy obraz to czyste live-medium bez kreatora
+                           instalacji.
+  --local-only             (tylko 'build container') Nie wypychaj kontenera
+                           do registry -- zapisz WYLACZNIE lokalne archiwum
+                           .tar wczytywalne przez 'podman load'/'docker load'.
+                           Bez tej flagi push jest i tak wykonywany TYLKO
+                           jesli [account]/[auth] sa faktycznie ustawione w
+                           config.hk (build container nie wymaga registry).
+  --all                    (tylko 'clean') Usun rowniez plik wyjsciowy .iso,
+                           nie tylko katalog roboczy.
+  -h, --help               Wyswietl ta pomoc i wyjdz.
+  -V, --version             Wyswietl wersje i wyjdz.
+
+@S6@
+  config/
+    config.hk                      <- WYMAGANE: konto, token, wersja Debiana
+    package-lists/*.list.chroot
+    hooks/normal/*.hook.chroot
+    includes.chroot/...
+    archives/*.list.chroot
+    archives/*.key.chroot
+
+Wszystkie komendy 'build' wymagaja uprawnien roota (debootstrap, chroot, mount).
+"
+end
