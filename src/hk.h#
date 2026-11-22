@@ -1,0 +1,770 @@
+mod sysc
+mod fsx
+
+pub struct HkDoc is
+    pub hk_paths: [string]
+    pub hk_kinds: [string]
+    pub hk_vals:  [string]
+end
+
+pub struct HkParse is
+    pub hp_doc: HkDoc
+    pub hp_err: string
+end
+
+pub struct HkVal is
+    pub hv_ok:   bool
+    pub hv_kind: string
+    pub hv_text: string
+end
+
+struct PState is
+    ps_doc:     HkDoc
+    ps_err:     string
+    ps_section: string
+    ps_stack:   [string]
+end
+
+fn sep() -> string is return "\x1e" end
+fn asep() -> string is return "\x1f" end
+
+pub fn doc_copy(d: HkDoc) -> HkDoc is
+    return HkDoc { hk_paths: d.hk_paths, hk_kinds: d.hk_kinds, hk_vals: d.hk_vals }
+end
+
+pub fn doc_new() -> HkDoc is
+    return HkDoc { hk_paths: [], hk_kinds: [], hk_vals: [] }
+end
+
+pub fn no_val() -> HkVal is
+    return HkVal { hv_ok: false, hv_kind: "", hv_text: "" }
+end
+
+;; --- bledy (komunikaty identyczne jak w Go) ---
+pub fn parse_error(line: int, col: int, msg: string, hint: string) -> string is
+    let base: string = "parse error\n  -> at " + to_string(line) + ":" + to_string(col) + "\n\n  " + msg
+    if hint != "" is return base + "\n\nHint: " + hint end
+    return base
+end
+pub fn key_conflict(key: string) -> string is return "hk: KeyConflict(" + key + ")" end
+pub fn invalid_ref(path: string) -> string is return "hk: InvalidReference(" + path + ") -- sprawdz czy sciezka istnieje" end
+pub fn cyclic_ref(path: string) -> string is return "hk: CyclicReference(" + path + ")" end
+pub fn kind_name(k: string) -> string is
+    if k == "s" is return "string" end
+    if k == "n" is return "number" end
+    if k == "b" is return "bool" end
+    if k == "a" is return "array" end
+    if k == "m" is return "map" end
+    return "unknown"
+end
+
+;; --- operacje na plaskim drzewie ---
+pub fn idx(doc: HkDoc, key: string) -> int is
+    let mut i: int = 0
+    while i < array_len(doc.hk_paths) is
+        if doc.hk_paths[i] == key is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn put(doc: HkDoc, key: string, kind: string, val: string) -> HkDoc is
+    let i: int = idx(doc, key)
+    if i >= 0 is
+        let mut ks: [string] = doc.hk_kinds
+        let mut vs: [string] = doc.hk_vals
+        ks = array_set(ks, i, kind)
+        vs = array_set(vs, i, val)
+        return HkDoc { hk_paths: doc.hk_paths, hk_kinds: ks, hk_vals: vs }
+    end
+    return HkDoc { hk_paths: array_push(doc.hk_paths, key), hk_kinds: array_push(doc.hk_kinds, kind), hk_vals: array_push(doc.hk_vals, val) }
+end
+
+;; usuwa wszystkich potomkow wezla (nie sam wezel)
+fn drop_children(doc: HkDoc, key: string) -> HkDoc is
+    let pre: string = key + sep()
+    let mut p: [string] = []
+    let mut k: [string] = []
+    let mut v: [string] = []
+    let mut i: int = 0
+    while i < array_len(doc.hk_paths) is
+        if !string_starts_with(doc.hk_paths[i], pre) is
+            p = array_push(p, doc.hk_paths[i])
+            k = array_push(k, doc.hk_kinds[i])
+            v = array_push(v, doc.hk_vals[i])
+        end
+        i += 1
+    end
+    return HkDoc { hk_paths: p, hk_kinds: k, hk_vals: v }
+end
+
+pub fn kind_of(doc: HkDoc, key: string) -> string is
+    let i: int = idx(doc, key)
+    if i < 0 is return "" end
+    return doc.hk_kinds[i]
+end
+
+;; bezposredni potomkowie (pelne klucze), w kolejnosci wstawiania
+pub fn children(doc: HkDoc, key: string) -> [string] is
+    let pre: string = if key == "" then "" else key + sep()
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(doc.hk_paths) is
+        let p: string = doc.hk_paths[i]
+        if string_starts_with(p, pre) && string_len(p) > string_len(pre) is
+            let rest: string = string_slice(p, string_len(pre), string_len(p))
+            if !string_contains(rest, sep()) is out = array_push(out, p) end
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn last_segment(key: string) -> string is
+    let parts: [string] = string_split(key, sep())
+    return parts[array_len(parts) - 1]
+end
+
+;; --- splitPath / parseArrayIndex ---
+pub fn split_path(path: string) -> [string] is
+    let mut segs: [string] = []
+    let mut cur: string = ""
+    let mut in_q: bool = false
+    let mut i: int = 0
+    while i < string_len(path) is
+        let c: string = string_at(path, i)
+        i += 1
+        if c == "\"" is
+            in_q = !in_q
+        else if c == "." && !in_q is
+            segs = array_push(segs, cur)
+            cur = ""
+        else is
+            cur = cur + c
+        end
+    end
+    if string_len(cur) > 0 || array_len(segs) > 0 is segs = array_push(segs, cur) end
+    return segs
+end
+
+;; zwraca [base, idx|"" ] - "" gdy brak indeksu
+pub fn parse_array_index(seg: string) -> [string] is
+    let o: int = string_find(seg, "[")
+    let c: int = string_find(seg, "]")
+    if o < 0 || c < 0 || c < o is return [seg, ""] end
+    let base: string = string_slice(seg, 0, o)
+    let num: string = string_slice(seg, o + 1, c)
+    let mut started: bool = false
+    let mut neg: bool = false
+    let mut digits: string = ""
+    let mut i: int = 0
+    while i < string_len(num) is
+        let ch: string = string_at(num, i)
+        i += 1
+        if ch == "-" && !started is
+            neg = true
+            started = true
+        else if ch < "0" || ch > "9" is
+            return [seg, ""]
+        else is
+            digits = digits + ch
+            started = true
+        end
+    end
+    let n: int = if digits == "" then 0 else str_to_int(digits)
+    if neg is return [base, to_string(0 - n)] end
+    return [base, to_string(n)]
+end
+
+;; --- liczby ---
+fn is_digit(c: string) -> bool is return c >= "0" && c <= "9" end
+
+;; strconv.ParseFloat zaakceptowalby ten literal (bez heksadecymalnych)?
+pub fn is_number(raw: string) -> bool is
+    let mut s: string = raw
+    if string_len(s) == 0 is return false end
+    if string_starts_with(s, "+") || string_starts_with(s, "-") is s = string_slice(s, 1, string_len(s)) end
+    let low: string = string_lower(s)
+    if low == "inf" || low == "infinity" || low == "nan" is return true end
+    let n: int = string_len(s)
+    let mut i: int = 0
+    let mut nd: int = 0
+    while i < n && is_digit(string_at(s, i)) is
+        i += 1
+        nd += 1
+    end
+    if i < n && string_at(s, i) == "." is
+        i += 1
+        while i < n && is_digit(string_at(s, i)) is
+            i += 1
+            nd += 1
+        end
+    end
+    if nd == 0 is return false end
+    if i < n && (string_at(s, i) == "e" || string_at(s, i) == "E") is
+        i += 1
+        if i < n && (string_at(s, i) == "+" || string_at(s, i) == "-") is i += 1 end
+        let mut ed: int = 0
+        while i < n && is_digit(string_at(s, i)) is
+            i += 1
+            ed += 1
+        end
+        if ed == 0 is return false end
+    end
+    return i == n
+end
+
+fn strip_lead_zeros(d: string) -> string is
+    let mut i: int = 0
+    while i < string_len(d) - 1 && string_at(d, i) == "0" is i += 1 end
+    return string_slice(d, i, string_len(d))
+end
+
+;; formatNumber z Go: calkowite -> %d, reszta -> %g (najkrotsza reprezentacja)
+pub fn format_number(raw: string) -> string is
+    let mut s: string = raw
+    let mut neg: bool = false
+    if string_starts_with(s, "+") is s = string_slice(s, 1, string_len(s)) end
+    if string_starts_with(s, "-") is
+        neg = true
+        s = string_slice(s, 1, string_len(s))
+    end
+    let low: string = string_lower(s)
+    if low == "inf" || low == "infinity" is
+        if neg is return "-Inf" end
+        return "+Inf"
+    end
+    if low == "nan" is return "NaN" end
+    let mut mant: string = s
+    let mut exp: int = 0
+    let epos: int = if string_find(low, "e") >= 0 then string_find(low, "e") else -1
+    if epos >= 0 is
+        mant = string_slice(s, 0, epos)
+        let et: string = string_slice(s, epos + 1, string_len(s))
+        if string_starts_with(et, "+") is exp = str_to_int(string_slice(et, 1, string_len(et)))
+        else if string_starts_with(et, "-") is exp = 0 - str_to_int(string_slice(et, 1, string_len(et)))
+        else is exp = str_to_int(et) end
+    end
+    let dot: int = string_find(mant, ".")
+    let mut ip: string = mant
+    let mut fp: string = ""
+    if dot >= 0 is
+        ip = string_slice(mant, 0, dot)
+        fp = string_slice(mant, dot + 1, string_len(mant))
+    end
+    let mut digits: string = strip_lead_zeros(ip + fp)
+    let mut e10: int = exp - string_len(fp)
+    while string_len(digits) > 1 && string_ends_with(digits, "0") is
+        digits = string_slice(digits, 0, string_len(digits) - 1)
+        e10 += 1
+    end
+    if digits == "0" is return "0" end
+    let sign: string = if neg then "-" else ""
+    if e10 >= 0 && string_len(digits) + e10 <= 18 is
+        return sign + digits + string_repeat("0", e10)
+    end
+    let x: int = string_len(digits) + e10 - 1
+    if x < -4 || x >= 6 is
+        let mut m: string = string_slice(digits, 0, 1)
+        if string_len(digits) > 1 is m = m + "." + string_slice(digits, 1, string_len(digits)) end
+        let ax: int = if x < 0 then 0 - x else x
+        let es: string = if ax < 10 then "0" + to_string(ax) else to_string(ax)
+        return sign + m + "e" + (if x < 0 then "-" else "+") + es
+    end
+    if e10 >= 0 is return sign + digits + string_repeat("0", e10) end
+    let nd: int = string_len(digits)
+    if nd + e10 > 0 is
+        return sign + string_slice(digits, 0, nd + e10) + "." + string_slice(digits, nd + e10, nd)
+    end
+    return sign + "0." + string_repeat("0", 0 - (nd + e10)) + digits
+end
+
+;; --- skalary / tablice ---
+pub fn unescape_string(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        if c == "\\" && i + 1 < string_len(s) is
+            let n: string = string_at(s, i + 1)
+            if n == "n" is out = out + "\n"
+            else if n == "t" is out = out + "\t"
+            else if n == "r" is out = out + "\r"
+            else if n == "\"" is out = out + "\""
+            else if n == "\\" is out = out + "\\"
+            else is out = out + "\\" + n end
+            i += 2
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+pub fn parse_scalar(raw0: string) -> HkVal is
+    let raw: string = string_trim(raw0)
+    if string_len(raw) >= 2 && string_starts_with(raw, "\"") && string_ends_with(raw, "\"") is
+        return HkVal { hv_ok: true, hv_kind: "s", hv_text: unescape_string(string_slice(raw, 1, string_len(raw) - 1)) }
+    end
+    let low: string = string_lower(raw)
+    if low == "true" is return HkVal { hv_ok: true, hv_kind: "b", hv_text: "true" } end
+    if low == "false" is return HkVal { hv_ok: true, hv_kind: "b", hv_text: "false" } end
+    if is_number(raw) is return HkVal { hv_ok: true, hv_kind: "n", hv_text: raw } end
+    return HkVal { hv_ok: true, hv_kind: "s", hv_text: raw }
+end
+
+fn split_array_elements(s: string) -> [string] is
+    let mut parts: [string] = []
+    let mut cur: string = ""
+    let mut in_q: bool = false
+    let mut esc: bool = false
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        i += 1
+        if esc is
+            cur = cur + c
+            esc = false
+        else if c == "\\" && in_q is
+            cur = cur + c
+            esc = true
+        else if c == "\"" is
+            in_q = !in_q
+            cur = cur + c
+        else if c == "," && !in_q is
+            parts = array_push(parts, cur)
+            cur = ""
+        else is
+            cur = cur + c
+        end
+    end
+    if string_len(cur) > 0 is parts = array_push(parts, cur) end
+    return parts
+end
+
+;; wartosc po "=>": tablica albo skalar. Zwraca HkVal (dla tablicy hv_text = elementy sklejone 0x1f).
+pub fn parse_scalar_or_array(raw0: string) -> HkVal is
+    let raw: string = string_trim(raw0)
+    if string_starts_with(raw, "[") && string_ends_with(raw, "]") && string_len(raw) >= 2 is
+        let inner: string = string_trim(string_slice(raw, 1, string_len(raw) - 1))
+        if inner == "" is return HkVal { hv_ok: true, hv_kind: "a", hv_text: "" } end
+        let parts: [string] = split_array_elements(inner)
+        let mut joined: string = ""
+        let mut i: int = 0
+        while i < array_len(parts) is
+            let v: HkVal = parse_scalar(parts[i])
+            if i > 0 is joined = joined + asep() end
+            joined = joined + v.hv_kind + v.hv_text
+            i += 1
+        end
+        return HkVal { hv_ok: true, hv_kind: "a", hv_text: joined }
+    end
+    return parse_scalar(raw)
+end
+
+pub fn array_items(v: HkVal) -> [string] is
+    if v.hv_text == "" is return [] end
+    return string_split(v.hv_text, asep())
+end
+pub fn item_kind(it: string) -> string is return string_slice(it, 0, 1) end
+pub fn item_text(it: string) -> string is return string_slice(it, 1, string_len(it)) end
+
+;; ============================ PARSER ============================
+
+fn strip_quotes(s: string) -> string is
+    if string_len(s) >= 2 && string_starts_with(s, "\"") && string_ends_with(s, "\"") is
+        return string_slice(s, 1, string_len(s) - 1)
+    end
+    return s
+end
+
+fn go_quote(s: string) -> string is
+    return "\"" + string_replace(string_replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+end
+
+fn fail_st(st: PState, msg: string) -> PState is
+    return PState { ps_doc: st.ps_doc, ps_err: msg, ps_section: st.ps_section, ps_stack: st.ps_stack }
+end
+
+fn with_doc(st: PState, doc: HkDoc) -> PState is
+    return PState { ps_doc: doc, ps_err: st.ps_err, ps_section: st.ps_section, ps_stack: st.ps_stack }
+end
+
+fn set_node(doc: HkDoc, full: string, kind: string, val: string) -> HkDoc is
+    if kind == "m" is
+        return put(drop_children(doc, full), full, "m", "")
+    end
+    return put(doc, full, kind, val)
+end
+
+;; Sciezka (klucz) ostatniego segmentu po rozwinieciu kropek.
+fn final_key(target: string, key: string) -> string is
+    let segs: [string] = split_path(key)
+    if array_len(segs) <= 1 is return target + sep() + key end
+    let mut cur: string = target
+    let mut i: int = 0
+    while i < array_len(segs) is
+        cur = cur + sep() + segs[i]
+        i += 1
+    end
+    return cur
+end
+
+fn insert_dot(st: PState, target: string, key: string, kind: string, val: string) -> PState is
+    let segs: [string] = split_path(key)
+    let mut doc: HkDoc = st.ps_doc
+    if array_len(segs) <= 1 is
+        let full: string = target + sep() + key
+        if kind_of(doc, full) == "m" && kind != "m" is return fail_st(st, key_conflict(key)) end
+        return with_doc(st, set_node(doc, full, kind, val))
+    end
+    let mut cur: string = target
+    let mut i: int = 0
+    while i < array_len(segs) - 1 is
+        let full: string = cur + sep() + segs[i]
+        let ek: string = kind_of(doc, full)
+        if ek == "" is
+            doc = put(doc, full, "m", "")
+        else if ek != "m" is
+            let mut pref: [string] = []
+            let mut j: int = 0
+            while j <= i is
+                pref = array_push(pref, segs[j])
+                j += 1
+            end
+            return fail_st(st, key_conflict(array_join(pref, ".")))
+        end
+        cur = full
+        i += 1
+    end
+    let last: string = cur + sep() + segs[array_len(segs) - 1]
+    if kind_of(doc, last) == "m" && kind != "m" is return fail_st(st, key_conflict(key)) end
+    return with_doc(st, set_node(doc, last, kind, val))
+end
+
+fn handle_section(st: PState, line: string, line_no: int, raw: string) -> PState is
+    if !string_ends_with(line, "]") is
+        return fail_st(st, parse_error(line_no, string_len(line), "Naglowek sekcji nie jest zamkniety ']'", "Czy zapisano: [nazwa_sekcji]"))
+    end
+    let name: string = string_trim(string_slice(line, 1, string_len(line) - 1))
+    if name == "" is
+        return fail_st(st, parse_error(line_no, 2, "Nazwa sekcji nie moze byc pusta", "Przyklad: [metadata]"))
+    end
+    let ek: string = kind_of(st.ps_doc, name)
+    let mut doc: HkDoc = st.ps_doc
+    if ek == "" is
+        doc = put(doc, name, "m", "")
+    else if ek != "m" is
+        return fail_st(st, key_conflict(name))
+    end
+    return PState { ps_doc: doc, ps_err: "", ps_section: name, ps_stack: [name] }
+end
+
+fn handle_key_line(st: PState, line: string, line_no: int, raw: string) -> PState is
+    if st.ps_section == "" is
+        return fail_st(st, parse_error(line_no, 1, "Klucz zdefiniowany przed jakakolwiek sekcja", "Kazdy klucz musi byc wewnatrz [sekcji]"))
+    end
+    ;; countDashDepth
+    let mut depth: int = 0
+    while depth < string_len(line) && string_at(line, depth) == "-" is depth += 1 end
+    if depth == 0 || depth >= string_len(line) || string_at(line, depth) != ">" is
+        return fail_st(st, parse_error(line_no, depth + 1, "Oczekiwano '>' po myslnikach", "Przyklad: -> klucz => wartosc"))
+    end
+    let rest: string = string_trim(string_slice(line, depth + 1, string_len(line)))
+    if rest == "" is
+        return fail_st(st, parse_error(line_no, depth + 1, "Brak klucza po myslnikach", "Przyklad: -> klucz => wartosc"))
+    end
+    if depth > array_len(st.ps_stack) is
+        return fail_st(st, parse_error(line_no, 1, "Zbyt gleboki poziom zagniezdzenia (" + to_string(depth) + ") -- brak rodzica", "Kazdy poziom (myslnik) musi miec rodzica zdefiniowanego linia wyzej"))
+    end
+    let stack: [string] = array_slice(st.ps_stack, 0, depth)
+    let target: string = stack[depth - 1]
+    let st2: PState = PState { ps_doc: st.ps_doc, ps_err: "", ps_section: st.ps_section, ps_stack: stack }
+    let arrow: int = string_find(rest, "=>")
+    if arrow < 0 is
+        let key_name: string = strip_quotes(string_trim(rest))
+        let r: PState = insert_dot(st2, target, key_name, "m", "")
+        if r.ps_err != "" is return r end
+        return PState { ps_doc: r.ps_doc, ps_err: "", ps_section: r.ps_section, ps_stack: array_push(stack, final_key(target, key_name)) }
+    end
+    let key_part0: string = string_trim(string_slice(rest, 0, arrow))
+    let val_part: string = string_trim(string_slice(rest, arrow + 2, string_len(rest)))
+    if key_part0 == "" is
+        return fail_st(st2, parse_error(line_no, depth + 1, "Brak nazwy klucza przed '=>'", "Przyklad: -> klucz => wartosc"))
+    end
+    let v: HkVal = parse_scalar_or_array(val_part)
+    let key_part: string = strip_quotes(key_part0)
+    return insert_dot(st2, target, key_part, v.hv_kind, v.hv_text)
+end
+
+pub fn parse_string(input: string) -> HkParse is
+    let lines: [string] = string_split(input, "\n")
+    let mut st: PState = PState { ps_doc: doc_new(), ps_err: "", ps_section: "", ps_stack: [] }
+    let mut n: int = 0
+    while n < array_len(lines) is
+        let raw: string = lines[n]
+        let line: string = string_trim(raw)
+        n += 1
+        if line == "" || string_starts_with(line, "!") is
+            ;; pusta linia lub komentarz
+        else if string_starts_with(line, "[") is
+            st = handle_section(st, line, n, raw)
+            if st.ps_err != "" is return HkParse { hp_doc: doc_new(), hp_err: st.ps_err } end
+        else if string_starts_with(line, "-") is
+            st = handle_key_line(st, line, n, raw)
+            if st.ps_err != "" is return HkParse { hp_doc: doc_new(), hp_err: st.ps_err } end
+        else is
+            return HkParse { hp_doc: doc_new(), hp_err: parse_error(n, 1, "Nieoczekiwana linia: " + go_quote(line), "Linie musza zaczynac sie od '!', '[' lub '-'") }
+        end
+    end
+    return HkParse { hp_doc: st.ps_doc, hp_err: "" }
+end
+
+pub fn load_file(path: string) -> HkParse is
+    if !file_exists(path) is
+        return HkParse { hp_doc: doc_new(), hp_err: "hk: nie mozna otworzyc " + path + ": open " + path + ": no such file or directory" }
+    end
+    return parse_string(fs_read(path))
+end
+
+;; ============================ DOSTEP DO WARTOSCI ============================
+
+pub fn val_at(doc: HkDoc, key: string) -> HkVal is
+    let i: int = idx(doc, key)
+    if i < 0 is return no_val() end
+    return HkVal { hv_ok: true, hv_kind: doc.hk_kinds[i], hv_text: doc.hk_vals[i] }
+end
+
+pub fn has_section(doc: HkDoc, name: string) -> bool is
+    return kind_of(doc, name) == "m"
+end
+
+;; sec.Get(key): bezposredni potomek sekcji (bez rozwijania kropek)
+pub fn get_child(doc: HkDoc, section: string, key: string) -> HkVal is
+    return val_at(doc, section + sep() + key)
+end
+
+;; AsString() daje wynik (string/number/bool)?
+pub fn string_ok(v: HkVal) -> bool is
+    return v.hv_ok && (v.hv_kind == "s" || v.hv_kind == "n" || v.hv_kind == "b")
+end
+
+pub fn as_string(v: HkVal) -> string is
+    if v.hv_kind == "n" is return format_number(v.hv_text) end
+    return v.hv_text
+end
+
+pub fn type_mismatch_string(v: HkVal) -> string is
+    return "hk: TypeMismatch -- nie mozna skonwertowac " + kind_name(v.hv_kind) + " na string"
+end
+
+;; config.Get(path): sciezka z kropkami i indeksami tablic
+pub fn get_path(doc: HkDoc, path: string) -> HkVal is
+    let segs: [string] = split_path(path)
+    if array_len(segs) == 0 is return no_val() end
+    let first: HkVal = val_at(doc, segs[0])
+    if !first.hv_ok is return no_val() end
+    let mut cur: HkVal = first
+    let mut cur_key: string = segs[0]
+    let mut i: int = 1
+    while i < array_len(segs) is
+        let pi: [string] = parse_array_index(segs[i])
+        i += 1
+        if cur.hv_kind != "m" is return no_val() end
+        let next_key: string = cur_key + sep() + pi[0]
+        let nv: HkVal = val_at(doc, next_key)
+        if !nv.hv_ok is return no_val() end
+        cur = nv
+        cur_key = next_key
+        if pi[1] != "" is
+            if cur.hv_kind != "a" is return no_val() end
+            let items: [string] = array_items(cur)
+            let ix: int = str_to_int(pi[1])
+            if ix < 0 || ix >= array_len(items) is return no_val() end
+            cur = HkVal { hv_ok: true, hv_kind: item_kind(items[ix]), hv_text: item_text(items[ix]) }
+        end
+    end
+    return cur
+end
+
+;; dotted path sekcji.klucza do wyswietlania
+fn dotted(key: string) -> string is
+    return string_replace(key, sep(), ".")
+end
+
+;; ============================ INTERPOLACJA ============================
+
+struct RStr is
+    rs_text: string
+    rs_err:  string
+end
+
+fn resolve_ref(doc: HkDoc, ref: string, self_path: string, resolving: [string]) -> RStr is
+    if string_starts_with(ref, "env:") is
+        return RStr { rs_text: env_get(string_slice(ref, 4, string_len(ref))), rs_err: "" }
+    end
+    let mut cyc: bool = ref == self_path
+    let mut i: int = 0
+    while i < array_len(resolving) is
+        if resolving[i] == ref is cyc = true end
+        i += 1
+    end
+    if cyc is return RStr { rs_text: "", rs_err: cyclic_ref(ref) } end
+    let v: HkVal = get_path(doc, ref)
+    if !v.hv_ok is return RStr { rs_text: "", rs_err: invalid_ref(ref) } end
+    if v.hv_kind == "s" && string_contains(v.hv_text, "$" + "{{") is
+        return resolve_string(doc, v.hv_text, ref, array_push(resolving, ref))
+    end
+    if !string_ok(v) is return RStr { rs_text: "", rs_err: type_mismatch_string(v) } end
+    return RStr { rs_text: as_string(v), rs_err: "" }
+end
+
+fn resolve_string(doc: HkDoc, s: string, self_path: string, resolving: [string]) -> RStr is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(s) is
+        let tail: string = string_slice(s, i, string_len(s))
+        let start: int = string_find(tail, "$" + "{{")
+        if start < 0 is
+            out = out + tail
+            i = string_len(s)
+        else is
+            out = out + string_slice(tail, 0, start)
+            let abs_start: int = i + start
+            let sub: string = string_slice(s, abs_start, string_len(s))
+            let end_rel: int = string_find(sub, "}")
+            if end_rel < 0 is
+                return RStr { rs_text: "", rs_err: parse_error(0, 0, "Niezamknieta interpolacja w " + go_quote(s) + " (brak '}')", "") }
+            end
+            let abs_end: int = abs_start + end_rel
+            let ref: string = string_slice(s, abs_start + 2, abs_end)
+            let r: RStr = resolve_ref(doc, ref, self_path, resolving)
+            if r.rs_err != "" is return r end
+            out = out + r.rs_text
+            i = abs_end + 1
+        end
+    end
+    return RStr { rs_text: out, rs_err: "" }
+end
+
+;; ResolveInterpolations: podmienia ${...} w stringach i elementach tablic (in place).
+pub fn resolve_interpolations(doc0: HkDoc) -> HkParse is
+    let orig: HkDoc = doc_copy(doc0)
+    let mut doc: HkDoc = doc0
+    let mut i: int = 0
+    while i < array_len(doc.hk_paths) is
+        let full: string = dotted(doc.hk_paths[i])
+        let kind: string = doc.hk_kinds[i]
+        if kind == "s" is
+            let r: RStr = resolve_string(doc, doc.hk_vals[i], full, [])
+            if r.rs_err != "" is return HkParse { hp_doc: orig, hp_err: r.rs_err } end
+            doc = put(doc, doc.hk_paths[i], "s", r.rs_text)
+        else if kind == "a" is
+            let items: [string] = array_items(HkVal { hv_ok: true, hv_kind: "a", hv_text: doc.hk_vals[i] })
+            let mut joined: string = ""
+            let mut j: int = 0
+            while j < array_len(items) is
+                let it: string = items[j]
+                let mut piece: string = it
+                if item_kind(it) == "s" is
+                    let r: RStr = resolve_string(doc, item_text(it), full + "[" + to_string(j) + "]", [])
+                    if r.rs_err != "" is return HkParse { hp_doc: orig, hp_err: r.rs_err } end
+                    piece = "s" + r.rs_text
+                end
+                if j > 0 is joined = joined + asep() end
+                joined = joined + piece
+                j += 1
+            end
+            doc = put(doc, doc.hk_paths[i], "a", joined)
+        end
+        i += 1
+    end
+    return HkParse { hp_doc: doc, hp_err: "" }
+end
+
+;; ============================ SERIALIZACJA / BUILDER ============================
+
+fn looks_like_number_or_bool(s: string) -> bool is
+    let low: string = string_lower(s)
+    return low == "true" || low == "false" || is_number(s)
+end
+
+fn serialize_string(s: string) -> string is
+    let needs: bool = s == "" || string_contains(s, "\n") || string_contains(s, "\t") || string_contains(s, "\r") || string_contains(s, "\"") || string_contains(s, "\\") || looks_like_number_or_bool(s) || string_trim(s) != s
+    if !needs is return s end
+    let e1: string = string_replace(s, "\\", "\\\\")
+    let e2: string = string_replace(e1, "\"", "\\\"")
+    let e3: string = string_replace(string_replace(string_replace(e2, "\n", "\\n"), "\t", "\\t"), "\r", "\\r")
+    return "\"" + e3 + "\""
+end
+
+fn serialize_scalar(kind: string, text: string) -> string is
+    if kind == "s" is return serialize_string(text) end
+    if kind == "n" is return format_number(text) end
+    return text
+end
+
+fn write_map_lines(doc: HkDoc, key: string, depth: int) -> string is
+    let prefix: string = string_repeat("-", depth) + ">"
+    let kids: [string] = children(doc, key)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: string = kids[i]
+        let kind: string = kind_of(doc, k)
+        let name: string = last_segment(k)
+        i += 1
+        if kind == "m" is
+            out = out + prefix + " " + name + "\n" + write_map_lines(doc, k, depth + 1)
+        else if kind == "a" is
+            let items: [string] = array_items(val_at(doc, k))
+            let mut parts: [string] = []
+            let mut j: int = 0
+            while j < array_len(items) is
+                parts = array_push(parts, serialize_scalar(item_kind(items[j]), item_text(items[j])))
+                j += 1
+            end
+            out = out + prefix + " " + name + " => [" + array_join(parts, ", ") + "]\n"
+        else is
+            out = out + prefix + " " + name + " => " + serialize_scalar(kind, val_at(doc, k).hv_text) + "\n"
+        end
+    end
+    return out
+end
+
+pub fn serialize(doc: HkDoc) -> string is
+    let mut b: string = ""
+    let sections: [string] = children(doc, "")
+    let mut i: int = 0
+    while i < array_len(sections) is
+        if kind_of(doc, sections[i]) == "m" is
+            b = b + "[" + sections[i] + "]\n" + write_map_lines(doc, sections[i], 1) + "\n"
+        end
+        i += 1
+    end
+    let mut t: string = b
+    while string_ends_with(t, "\n") is t = string_slice(t, 0, string_len(t) - 1) end
+    return t + "\n"
+end
+
+pub fn write_file(path: string, doc: HkDoc) -> string is
+    let e: string = fsx::write_file(path, serialize(doc), 420)
+    if e != "" is return "hk: nie mozna zapisac " + path + ": " + e end
+    return ""
+end
+
+;; Builder: Section(name).Set(key, value)
+fn ensure_section(doc: HkDoc, name: string) -> HkDoc is
+    if kind_of(doc, name) == "" is return put(doc, name, "m", "") end
+    return doc
+end
+
+pub fn set_string(doc: HkDoc, section: string, key: string, v: string) -> HkDoc is
+    return put(ensure_section(doc, section), section + sep() + key, "s", v)
+end
+
+pub fn set_bool(doc: HkDoc, section: string, key: string, v: bool) -> HkDoc is
+    let t: string = if v then "true" else "false"
+    return put(ensure_section(doc, section), section + sep() + key, "b", t)
+end
