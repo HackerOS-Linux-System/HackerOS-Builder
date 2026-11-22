@@ -1,0 +1,27 @@
+use "std -> test" from "test"
+mod fsx
+mod proc
+
+pub fn tmpdir() -> string is
+    return string_trim(shell("mktemp -d /tmp/hosb-test-XXXXXX"))
+end
+
+pub fn put(path: string, content: string) is
+    fsx::write_file_p(path, content, 420)
+end
+
+pub fn eq_s(got: string, want: string) is
+    if got != want is test::fail("oczekiwano [" + want + "], otrzymano [" + got + "]") end
+end
+
+pub fn eq_i(got: int, want: int) is
+    if got != want is test::fail("oczekiwano " + to_string(want) + ", otrzymano " + to_string(got)) end
+end
+
+pub fn is_true(c: bool, msg: string) is
+    if !c is test::fail(msg) end
+end
+
+pub fn contains(hay: string, needle: string) is
+    if !string_contains(hay, needle) is test::fail("brak [" + needle + "] w: " + hay) end
+end
