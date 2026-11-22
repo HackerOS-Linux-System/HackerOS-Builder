@@ -1,0 +1,52 @@
+mod sysc
+mod proc
+mod fsx
+
+pub fn default_timeout_secs() -> int is return 30 end
+pub fn registry_timeout_secs() -> int is return 300 end
+
+pub fn user_agent_03() -> string is
+    return "hackeros-builder/0.3 (+https://github.com/HackerOS-Linux-System/hackeros-builder)"
+end
+
+pub fn user_agent_09() -> string is
+    return "hackeros-builder/0.9 (+https://github.com/HackerOS-Linux-System/hackeros-builder)"
+end
+
+pub struct FetchRes is
+    pub fr_status: int
+    pub fr_err:    string
+end
+
+;; GET do pliku. fr_err != "" przy bledzie transportu; fr_status = kod HTTP (0 gdy brak odpowiedzi).
+pub fn fetch_to_file(url: string, dest: string, ua: string) -> FetchRes is
+    let se: string = proc::tmp_path("curl")
+    let so: string = proc::tmp_path("code")
+    let rc: int = sysc::sh("curl -sS -L -m " + to_string(default_timeout_secs()) + " -A " + proc::sq(ua) + " -o " + proc::sq(dest) + " -w '%{{http_code}}' " + proc::sq(url) + " >" + proc::sq(so) + " 2>" + proc::sq(se))
+    let code_txt: string = string_trim(proc::read_file_or_empty(so))
+    let err_txt: string = string_trim(proc::read_file_or_empty(se))
+    sysc::sh("rm -f " + proc::sq(so) + " " + proc::sq(se))
+    if rc != 0 is
+        return FetchRes { fr_status: 0, fr_err: "zadanie HTTP nie powiodlo sie (timeout " + to_string(default_timeout_secs()) + "s): " + err_txt }
+    end
+    let code: int = if code_txt == "" then 0 else str_to_int(code_txt)
+    return FetchRes { fr_status: code, fr_err: "" }
+end
+
+;; fetchBytes: pobiera i sprawdza status 200. Zwraca "" gdy OK.
+pub fn fetch_ok(url: string, dest: string, ua: string) -> string is
+    let r: FetchRes = fetch_to_file(url, dest, ua)
+    if r.fr_err != "" is return r.fr_err end
+    if r.fr_status != 200 is
+        return "status HTTP " + to_string(r.fr_status) + " (URL: " + url + ")"
+    end
+    return ""
+end
+
+;; SHA256 pliku (hex) albo "" przy bledzie.
+pub fn sha256_file(path: string) -> string is
+    let out: string = shell("sha256sum " + proc::sq(path) + " 2>/dev/null")
+    let f: [string] = string_split(string_trim(out), " ")
+    if array_len(f) == 0 is return "" end
+    return f[0]
+end
