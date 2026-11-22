@@ -1,0 +1,41 @@
+mod hk
+
+pub struct HammerConfigParams is
+    pub hc_sysroot:     string
+    pub hc_ostree_repo: string
+    pub hc_os_name:     string
+    pub hc_lists_path:  string
+    pub hc_sources_list: string
+    pub hc_sources_dir: string
+    pub hc_keyring_dir: string
+    pub hc_require_gpg: bool
+    pub hc_origin:      string
+end
+
+pub fn empty_params() -> HammerConfigParams is
+    return HammerConfigParams { hc_sysroot: "", hc_ostree_repo: "", hc_os_name: "", hc_lists_path: "", hc_sources_list: "", hc_sources_dir: "", hc_keyring_dir: "", hc_require_gpg: false, hc_origin: "" }
+end
+
+fn or_default(v: string, d: string) -> string is
+    if v == "" is return d end
+    return v
+end
+
+pub fn generate(p: HammerConfigParams) -> hk::HkDoc is
+    let mut d: hk::HkDoc = hk::doc_new()
+    d = hk::set_string(d, "sysroot", "path", or_default(p.hc_sysroot, "/"))
+    d = hk::set_string(d, "ostree", "repo_path", or_default(p.hc_ostree_repo, "/ostree/repo"))
+    d = hk::set_string(d, "system", "osname", or_default(p.hc_os_name, "debian"))
+    d = hk::set_string(d, "apt", "lists_paths", or_default(p.hc_lists_path, "/var/lib/hammer/lists"))
+    d = hk::set_string(d, "sources", "sources_list", or_default(p.hc_sources_list, "/etc/hammer/sources-list.hk"))
+    d = hk::set_string(d, "sources", "sources_dir", or_default(p.hc_sources_dir, "/etc/hammer/sources-list.d"))
+    d = hk::set_string(d, "sources", "keyring_dir", or_default(p.hc_keyring_dir, "/etc/hammer/trusted.gpg.d"))
+    d = hk::set_bool(d, "sources", "require_gpg", p.hc_require_gpg)
+    if p.hc_origin != "" is d = hk::set_string(d, "origin", "refspec", p.hc_origin) end
+    return d
+end
+
+;; "" = OK
+pub fn write_hammer_config(dest: string, p: HammerConfigParams) -> string is
+    return hk::write_file(dest, generate(p))
+end
