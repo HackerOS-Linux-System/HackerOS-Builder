@@ -1,0 +1,46 @@
+mod buildlock
+mod testutil
+mod fsx
+
+#[test]
+fn test_acquire_fresh_dir() is
+    let d: string = testutil::tmpdir()
+    let r: buildlock::LockRes = buildlock::acquire(d + "/wd")
+    testutil::eq_s(r.lr_err, "")
+    buildlock::release(r.lr_lock)
+end
+
+#[test]
+fn test_acquire_fails_when_locked() is
+    let d: string = testutil::tmpdir()
+    let r: buildlock::LockRes = buildlock::acquire(d)
+    testutil::eq_s(r.lr_err, "")
+    let r2: buildlock::LockRes = buildlock::acquire(d)
+    testutil::contains(r2.lr_err, "jest juz uzywany przez inny build")
+    buildlock::release(r.lr_lock)
+end
+
+#[test]
+fn test_acquire_after_release() is
+    let d: string = testutil::tmpdir()
+    let r: buildlock::LockRes = buildlock::acquire(d)
+    buildlock::release(r.lr_lock)
+    let r2: buildlock::LockRes = buildlock::acquire(d)
+    testutil::eq_s(r2.lr_err, "")
+    buildlock::release(r2.lr_lock)
+end
+
+#[test]
+fn test_creates_workdir() is
+    let d: string = testutil::tmpdir() + "/a/b/c"
+    let r: buildlock::LockRes = buildlock::acquire(d)
+    testutil::eq_s(r.lr_err, "")
+    testutil::is_true(fsx::is_dir(d), "katalog utworzony")
+    buildlock::release(r.lr_lock)
+end
+
+#[test]
+fn test_release_of_empty_lock_is_noop() is
+    buildlock::release(buildlock::Lock { lk_fd: -1, lk_path: "" })
+    buildlock::release(buildlock::Lock { lk_fd: -1, lk_path: "" })
+end
