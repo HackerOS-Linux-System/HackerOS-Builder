@@ -1,0 +1,611 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod prog
+mod strx
+mod config
+mod liveparse
+mod hooklang
+mod hkgen
+mod sandbox
+mod toolchain
+mod download
+mod layers
+mod track
+
+pub struct Builder is
+    pub rb_project:        liveparse::Project
+    pub rb_cfg:            config::Config
+    pub rb_rootfs:         string
+    pub rb_work:           string
+    pub rb_origin:         string
+    pub rb_container_mode: bool
+    pub rb_layer_paths:    [string]
+end
+
+pub struct BuildRes is
+    pub bd_builder: Builder
+    pub bd_err:     string
+end
+
+pub fn new_builder(project: liveparse::Project, cfg: config::Config, rootfs_dir: string, work_dir: string) -> Builder is
+    return Builder { rb_project: project, rb_cfg: cfg, rb_rootfs: rootfs_dir, rb_work: work_dir, rb_origin: "", rb_container_mode: false, rb_layer_paths: [] }
+end
+
+fn hammer_deps() -> [string] is
+    return ["libostree-1-1", "libglib2.0-0t64", "liblzma5", "libbz2-1.0", "libgcc-s1"]
+end
+
+fn mac_packages(b: Builder) -> [string] is
+    if b.rb_cfg.pj_mac == "selinux" is
+        return ["selinux-basics", "selinux-policy-default", "policycoreutils", "policycoreutils-python-utils", "auditd"]
+    end
+    return ["apparmor", "apparmor-profiles", "apparmor-utils"]
+end
+
+fn cybersecurity_packages() -> [string] is
+    return ["nmap", "netcat-openbsd", "tcpdump", "wireshark", "whois", "dnsutils", "hydra", "john", "hashcat", "aircrack-ng", "sqlmap", "nikto", "radare2", "binwalk", "foremost", "steghide", "gdb"]
+end
+
+fn sandbox_exec(b: Builder, args: [string]) -> string is
+    return sandbox::exec(b.rb_rootfs, args)
+end
+
+;; --- apt z paskiem postepu opartym na liniach "Setting up " ---
+fn count_apt_planned_ops(rootfs: string, sim_args: [string]) -> int is
+    let job: proc::Job = sandbox::start_with_lines(rootfs, [], strx::concat(["apt-get"], sim_args))
+    proc::job_wait(job)
+    let n: int = proc::job_count(job, ["Inst "])
+    proc::job_cleanup(job)
+    return n
+end
+
+fn apt_install_with_progress(b: Builder, label: string, pkgs: [string], extra: [string]) -> string is
+    if array_len(pkgs) == 0 is return "" end
+    let sim_args: [string] = strx::concat(strx::concat(["install", "-y", "-s"], extra), pkgs)
+    let total: int = count_apt_planned_ops(b.rb_rootfs, sim_args)
+    let base: [string] = ["install", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+    let install_args: [string] = strx::concat(strx::concat(base, extra), pkgs)
+    let bar: prog::Bar = prog::new(label, total, "pakietow")
+    let job: proc::Job = sandbox::start_with_lines(b.rb_rootfs, [], strx::concat(["apt-get"], install_args))
+    let r: track::TrackRes = track::finish_job(job, bar, ["Setting up "], "apt", "apt-get install")
+    if r.tk_rc != 0 is
+        return "instalacja pakietow " + label + " (" + proc::format_args(pkgs) + "): sandbox: exec \"apt-get\" w " + b.rb_rootfs + " nie powiodl sie: exit status " + to_string(r.tk_rc)
+    end
+    return ""
+end
+
+fn install_cybersecurity_packages(b: Builder) -> string is
+    let mut pkgs: [string] = cybersecurity_packages()
+    let mut source: string = "wbudowana lista domyslna"
+    if array_len(b.rb_cfg.pj_cyber_pkgs) > 0 is
+        pkgs = b.rb_cfg.pj_cyber_pkgs
+        source = "[project] -> cybersecurity_packages w config.hk"
+    end
+    ui::info("  cybersecurity ([project] -> type=cybersecurity): instalacja " + to_string(array_len(pkgs)) + " pakietow (" + source + ")...")
+    return apt_install_with_progress(b, "cybersecurity", pkgs, [])
+end
+
+fn install_mac_packages(b: Builder) -> string is
+    let pkgs: [string] = mac_packages(b)
+    let mac_name: string = if b.rb_cfg.pj_mac == "selinux" then "SELinux" else "AppArmor"
+    ui::info("  MAC (" + mac_name + "): instalacja " + to_string(array_len(pkgs)) + " pakietow...")
+    return apt_install_with_progress(b, "MAC:" + mac_name, pkgs, [])
+end
+
+;; --- etapy ---
+fn prepare_dir(b: Builder) -> string is
+    let e: string = fsx::remove_all(b.rb_rootfs)
+    if e != "" is return "czyszczenie " + b.rb_rootfs + ": " + e end
+    let m: string = fsx::mkdir_p(b.rb_rootfs)
+    if m != "" is return "tworzenie " + b.rb_rootfs + ": " + m end
+    return ""
+end
+
+fn run_debootstrap(b: Builder) -> string is
+    let args: [string] = ["debootstrap", "--arch=" + config::effective_arch(b.rb_cfg), b.rb_cfg.cfg_release, b.rb_rootfs, config::effective_mirror(b.rb_cfg)]
+    ui::debug("exec (streaming+lines): " + proc::join_args(args))
+    let pre: [string] = ["I: Retrieving ", "I: Validating ", "I: Extracting ", "I: Unpacking ", "I: Configuring "]
+    let r: track::TrackRes = track::run_line(proc::join_args(args), "debootstrap", 0, "operacji", pre, "debootstrap", "debootstrap")
+    if r.tk_rc != 0 is
+        let tail: string = if r.tk_tail == "" then "" else "\nostatnie linie debootstrap:\n" + r.tk_tail
+        return "komenda \"debootstrap\" " + proc::format_args(strx::concat([], array_slice(args, 1, array_len(args)))) + " nie powiodla sie: exit status " + to_string(r.tk_rc) + tail
+    end
+    return ""
+end
+
+fn sudo_stub_text() -> string is
+    return "#!/bin/sh\n# sudo-stub wygenerowany przez hackeros-builder.\n# Hooki pisane z myslą o normalnej maszynie uzywaja 'sudo <cmd>' -- wewnatrz\n# kontenera nspawn build jest rootem, wiec sudo jest zbedne. Ten stub\n# po prostu odpala komende bezposrednio, eliminujac \"sudo: not found\".\nexec \"$@\"\n"
+end
+
+fn install_sudo_stub(b: Builder) -> string is
+    let stub_dir: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "usr"), "local"), "sbin")
+    let e: string = fsx::mkdir_p(stub_dir)
+    if e != "" is return e end
+    let stub_path: string = fsx::join(stub_dir, "sudo")
+    let we: string = fsx::write_file(stub_path, sudo_stub_text(), 493)
+    if we != "" is return "zapis sudo-stub: " + we end
+    ui::info("  sudo-stub zainstalowany: " + stub_path)
+    return ""
+end
+
+fn remove_sudo_stub(b: Builder) is
+    let stub_path: string = fsx::join(fsx::join(fsx::join(fsx::join(b.rb_rootfs, "usr"), "local"), "sbin"), "sudo")
+    if fsx::lexists(stub_path) is
+        if proc::run_or_error(["rm", "-f", stub_path]) != "" is
+            ui::warn("Nie mozna usunac sudo-stub " + stub_path + ": blad")
+        end
+    end
+end
+
+pub fn boot_has_any_kernel(rootfs: string) -> bool is
+    return array_len(fsx::glob_prefix(fsx::join(rootfs, "boot"), "vmlinuz-")) > 0
+end
+
+pub fn packages_with_live_boot(b: Builder) -> [string] is
+    let mut pkgs: [string] = b.rb_project.lp_packages
+    if b.rb_container_mode is return pkgs end
+    let lb: [string] = ["live-boot", "live-boot-initramfs-tools"]
+    let mut i: int = 0
+    while i < array_len(lb) is
+        let p: string = lb[i]
+        i += 1
+        if !strx::contains(pkgs, p) && !strx::contains(b.rb_project.lp_excluded, p) is
+            ui::info("  dopisuje " + ui::quote(p) + " do pakietow (wymagane przez boot=live; live-build robi to automatycznie)")
+            pkgs = array_push(pkgs, p)
+        end
+    end
+    return pkgs
+end
+
+fn install_packages(b: Builder) -> string is
+    let e: string = sandbox_exec(b, ["apt-get", "update"])
+    if e != "" is return "apt-get update: " + e end
+    if array_len(b.rb_project.lp_packages) == 0 is return "" end
+    return apt_install_with_progress(b, "pakiety projektu", packages_with_live_boot(b), ["-o", "APT::Get::Assume-Yes=true"])
+end
+
+fn write_initramfs_conf(b: Builder) -> string is
+    let conf_dir: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "etc"), "initramfs-tools"), "conf.d")
+    let e: string = fsx::mkdir_p(conf_dir)
+    if e != "" is return e end
+    let conf: string = "# hackeros-builder: initrd musi dzialac na DOWOLNYM sprzecie (live ISO), nie tylko na hoscie budujacym.\nMODULES=most\n"
+    let we: string = fsx::write_file(fsx::join(conf_dir, "hackeros-live.conf"), conf, 420)
+    if we != "" is return we end
+    let modules: string = "# hackeros-builder: moduly wymagane przez boot=live\nsquashfs\noverlay\nloop\nisofs\nudf\nvfat\nnls_cp437\nnls_utf8\nnls_iso8859-1\nsr_mod\nsd_mod\ncdrom\nusb_storage\nuas\nahci\nnvme\nvirtio_blk\nvirtio_scsi\nvirtio_pci\nata_piix\n"
+    let mp: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "etc"), "initramfs-tools"), "modules")
+    let old: string = proc::read_file_or_empty(mp)
+    return fsx::write_file(mp, old + modules, 420)
+end
+
+fn verify_initrd_script() -> string is
+    return "set -e
+found=0
+for f in /boot/initrd.img-*; do
+  [ -e \"$f\" ] || continue
+  found=1
+  list=$(lsinitramfs \"$f\")
+  echo \"$list\" | grep -Eq '(^|/)scripts/live$' || {{ echo \"BLAD: $f nie zawiera scripts/live (brak live-boot-initramfs-tools?)\" >&2; exit 1; }}
+  echo \"$list\" | grep -Eq '(^|/)lib/live/boot/' || {{ echo \"BLAD: $f nie zawiera lib/live/boot (brak live-boot?)\" >&2; exit 1; }}
+  echo \"$list\" | grep -Eq 'squashfs(\\.ko[^ ]*)?$' || echo \"OSTRZEZENIE: $f nie ma squashfs.ko (moze byc wbudowany w jadro)\" >&2
+  echo \"$list\" | grep -Eq 'overlay(\\.ko[^ ]*)?$' || echo \"OSTRZEZENIE: $f nie ma overlay.ko (moze byc wbudowany w jadro)\" >&2
+done
+[ \"$found\" = 1 ] || {{ echo \"BLAD: brak /boot/initrd.img-*\" >&2; exit 1; }}
+"
+end
+
+fn verify_initrd(b: Builder) -> string is
+    return sandbox_exec(b, ["sh", "-c", verify_initrd_script()])
+end
+
+fn apply_extra_sources(b: Builder) -> string is
+    let sources_dir: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "etc"), "apt"), "sources.list.d")
+    let e: string = fsx::mkdir_p(sources_dir)
+    if e != "" is return e end
+    let list_path: string = fsx::join(sources_dir, "hackeros-extra.list")
+    let body: string = array_join(b.rb_project.lp_extra_sources, "\n") + "\n"
+    let we: string = fsx::write_file(list_path, body, 420)
+    if we != "" is return "tworzenie " + list_path + ": " + we end
+    let mut i: int = 0
+    while i < array_len(b.rb_project.lp_extra_keys) is
+        let key_path: string = b.rb_project.lp_extra_keys[i]
+        i += 1
+        let dest: string = fsx::join(fsx::join(fsx::join(fsx::join(b.rb_rootfs, "etc"), "apt"), "trusted.gpg.d"), fsx::basename(key_path))
+        let ce: string = fsx::copy_file(key_path, dest, 420)
+        if ce != "" is return "kopiowanie klucza GPG " + key_path + ": " + ce end
+    end
+    return ""
+end
+
+fn remove_existing_entry(dest: string) -> string is
+    if !fsx::lexists(dest) is return "" end
+    if fsx::is_dir(dest) && !fsx::is_symlink(dest) is
+        return dest + " jest juz katalogiem w rootfs, a includes.chroot probuje nadpisac go plikiem/symlinkiem -- to prawdopodobnie blad w strukturze projektu (sciezka zajeta przez pakiet lub inny wczesniejszy krok), sprawdz zawartosc includes.chroot* recznie"
+    end
+    let r: string = proc::run_or_error(["rm", "-f", dest])
+    if r != "" is return "usuwanie istniejacego wpisu " + dest + " przed nadpisaniem: " + r end
+    return ""
+end
+
+;; filepath.Walk(srcDir) -> kopiowanie do rootfs (katalogi: prawa & ~umask, pliki: dokladne prawa, symlinki odtwarzane)
+pub fn copy_dir_to_dir(src_dir: string, dest_root: string) -> string is
+    let listing: string = shell("cd " + proc::sq(src_dir) + " && find . -mindepth 1 -printf '%P\\037%y\\037%m\\n' | LC_ALL=C sort")
+    let lines: [string] = fsx::non_empty_lines(listing)
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let f: [string] = string_split(lines[i], "\x1f")
+        i += 1
+        let rel: string = f[0]
+        let kind: string = f[1]
+        let mode: int = fsx::oct(f[2])
+        let src: string = fsx::join(src_dir, rel)
+        let dest: string = fsx::join(dest_root, rel)
+        if kind == "d" is
+            let e: string = fsx::mkdir_all_mode(dest, mode)
+            if e != "" is return e end
+        else is
+            let re: string = remove_existing_entry(dest)
+            if re != "" is return re end
+            if kind == "l" is
+                let target: string = fsx::readlink(src)
+                let se: string = fsx::symlink_force(target, dest)
+                if se != "" is return se end
+            else is
+                let ce: string = fsx::copy_file(src, dest, mode)
+                if ce != "" is return ce end
+            end
+        end
+    end
+    return ""
+end
+
+fn copy_dir_to_rootfs(b: Builder, src_dir: string) -> string is
+    return copy_dir_to_dir(src_dir, b.rb_rootfs)
+end
+
+fn ensure_hook_interpreters(b: Builder, hooks: [liveparse::HookScript]) -> string is
+    let mut order: [string] = []
+    let mut i: int = 0
+    while i < array_len(hooks) is
+        let pkg: string = hooklang::interpreter_package(hooks[i].hs_interp)
+        i += 1
+        if pkg != "" && !strx::contains(order, pkg) is order = array_push(order, pkg) end
+    end
+    if array_len(order) == 0 is return "" end
+    order = strx::sort_strings(order)
+    ui::info("  interpretery hookow: instalacja " + array_join(order, ", ") + "...")
+    let args: [string] = strx::concat(["apt-get", "install", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"], order)
+    let e: string = sandbox_exec(b, args)
+    if e != "" is return "instalacja interpreterow hookow (" + proc::format_args(order) + "): " + e end
+    return ""
+end
+
+fn run_hooks_inner(b: Builder) -> string is
+    let hooks: [liveparse::HookScript] = b.rb_project.lp_hooks
+    if array_len(hooks) == 0 is
+        ui::info("  brak hookow (config/hooks/normal|live/*.hook.chroot) -- pominieto")
+        return ""
+    end
+    let pe: string = ensure_hook_interpreters(b, hooks)
+    if pe != "" is return "przygotowanie interpreterow hookow: " + pe end
+    let mut bar: prog::Bar = prog::new("hooki", array_len(hooks), "hookow")
+    let mut i: int = 0
+    while i < array_len(hooks) is
+        let h: liveparse::HookScript = hooks[i]
+        ui::substep("[" + to_string(i + 1) + "/" + to_string(array_len(hooks)) + "] " + h.hs_name + "  " + ui::magenta("(" + hooklang::label(h.hs_interp) + ")"))
+        let tmp_name: string = "/tmp-hackeros-hook-" + h.hs_name
+        let dest_on_host: string = fsx::join(b.rb_rootfs, tmp_name)
+        let ce: string = fsx::copy_file(h.hs_path, dest_on_host, 493)
+        if ce != "" is
+            bar = prog::fail(bar, h.hs_name)
+            return "kopiowanie hooka " + h.hs_name + ": " + ce
+        end
+        let err: string = sandbox::exec_hook(b.rb_rootfs, tmp_name)
+        fsx::remove(dest_on_host)
+        if err != "" is
+            bar = prog::fail(bar, h.hs_name)
+            if string_starts_with(err, "przekroczono limit czasu") is
+                return "hook " + h.hs_name + ": " + err + " -- hook prawdopodobnie czeka na interaktywna odpowiedz (np. whiptail/dialog/apt-get bez -y/'read' na cos co nigdy nie nadejdzie); nienadzorowany build ('hackeros-builder build ...') NIE MOZE dostarczyc takiej odpowiedzi -- popraw hook zeby dzialal w pelni bez interakcji (np. dopisz -y do apt-get/dpkg, ustaw DEBIAN_FRONTEND=noninteractive we wlasnych podprocesach hooka), albo podnies limit zmienna HACKEROS_HOOK_TIMEOUT_SECONDS jesli hook LEGALNIE potrzebuje wiecej czasu (kompilacja, duze pobieranie)"
+            end
+            if h.hs_interp != "" && !hooklang::is_recognized(h.hs_interp) is
+                return "wykonanie hooka " + h.hs_name + " (interpreter " + ui::quote(h.hs_interp) + " z shebang) nie powiodlo sie: " + err + " -- " + ui::quote(h.hs_interp) + " NIE jest jednym z jezykow z automatyczna instalacja interpretera (patrz lista nizej); jesli " + ui::quote(h.hs_interp) + " to faktycznie prawidlowy interpreter, dodaj odpowiedni pakiet recznie w config/package-lists/*.list.chroot PRZED tym hookiem (numeracja prefiksow decyduje o kolejnosci). Jezyki z automatyczna instalacja: " + array_join(hooklang::supported_languages(), "; ")
+            end
+            return "wykonanie hooka " + h.hs_name + ": " + err
+        end
+        bar = prog::add(bar, 1)
+        i += 1
+    end
+    bar = prog::finish(bar)
+    return ""
+end
+
+fn run_hooks(b: Builder) -> string is
+    let r: string = run_hooks_inner(b)
+    remove_sudo_stub(b)
+    return r
+end
+
+fn inject_hammer(b: Builder) -> string is
+    let mut version: string = env_get("HAMMER_VERSION")
+    if version == "" is version = download::latest_hammer_version() end
+    let dest_path: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "usr"), "bin"), "hammer")
+    ui::info("  hammer " + version + " (oci-mode) -> " + dest_path)
+    return download::download_hammer(version, dest_path)
+end
+
+fn generate_hammer_config(b: Builder) -> string is
+    let dest_path: string = fsx::join(fsx::join(fsx::join(b.rb_rootfs, "etc"), "hammer"), "oci.hk")
+    let e: string = fsx::mkdir_p(fsx::dirname(dest_path))
+    if e != "" is return "tworzenie katalogu " + fsx::dirname(dest_path) + ": " + e end
+    let mut p: hkgen::HammerConfigParams = hkgen::empty_params()
+    p.hc_os_name = "debian"
+    p.hc_require_gpg = true
+    p.hc_origin = b.rb_origin
+    let we: string = hkgen::write_hammer_config(dest_path, p)
+    if we != "" is return "zapis " + dest_path + ": " + we end
+    ui::info("  wygenerowano: " + dest_path)
+    return ""
+end
+
+fn install_hammer_deps(b: Builder) -> string is
+    let deps: [string] = hammer_deps()
+    ui::info("  hammer: instalacja " + to_string(array_len(deps)) + " bibliotek dynamicznych...")
+    let e: string = sandbox_exec(b, ["apt-get", "update"])
+    if e != "" is return "apt-get update przed instalacja zaleznosci hammer: " + e end
+    let args: [string] = strx::concat(["apt-get", "install", "-y", "--no-install-recommends", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"], deps)
+    let ie: string = sandbox_exec(b, args)
+    if ie != "" is return "instalacja bibliotek hammer (" + proc::format_args(deps) + "): " + ie end
+    ui::info("  hammer: weryfikacja bibliotek dynamicznych (ldd)...")
+    if sandbox_exec(b, ["ldd", "/usr/bin/hammer"]) != "" is
+        ui::warn("ldd /usr/bin/hammer zwrocilo blad -- sprawdz logi powyzej pod katem 'not found'. Brakujace biblioteki mozna dodac do hammerDeps w internal/rootfs/hammer_deps.go")
+    end
+    return ""
+end
+
+fn seed_debconf(b: Builder) -> string is
+    let preseed: string = "keyboard-configuration\tkeyboard-configuration/layout\tselect\tEnglish (US)\nkeyboard-configuration\tkeyboard-configuration/layoutcode\tstring\tus\nkeyboard-configuration\tkeyboard-configuration/variant\tselect\tEnglish (US)\nkeyboard-configuration\tkeyboard-configuration/modelcode\tstring\tpc105\nkeyboard-configuration\tkeyboard-configuration/model\tselect\tGeneric 105-key PC (intl.)\nkeyboard-configuration\tkeyboard-configuration/altgr\tselect\tThe default for the keyboard layout\nkeyboard-configuration\tkeyboard-configuration/unsupported_layout\tboolean\ttrue\nkeyboard-configuration\tkeyboard-configuration/unsupported_options\tboolean\ttrue\ntzdata\ttzdata/Areas\tselect\tEtc\ntzdata\ttzdata/Zones/Etc\tselect\tUTC\nlocales\tlocales/default_environment_locale\tselect\tC.UTF-8\nlocales\tlocales/locales_to_be_generated\tmultiselect\ten_US.UTF-8 UTF-8\ndebconf\tdebconf/frontend\tselect\tNoninteractive\ndebconf\tdebconf/priority\tselect\tcritical\nman-db\tman-db/auto-update\tboolean\tfalse\n"
+    return sandbox::exec_with_stdin(b.rb_rootfs, preseed, ["debconf-set-selections"])
+end
+
+;; RemoveAptTooling: usuwa apt/apt-get itd. (baza dpkg zostaje dla hammer)
+pub fn remove_apt_tooling(rootfs: string) -> string is
+    let bins: [string] = ["usr/bin/apt", "usr/bin/apt-get", "usr/bin/apt-cache", "usr/bin/apt-config", "usr/bin/apt-cdrom", "usr/bin/apt-mark", "usr/bin/apt-key"]
+    let mut removed: int = 0
+    let mut i: int = 0
+    while i < array_len(bins) is
+        let p: string = fsx::join(rootfs, bins[i])
+        i += 1
+        if fsx::lexists(p) is
+            let r: string = proc::run_or_error(["rm", "-f", p])
+            if r != "" is return "usuwanie " + bins[i - 1] + ": " + r end
+            removed += 1
+        end
+    end
+    let dirs: [string] = ["usr/lib/apt"]
+    let mut j: int = 0
+    while j < array_len(dirs) is
+        let p2: string = fsx::join(rootfs, dirs[j])
+        j += 1
+        if fsx::exists(p2) is
+            let e: string = fsx::remove_all(p2)
+            if e != "" is return "usuwanie katalogu " + dirs[j - 1] + ": " + e end
+            removed += 1
+        end
+    end
+    ui::info("  usunieto " + to_string(removed) + " element(ow) apt/apt-get -- baza dpkg (/var/lib/dpkg) pozostawiona nietknieta dla hammer")
+    return ""
+end
+
+;; --- warstwy ---
+struct Next is
+    nx_builder:    Builder
+    nx_checkpoint: string
+    nx_err:        string
+end
+
+fn next_layer(b: Builder, name: string, checkpoint: string, layers_dir: string) -> Next is
+    let after: string = checkpoint + ".next"
+    let se: string = layers::snapshot_tree(b.rb_rootfs, after)
+    if se != "" is return Next { nx_builder: b, nx_checkpoint: checkpoint, nx_err: "migawka rootfs po etapie " + ui::quote(name) + ": " + se } end
+    let d: layers::Diff = layers::diff_snapshots(checkpoint, after, name)
+    let layer_path: string = fsx::join(layers_dir, name + ".tar.gz")
+    let w: layers::LayerRes = layers::write_incremental_layer(b.rb_rootfs, d, layer_path)
+    if w.ly_err != "" is
+        layers::diff_free(d)
+        fsx::remove(after)
+        return Next { nx_builder: b, nx_checkpoint: checkpoint, nx_err: "zapis warstwy OCI " + ui::quote(name) + ": " + w.ly_err }
+    end
+    let paths_now: [string] = b.rb_layer_paths
+    let mut nb: Builder = b
+    if w.ly_wrote is
+        nb.rb_layer_paths = array_push(paths_now, layer_path)
+        ui::debug("warstwa OCI " + ui::quote(name) + ": " + to_string(d.df_changed_n) + " zmienionych, " + to_string(d.df_removed_n) + " usunietych sciezek -> " + layer_path)
+    else is
+        ui::debug("warstwa OCI " + ui::quote(name) + ": brak zmian -- pominieta")
+    end
+    layers::diff_free(d)
+    fsx::remove(checkpoint)
+    return Next { nx_builder: nb, nx_checkpoint: after, nx_err: "" }
+end
+
+fn fail_build(b: Builder, msg: string) -> BuildRes is
+    return BuildRes { bd_builder: b, bd_err: msg }
+end
+
+pub fn build(b0: Builder) -> BuildRes is
+    let mut b: Builder = b0
+    let mut section_label: string = "Budowa rootfs"
+    if b.rb_container_mode is section_label = "Budowa rootfs (kontener roboczy)" end
+    ui::section(section_label)
+    let pd: string = prepare_dir(b)
+    if pd != "" is return fail_build(b, pd) end
+    let layers_dir: string = fsx::join(b.rb_work, "layers")
+    let le: string = fsx::mkdir_p(layers_dir)
+    if le != "" is return fail_build(b, "tworzenie katalogu warstw OCI (" + layers_dir + "): " + le) end
+    b.rb_layer_paths = []
+    let mut checkpoint: string = proc::tmp_path("snap") + ".0"
+    let ce0: string = layers::snapshot_tree(b.rb_rootfs, checkpoint)
+    if ce0 != "" is return fail_build(b, "migawka poczatkowa rootfs: " + ce0) end
+
+    ui::step(0, 10, "sprawdzanie/pobieranie narzedzi build-time...")
+    let tc: toolchain::Manager = toolchain::new_manager(b.rb_work)
+    let te: string = toolchain::prepare_all(tc)
+    if te != "" is return fail_build(b, "toolchain: " + te) end
+    env_set("PATH", string_slice(toolchain::env(tc)[0], 5, string_len(toolchain::env(tc)[0])))
+
+    ui::step(1, 10, "debootstrap (" + b.rb_cfg.cfg_release + ")...")
+    let de: string = run_debootstrap(b)
+    if de != "" is return fail_build(b, "debootstrap: " + de) end
+
+    ui::step(2, 10, "preseed debconf + sudo-stub...")
+    let sd: string = seed_debconf(b)
+    if sd != "" is return fail_build(b, "preseed debconf: " + sd) end
+    let ss: string = install_sudo_stub(b)
+    if ss != "" is return fail_build(b, "sudo stub: " + ss) end
+    if !b.rb_container_mode is
+        let wi: string = write_initramfs_conf(b)
+        if wi != "" is return fail_build(b, "konfiguracja initramfs-tools: " + wi) end
+    end
+
+    if b.rb_project.lp_includes_before != "" is
+        ui::step(3, 10, "kopiowanie includes.chroot_before_packages...")
+        let ce: string = copy_dir_to_rootfs(b, b.rb_project.lp_includes_before)
+        if ce != "" is return fail_build(b, "includes.chroot_before_packages: " + ce) end
+    else is
+        ui::step(3, 10, "brak includes.chroot_before_packages -- pominieto")
+    end
+
+    if array_len(b.rb_project.lp_extra_sources) > 0 is
+        ui::step(4, 10, "dodatkowe zrodla apt (" + to_string(array_len(b.rb_project.lp_extra_sources)) + ")...")
+        let ae: string = apply_extra_sources(b)
+        if ae != "" is return fail_build(b, "extra sources: " + ae) end
+    else is
+        ui::step(4, 10, "brak dodatkowych zrodel apt -- pominieto")
+    end
+
+    ui::step(5, 10, "instalacja systemu MAC ([project] -> selinux=" + (if b.rb_cfg.pj_mac == "selinux" then "true" else "false") + ")...")
+    let me: string = install_mac_packages(b)
+    if me != "" is return fail_build(b, "instalacja MAC: " + me) end
+
+    if config::is_cybersecurity(b.rb_cfg) is
+        ui::step(6, 10, "pakiety cybersecurity ([project] -> type=cybersecurity)...")
+        let cy: string = install_cybersecurity_packages(b)
+        if cy != "" is return fail_build(b, "instalacja pakietow cybersecurity: " + cy) end
+    else is
+        ui::step(6, 10, "[project] -> type != cybersecurity -- pominieto")
+    end
+
+    let n1: Next = next_layer(b, "base", checkpoint, layers_dir)
+    if n1.nx_err != "" is return fail_build(b, "warstwa OCI 'base': " + n1.nx_err) end
+    checkpoint = n1.nx_checkpoint
+    b = n1.nx_builder
+
+    ui::step(7, 10, "instalacja " + to_string(array_len(b.rb_project.lp_packages)) + " pakiet(ow)...")
+    let ip: string = install_packages(b)
+    if ip != "" is return fail_build(b, "instalacja pakietow: " + ip) end
+    let n2: Next = next_layer(b, "packages", checkpoint, layers_dir)
+    if n2.nx_err != "" is return fail_build(b, "warstwa OCI 'packages': " + n2.nx_err) end
+    checkpoint = n2.nx_checkpoint
+    b = n2.nx_builder
+
+    let has_after: bool = b.rb_project.lp_includes_chroot != "" || b.rb_project.lp_includes_after != ""
+    if has_after is
+        ui::step(8, 10, "kopiowanie includes.chroot / includes.chroot_after_packages...")
+        if b.rb_project.lp_includes_chroot != "" is
+            let c1: string = copy_dir_to_rootfs(b, b.rb_project.lp_includes_chroot)
+            if c1 != "" is return fail_build(b, "includes.chroot: " + c1) end
+        end
+        if b.rb_project.lp_includes_after != "" is
+            let c2: string = copy_dir_to_rootfs(b, b.rb_project.lp_includes_after)
+            if c2 != "" is return fail_build(b, "includes.chroot_after_packages: " + c2) end
+        end
+    else is
+        ui::step(8, 10, "brak includes.chroot/includes.chroot_after_packages -- pominieto")
+    end
+
+    ui::step(9, 10, "wykonywanie " + to_string(array_len(b.rb_project.lp_hooks)) + " hook(ow)...")
+    let rh: string = run_hooks(b)
+    if rh != "" is return fail_build(b, "hooks: " + rh) end
+
+    if boot_has_any_kernel(b.rb_rootfs) is
+        ui::info("  koncowe przebudowanie initrd (update-initramfs -u -k all)...")
+        let ue: string = sandbox_exec(b, ["update-initramfs", "-u", "-k", "all"])
+        if ue != "" is
+            return fail_build(b, "update-initramfs -u -k all: " + ue + " -- initrd.img w /boot moze NIE zawierac hookow live-boot/dodatkowych modulow dopisanych PO instalacji kernela (includes.chroot_after_packages, hooki) -- bez poprawnego initrd live-medium konczy sie panika \"Attempted to kill init!\" przy starcie")
+        end
+        if !b.rb_container_mode is
+            ui::info("  weryfikacja initrd (live-boot, squashfs, overlay)...")
+            let vi: string = verify_initrd(b)
+            if vi != "" is
+                return fail_build(b, "weryfikacja initrd: " + vi + " -- initrd bez live-boot = panika jadra \"Attempted to kill init!\" przy starcie live-medium (sprawdz czy pakiety live-boot i live-boot-initramfs-tools sie zainstalowaly i nie sa wykluczone przez \"-live-boot\" w package-lists)")
+            end
+        end
+    else is
+        ui::info("  brak jadra w /boot -- pomijam koncowe update-initramfs (typowe dla ContainerMode)")
+    end
+    let n3: Next = next_layer(b, "hooks", checkpoint, layers_dir)
+    if n3.nx_err != "" is return fail_build(b, "warstwa OCI 'hooks': " + n3.nx_err) end
+    checkpoint = n3.nx_checkpoint
+    b = n3.nx_builder
+
+    if b.rb_container_mode is
+        ui::step(10, 10, "tryb kontenera roboczego (ContainerMode) -- pomijam wstrzykiwanie hammer/oci.hk")
+    else is
+        ui::step(10, 10, "wstrzykiwanie hammer + generowanie /etc/hammer/oci.hk...")
+        let ih: string = inject_hammer(b)
+        if ih != "" is return fail_build(b, "hammer injection: " + ih) end
+        let hd: string = install_hammer_deps(b)
+        if hd != "" is return fail_build(b, "hammer biblioteki dynamiczne: " + hd) end
+        let gh: string = generate_hammer_config(b)
+        if gh != "" is return fail_build(b, "generowanie /etc/hammer/oci.hk: " + gh) end
+        let n4: Next = next_layer(b, "runtime", checkpoint, layers_dir)
+        if n4.nx_err != "" is return fail_build(b, "warstwa OCI 'runtime': " + n4.nx_err) end
+        b = n4.nx_builder
+        checkpoint = n4.nx_checkpoint
+    end
+    fsx::remove(checkpoint)
+    ui::info("Rootfs zbudowany: " + b.rb_rootfs)
+    return BuildRes { bd_builder: b, bd_err: "" }
+end
+
+;; ============================ WALIDACJA ============================
+
+fn stat_err(p: string) -> string is
+    return "stat " + p + ": no such file or directory"
+end
+
+;; ValidateRootfs: "" = OK
+pub fn validate_rootfs(rootfs: string, require_hammer: bool, min_size_opt: int, min_pkgs_opt: int) -> string is
+    if !fsx::exists(rootfs) is return "rootfs " + rootfs + " nie istnieje/nie mozna odczytac: " + stat_err(rootfs) end
+    if !fsx::is_dir(rootfs) is return "rootfs " + rootfs + " nie jest katalogiem" end
+    let min_size: int = if min_size_opt <= 0 then 52428800 else min_size_opt
+    let min_pkgs: int = if min_pkgs_opt <= 0 then 10 else min_pkgs_opt
+    let total: int = fsx::tree_size(rootfs)
+    if total < min_size is
+        return "rootfs wyglada na niekompletny: " + ui::format_bytes(total) + " calkowitego rozmiaru, oczekiwano co najmniej " + ui::format_bytes(min_size) + " (debootstrap/instalacja pakietow prawdopodobnie zostaly przerwane w polowie -- brak miejsca na dysku, OOM killer, przerwane polaczenie z mirrorem) -- NIE wypychamy tego do registry"
+    end
+    let req: [string] = ["etc", "usr/bin", "var/lib/dpkg/status", "var/lib/dpkg"]
+    let mut i: int = 0
+    while i < array_len(req) is
+        let p: string = fsx::join(rootfs, req[i])
+        if !fsx::exists(p) is
+            return "rootfs wyglada na niekompletny: brak " + req[i] + " (" + stat_err(p) + ") -- to nie wyglada na dzialajacy system Debian -- NIE wypychamy tego do registry"
+        end
+        i += 1
+    end
+    if require_hammer is
+        let p2: string = fsx::join(fsx::join(fsx::join(rootfs, "etc"), "hammer"), "oci.hk")
+        if !fsx::exists(p2) is
+            return "rootfs nie zawiera /etc/hammer/oci.hk (" + stat_err(p2) + ") -- wstrzykniecie hammer prawdopodobnie zawiodlo mimo ze Build() zglosil sukces -- NIE wypychamy tego do registry"
+        end
+    end
+    let status_path: string = fsx::join(fsx::join(fsx::join(rootfs, "var"), "lib"), fsx::join("dpkg", "status"))
+    let cnt_txt: string = string_trim(shell("grep -c '^Package: ' " + proc::sq(status_path) + " 2>/dev/null"))
+    let pkg_count: int = if cnt_txt == "" then 0 else str_to_int(cnt_txt)
+    if pkg_count < min_pkgs is
+        return "baza dpkg zawiera tylko " + to_string(pkg_count) + " pakiet(ow), oczekiwano co najmniej " + to_string(min_pkgs) + " -- rootfs wyglada na niekompletny (debootstrap prawdopodobnie nie skonczyl instalacji bazowej) -- NIE wypychamy tego do registry"
+    end
+    ui::info("Walidacja rootfs OK: " + ui::format_bytes(total) + ", " + to_string(pkg_count) + " pakietow dpkg, wszystkie wymagane sciezki obecne")
+    return ""
+end
