@@ -1,0 +1,205 @@
+mod sysc
+mod ui
+
+;; Wynik komendy z przechwyconym stdout/stderr.
+pub struct RunResult is
+    pub rr_code:   int
+    pub rr_stdout: string
+    pub rr_stderr: string
+end
+
+;; Zadanie w tle (do pasków postepu opartych na REALNYCH liniach wyjscia komendy).
+pub struct Job is
+    pub job_log: string
+    pub job_rc:  string
+end
+
+;; POSIX single-quote.
+pub fn sq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+pub fn join_args(args: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(args) is
+        if i > 0 is out = out + " " end
+        out = out + sq(args[i])
+        i += 1
+    end
+    return out
+end
+
+;; Prefiks "cd <dir> && env K=V ... " gdy potrzebny.
+pub fn prefix(dir: string, env: [string]) -> string is
+    let mut p: string = ""
+    if dir != "" is p = "cd " + sq(dir) + " && " end
+    if array_len(env) > 0 is
+        p = p + "env"
+        let mut i: int = 0
+        while i < array_len(env) is
+            p = p + " " + sq(env[i])
+            i += 1
+        end
+        p = p + " "
+    end
+    return p
+end
+
+pub fn tmp_path(kind: string) -> string is
+    let base: string = env_get("TMPDIR")
+    let dir: string = if base == "" then "/tmp" else base
+    return dir + "/hosb-" + kind + "-" + to_string(sysc::pid()) + "-" + to_string(time_ms()) + "-" + to_string(now_ms() % 100000)
+end
+
+pub fn read_file_or_empty(path: string) -> string is
+    if !file_exists(path) is return "" end
+    return fs_read(path)
+end
+
+pub fn tool_exists(name: string) -> bool is
+    return sysc::sh("command -v " + sq(name) + " >/dev/null 2>&1") == 0
+end
+
+;; Sciezka do binarki w PATH albo "".
+pub fn look_path(name: string) -> string is
+    return string_trim(shell("command -v " + sq(name) + " 2>/dev/null"))
+end
+
+;; Run: synchronicznie, przechwytuje stdout/stderr. Kod != 0 nie jest bledem - sprawdza wolajacy.
+pub fn run_in_dir(dir: string, args: [string]) -> RunResult is
+    let so: string = tmp_path("so")
+    let se: string = tmp_path("se")
+    ui::debug("exec: " + join_args(args))
+    let rc: int = sysc::sh(prefix(dir, []) + join_args(args) + " >" + sq(so) + " 2>" + sq(se))
+    let res: RunResult = RunResult { rr_code: rc, rr_stdout: read_file_or_empty(so), rr_stderr: read_file_or_empty(se) }
+    sysc::sh("rm -f " + sq(so) + " " + sq(se))
+    return res
+end
+
+pub fn run(args: [string]) -> RunResult is
+    return run_in_dir("", args)
+end
+
+;; RunOrError: "" gdy OK, w przeciwnym razie komunikat bledu.
+pub fn run_or_error(args: [string]) -> string is
+    let res: RunResult = run(args)
+    if res.rr_code == 127 is
+        return "nie mozna uruchomic \"" + args[0] + "\": nie znaleziono programu"
+    end
+    if res.rr_code != 0 is
+        return "komenda \"" + args[0] + "\" " + format_args(args) + " zakonczona kodem " + to_string(res.rr_code) + "\nstderr: " + res.rr_stderr
+    end
+    return ""
+end
+
+;; Zapis jak %v z Go dla []string: [a b c]
+pub fn format_args(args: [string]) -> string is
+    let mut out: string = "["
+    let mut i: int = 0
+    while i < array_len(args) is
+        if i > 0 is out = out + " " end
+        out = out + args[i]
+        i += 1
+    end
+    return out + "]"
+end
+
+pub fn stdout_trim(args: [string]) -> string is
+    return string_trim(run(args).rr_stdout)
+end
+
+;; RunStreaming: stdout/stderr prosto na terminal. "" = OK, inaczej komunikat.
+pub fn run_streaming(dir: string, args: [string]) -> string is
+    return run_streaming_env(dir, [], args)
+end
+
+pub fn run_streaming_env(dir: string, env: [string], args: [string]) -> string is
+    ui::debug("exec (streaming): " + join_args(args))
+    let rc: int = sysc::sh(prefix(dir, env) + join_args(args))
+    if rc != 0 is
+        return "komenda \"" + args[0] + "\" " + format_args(args) + " nie powiodla sie: exit status " + to_string(rc)
+    end
+    return ""
+end
+
+;; RunWithStdin: dane z pamieci na stdin komendy. stdout/stderr przechwycone do komunikatu bledu.
+pub fn run_with_stdin(dir: string, data: string, args: [string]) -> string is
+    let inp: string = tmp_path("in")
+    let se: string = tmp_path("se")
+    fs_write(inp, data)
+    ui::debug("exec (stdin): " + join_args(args))
+    let rc: int = sysc::sh(prefix(dir, []) + join_args(args) + " <" + sq(inp) + " >/dev/null 2>" + sq(se))
+    let err: string = read_file_or_empty(se)
+    sysc::sh("rm -f " + sq(inp) + " " + sq(se))
+    if rc != 0 is
+        return "komenda \"" + args[0] + "\" " + format_args(args) + " nie powiodla sie: exit status " + to_string(rc) + "\nstderr: " + err
+    end
+    return ""
+end
+
+;; --- zadania w tle: stdout+stderr scalone, '\r' traktowane jak koniec linii (debootstrap, apt) ---
+
+;; Startuje `cmdline` (gotowa linia shella) w tle; stdout+stderr -> log, kod wyjscia -> osobny plik.
+pub fn job_start_rc(cmdline: string) -> Job is
+    let log: string = tmp_path("job") + ".log"
+    let rcf: string = tmp_path("job") + ".rc"
+    let raw: string = log + ".raw"
+    sysc::sh("rm -f " + sq(rcf) + " " + sq(raw) + " && : > " + sq(log))
+    ;; komenda -> raw (stdout+stderr); potem rc; '\r'->'\n' robimy przy czytaniu (job_lines)
+    sysc::sh("{ ( " + cmdline + " ) >" + sq(raw) + " 2>&1 ; echo $? >" + sq(rcf) + " ; } >/dev/null 2>&1 &")
+    return Job { job_log: raw, job_rc: rcf }
+end
+
+pub fn job_done(j: Job) -> bool is
+    return file_exists(j.job_rc)
+end
+
+pub fn job_code(j: Job) -> int is
+    let t: string = string_trim(read_file_or_empty(j.job_rc))
+    if t == "" is return -1 end
+    return str_to_int(t)
+end
+
+;; Liczba linii (po rozbiciu '\n' i '\r') zaczynajacych sie od ktoregos z prefiksow.
+pub fn job_count(j: Job, prefixes: [string]) -> int is
+    let mut pat: string = ""
+    let mut i: int = 0
+    while i < array_len(prefixes) is
+        if i > 0 is pat = pat + "\\|" end
+        pat = pat + "^" + prefixes[i]
+        i += 1
+    end
+    let t: string = string_trim(shell("tr '\\r' '\\n' <" + sq(j.job_log) + " 2>/dev/null | sed 's/^[[:space:]]*//' | grep -c " + sq(pat) + " 2>/dev/null"))
+    if t == "" is return 0 end
+    return str_to_int(t)
+end
+
+;; Ostatnie n linii logu (do komunikatu bledu / trybu verbose).
+pub fn job_tail(j: Job, n: int) -> string is
+    return shell("tr '\\r' '\\n' <" + sq(j.job_log) + " 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n " + to_string(n))
+end
+
+pub fn job_cleanup(j: Job) is
+    sysc::sh("rm -f " + sq(j.job_log) + " " + sq(j.job_rc))
+end
+
+;; Zadanie w tle, w ktorym do logu trafia TYLKO stdout (stderr zostaje na terminalu) - dla ExecWithLines.
+pub fn job_start_out(cmdline: string) -> Job is
+    let raw: string = tmp_path("job") + ".log"
+    let rcf: string = tmp_path("job") + ".rc"
+    sysc::sh("rm -f " + sq(rcf) + " " + sq(raw) + " && : > " + sq(raw))
+    sysc::sh("{ ( " + cmdline + " ) >" + sq(raw) + " ; echo $? >" + sq(rcf) + " ; } &")
+    return Job { job_log: raw, job_rc: rcf }
+end
+
+;; Czeka na zakonczenie zadania i zwraca jego kod wyjscia.
+pub fn job_wait(j: Job) -> int is
+    while !job_done(j) is sleep_ms(100) end
+    return job_code(j)
+end
+
+;; Linie logu (po rozbiciu na \n i \r, bez pustych) od numeru `from` (0-based) wlacznie.
+pub fn job_lines_from(j: Job, from: int) -> string is
+    return shell("tr '\\r' '\\n' <" + sq(j.job_log) + " 2>/dev/null | grep -v '^[[:space:]]*$' | awk 'NR>" + to_string(from) + "'")
+end
