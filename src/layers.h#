@@ -1,0 +1,65 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+
+pub struct Diff is
+    pub df_changed_file: string
+    pub df_removed_file: string
+    pub df_changed_n:    int
+    pub df_removed_n:    int
+end
+
+pub fn snapshot_tree(root: string, out: string) -> string is
+    let rc: int = sysc::sh("cd " + proc::sq(root) + " && find . -mindepth 1 -printf '%P\\037%y\\037%m\\037%s\\037%T@\\n' | LC_ALL=C sort > " + proc::sq(out))
+    if rc != 0 is return "migawka " + root + ": find/sort zakonczone kodem " + to_string(rc) end
+    return ""
+end
+
+fn count_lines(path: string) -> int is
+    let t: string = string_trim(shell("wc -l < " + proc::sq(path) + " 2>/dev/null"))
+    if t == "" is return 0 end
+    return str_to_int(t)
+end
+
+;; diffSnapshots: zmienione/nowe (po pelnych metadanych) i usuniete (z pominieciem potomkow usunietych katalogow)
+pub fn diff_snapshots(before: string, after: string, tag: string) -> Diff is
+    let base: string = proc::tmp_path("diff-" + tag)
+    let changed: string = base + ".changed"
+    let removed: string = base + ".removed"
+    let script: string = "set -e\nexport LC_ALL=C\nB=" + proc::sq(base) + "\ncomm -13 " + proc::sq(before) + " " + proc::sq(after) + " | awk -F'\\037' '{{print $1}}' | sort > " + proc::sq(changed) + "\nawk -F'\\037' '{{print $1}}' " + proc::sq(before) + " | sort > $B.bp\nawk -F'\\037' '{{print $1}}' " + proc::sq(after) + " | sort > $B.ap\ncomm -23 $B.bp $B.ap | awk '{{ n=split($0,a,\"/\"); pre=\"\"; skip=0; for(i=1;i<n;i++){{ pre=(i==1?a[1]:pre\"/\"a[i]); if(pre in P){{skip=1;break}} }} if(!skip){{P[$0]=1; print}} }}' > " + proc::sq(removed) + "\nrm -f $B.bp $B.ap\n"
+    sysc::sh("sh -c " + proc::sq(script))
+    return Diff { df_changed_file: changed, df_removed_file: removed, df_changed_n: count_lines(changed), df_removed_n: count_lines(removed) }
+end
+
+pub fn diff_free(d: Diff) is
+    fsx::remove(d.df_changed_file)
+    fsx::remove(d.df_removed_file)
+end
+
+pub struct LayerRes is
+    pub ly_wrote: bool
+    pub ly_err:   string
+end
+
+;; writeIncrementalLayer: wpisy zmienionych sciezek (bez rekurencji) + whiteouty .wh.<nazwa> dla usunietych.
+pub fn write_incremental_layer(rootfs: string, d: Diff, dest: string) -> LayerRes is
+    if d.df_changed_n == 0 && d.df_removed_n == 0 is return LayerRes { ly_wrote: false, ly_err: "" } end
+    let stage: string = proc::tmp_path("whiteouts")
+    let clist: string = stage + ".changed0"
+    let wlist: string = stage + ".wh0"
+    let rcf: string = stage + ".rc"
+    fsx::mkdir_p(stage)
+    let wscript: string = "umask 022\nS=" + proc::sq(stage) + "\n: > " + proc::sq(wlist) + "\nwhile IFS= read -r p; do\n  case \"$p\" in\n    */*) dir=\"${{p%/*}}\"; base=\"${{p##*/}}\"; [ -d \"$S/$dir\" ] || mkdir -p \"$S/$dir\"; n=\"$dir/.wh.$base\" ;;\n    *) n=\".wh.$p\" ;;\n  esac\n  : > \"$S/$n\"\n  printf '%s\\0' \"$n\" >> " + proc::sq(wlist) + "\ndone < " + proc::sq(d.df_removed_file) + "\n"
+    sysc::sh("sh -c " + proc::sq(wscript))
+    sysc::sh("tr '\\n' '\\0' < " + proc::sq(d.df_changed_file) + " > " + proc::sq(clist))
+    let tar: string = "tar --create --format=gnu --hard-dereference --no-recursion --null --verbatim-files-from -C " + proc::sq(rootfs) + " -T " + proc::sq(clist) + " -C " + proc::sq(stage) + " -T " + proc::sq(wlist)
+    let rc: int = sysc::sh("{ " + tar + " 2>/dev/null; echo $? > " + proc::sq(rcf) + "; } | gzip -n -c > " + proc::sq(dest))
+    let trc: string = string_trim(proc::read_file_or_empty(rcf))
+    sysc::sh("rm -rf " + proc::sq(stage) + " " + proc::sq(clist) + " " + proc::sq(wlist) + " " + proc::sq(rcf))
+    if rc != 0 || (trc != "" && str_to_int(trc) > 1) is
+        fsx::remove(dest)
+        return LayerRes { ly_wrote: false, ly_err: "tar warstwy: blad (kod gzip " + to_string(rc) + ", kod tar " + trc + ")" }
+    end
+    return LayerRes { ly_wrote: true, ly_err: "" }
+end
