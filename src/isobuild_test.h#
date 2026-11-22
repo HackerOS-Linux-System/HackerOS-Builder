@@ -1,0 +1,200 @@
+mod isobuild
+mod installer_assets
+mod testutil
+mod fsx
+mod proc
+
+fn expect_files(root: string, files: [string]) is
+    let mut i: int = 0
+    while i < array_len(files) is
+        testutil::is_true(fsx::exists(root + "/" + files[i]), "brak " + files[i])
+        i += 1
+    end
+end
+
+#[test]
+fn test_write_immutability() is
+    let root: string = testutil::tmpdir()
+    testutil::eq_s(isobuild::write_immutability(root), "")
+    expect_files(root, ["usr/sbin/hackeros-immutable", "etc/systemd/system/hackeros-immutable.service"])
+    testutil::eq_s(fsx::readlink(root + "/etc/systemd/system/sysinit.target.wants/hackeros-immutable.service"), "/etc/systemd/system/hackeros-immutable.service")
+    testutil::is_true(!fsx::exists(root + "/hammer/db/.immutable-enabled"), "bez hammera brak flag")
+end
+
+#[test]
+fn test_write_immutability_hammer_flags() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/usr/bin/hammer", "x")
+    testutil::eq_s(isobuild::write_immutability(root), "")
+    testutil::eq_s(fs_read(root + "/hammer/db/.immutable-enabled"), "1\n")
+    testutil::eq_s(fs_read(root + "/hammer/db/.immutable-backend"), "remount\n")
+end
+
+#[test]
+fn test_installer_autostart_service_based() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/root/.bash_profile", "x")
+    shell("mkdir -p '" + root + "/etc/systemd/system' && ln -s /lib/systemd/system/multi-user.target '" + root + "/etc/systemd/system/default.target'")
+    testutil::eq_s(isobuild::write_installer_autostart(root), "")
+    let unit: string = fs_read(root + "/etc/systemd/system/hackeros-installer.service")
+    testutil::contains(unit, "ConditionKernelCommandLine=boot=live")
+    testutil::contains(unit, "Conflicts=getty@tty1.service")
+    testutil::contains(unit, "hackeros-installer-session")
+    testutil::is_true(fsx::is_symlink(root + "/etc/systemd/system/multi-user.target.wants/hackeros-installer.service"), "usluga enabled")
+    testutil::eq_s(fsx::stat_mode_octal(root + "/usr/local/sbin/hackeros-installer-session"), "755")
+    testutil::is_true(!fsx::lexists(root + "/root/.bash_profile"), ".bash_profile usuniety")
+    testutil::is_true(!fsx::lexists(root + "/etc/systemd/system/default.target"), "default.target override usuniety")
+end
+
+#[test]
+fn test_verify_installer_reports_missing() is
+    let e: string = isobuild::verify_installer(testutil::tmpdir(), "amd64")
+    testutil::contains(e, "/usr/bin/calamares")
+    testutil::contains(e, "graficzny instalator nie wystartuje")
+end
+
+#[test]
+fn test_verify_installer_accepts_either_bin_dir() is
+    let root: string = testutil::tmpdir()
+    let all: [string] = ["usr/bin/calamares", "usr/bin/openbox", "usr/bin/xinit", "usr/bin/Xorg", "usr/lib/xorg/modules/input/libinput_drv.so", "etc/calamares/settings.conf", "etc/calamares/modules/finished.conf", "usr/local/sbin/hackeros-bootfix", "etc/calamares/branding/hackeros/branding.desc", "etc/calamares/branding/hackeros/logo.png", "etc/calamares/branding/hackeros/welcome.png", "etc/calamares/branding/hackeros/show.qml", "usr/bin/grub-install", "usr/bin/grub-mkconfig", "usr/bin/efibootmgr", "usr/lib/grub/x86_64-efi/modinfo.sh", "usr/lib/grub/i386-pc/modinfo.sh"]
+    let mut i: int = 0
+    while i < array_len(all) is
+        testutil::put(root + "/" + all[i], "x")
+        i += 1
+    end
+    testutil::eq_s(isobuild::verify_installer(root, "amd64"), "")
+end
+
+#[test]
+fn test_calamares_config_generates_branding_assets() is
+    let root: string = testutil::tmpdir()
+    testutil::eq_s(isobuild::write_calamares_config(root, "default", ""), "")
+    expect_files(root, ["etc/calamares/settings.conf", "etc/calamares/modules/mount.conf", "etc/calamares/branding/hackeros/logo.png", "etc/calamares/branding/hackeros/welcome.png", "etc/calamares/branding/hackeros/show.qml", "usr/local/sbin/hackeros-bootfix", "usr/local/sbin/hackeros-remove-live-user"])
+    let magic: string = string_trim(shell("od -An -tx1 -N8 '" + root + "/etc/calamares/branding/hackeros/logo.png' | tr -d ' \\n'"))
+    testutil::eq_s(magic, "89504e470d0a1a0a")
+end
+
+#[test]
+fn test_calamares_config_uses_project_branding() is
+    let root: string = testutil::tmpdir()
+    let proj: string = testutil::tmpdir()
+    shell("mkdir -p '" + proj + "/config/installer-branding'")
+    shell("base64 -d > '" + proj + "/config/installer-branding/debian-logo.png' <<'EOF'\n" + installer_assets::branding_logo_b64_cybersecurity() + "\nEOF")
+    testutil::eq_s(isobuild::write_calamares_config(root, "default", proj), "")
+    let a: string = string_trim(shell("sha256sum < '" + proj + "/config/installer-branding/debian-logo.png'"))
+    let b: string = string_trim(shell("sha256sum < '" + root + "/etc/calamares/branding/hackeros/logo.png'"))
+    testutil::eq_s(a, b)
+end
+
+#[test]
+fn test_calamares_cybersecurity_variant_branding() is
+    let root: string = testutil::tmpdir()
+    testutil::eq_s(isobuild::write_calamares_config(root, "cybersecurity", ""), "")
+    testutil::contains(fs_read(root + "/etc/calamares/branding/hackeros/branding.desc"), "Cybersecurity")
+end
+
+#[test]
+fn test_calamares_settings_has_shellprocess_and_no_dm_by_default() is
+    let root: string = testutil::tmpdir()
+    isobuild::write_calamares_config(root, "default", "")
+    let st: string = fs_read(root + "/etc/calamares/settings.conf")
+    testutil::contains(st, "shellprocess@done")
+    testutil::is_true(!string_contains(st, "- displaymanager"), "bez DM brak modulu displaymanager")
+    testutil::contains(fs_read(root + "/etc/calamares/modules/finished.conf"), "restartNowChecked: true")
+end
+
+#[test]
+fn test_calamares_displaymanager_when_present() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/usr/bin/sddm", "x")
+    isobuild::write_calamares_config(root, "default", "")
+    testutil::contains(fs_read(root + "/etc/calamares/settings.conf"), "- displaymanager")
+    testutil::contains(fs_read(root + "/etc/calamares/modules/displaymanager.conf"), "sddm")
+end
+
+#[test]
+fn test_mount_conf_mounts_proc_sys_dev_run() is
+    let m: string = installer_assets::calamares_mount_conf()
+    testutil::contains(m, "/proc")
+    testutil::contains(m, "/sys")
+    testutil::contains(m, "/dev")
+    testutil::contains(m, "/run")
+    testutil::is_true(!string_contains(m, "extraMounts: []"), "extraMounts nie moze byc pusty")
+end
+
+#[test]
+fn test_installer_scripts_content() is
+    testutil::contains(installer_assets::installer_service_unit(), "systemd-udev-trigger.service")
+    testutil::contains(installer_assets::installer_service_unit(), "udevadm settle")
+    testutil::contains(installer_assets::installer_session_script(), "udevadm trigger --subsystem-match=input")
+    let bf: string = installer_assets::installer_bootfix_script()
+    testutil::contains(bf, "grub-mkconfig -o")
+    testutil::contains(bf, "configfile")
+    testutil::contains(bf, "exit 1")
+end
+
+#[test]
+fn test_bootloader_packages_amd64() is
+    let p: string = array_join(isobuild::bootloader_packages("amd64"), " ")
+    testutil::contains(p, "grub-efi-amd64-bin")
+    testutil::contains(p, "grub-pc-bin")
+    testutil::contains(p, "efibootmgr")
+    testutil::contains(p, "grub2-common")
+    testutil::is_true(!string_contains(array_join(isobuild::bootloader_packages("arm64"), " "), "grub-pc-bin"), "arm64 bez grub-pc")
+end
+
+#[test]
+fn test_grub_config_has_debug_entry() is
+    let iso: string = testutil::tmpdir()
+    testutil::eq_s(isobuild::write_grub_config(iso, "HackerOS", true), "")
+    let g: string = fs_read(iso + "/boot/grub/grub.cfg")
+    testutil::contains(g, "menuentry \"HackerOS\"")
+    testutil::contains(g, "(safe graphics)")
+    testutil::contains(g, "(debug - bez quiet/splash)")
+    testutil::contains(g, "systemd.unit=multi-user.target")
+    testutil::contains(g, "earlyprintk=vga")
+end
+
+#[test]
+fn test_grub_config_without_installer_has_splash() is
+    let iso: string = testutil::tmpdir()
+    isobuild::write_grub_config(iso, "X", false)
+    let g: string = fs_read(iso + "/boot/grub/grub.cfg")
+    testutil::contains(g, "quiet splash")
+    testutil::is_true(!string_contains(g, "systemd.unit"), "bez instalatora brak systemd.unit")
+end
+
+#[test]
+fn test_xorriso_wrapper_content_and_executable() is
+    let d: string = testutil::tmpdir()
+    shell("printf '#!/bin/sh\\nexit 0\\n' > '" + d + "/xorriso' && chmod 755 '" + d + "/xorriso'")
+    env_set("PATH", d + ":" + env_get("PATH"))
+    let w: string = isobuild::write_xorriso_wrapper(d)
+    testutil::is_true(!string_starts_with(w, "!"), "wrapper utworzony")
+    testutil::contains(fs_read(w), "-compliance iso_9660_level=3")
+    testutil::eq_s(fsx::stat_mode_octal(w), "755")
+end
+
+#[test]
+fn test_shell_quote() is
+    testutil::eq_s(proc::sq("it's"), "'it'\\''s'")
+    testutil::eq_s(proc::sq("plain"), "'plain'")
+end
+
+#[test]
+fn test_kernel_version_pairing() is
+    let boot: string = testutil::tmpdir()
+    testutil::put(boot + "/vmlinuz-6.1.0-9", "k")
+    testutil::put(boot + "/initrd.img-6.1.0-9", "i")
+    testutil::put(boot + "/vmlinuz-6.2.0", "k")
+    testutil::put(boot + "/initrd.img-6.0.0", "i")
+    testutil::eq_s(array_join(isobuild::kernel_versions_with_initrd(boot), ","), "6.1.0-9")
+end
+
+#[test]
+fn test_installer_packages_cover_x_stack() is
+    let p: string = array_join(isobuild::installer_packages(), " ")
+    testutil::contains(p, "calamares")
+    testutil::contains(p, "xserver-xorg-input-all")
+    testutil::contains(p, "openbox")
+end
