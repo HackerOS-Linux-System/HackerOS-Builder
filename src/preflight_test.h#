@@ -1,0 +1,23 @@
+mod preflight
+mod testutil
+
+#[test]
+fn test_all_present() is
+    testutil::eq_s(preflight::check_tools(["sh|dash|x", "ls|coreutils|y"]), "")
+end
+
+#[test]
+fn test_missing_lists_all_sorted() is
+    let e: string = preflight::check_tools(["zzz-nope|pkg-z|krok z", "aaa-nope|pkg-a|krok a", "sh|dash|x"])
+    testutil::contains(e, "brakuje 2 wymaganych narzedzi")
+    testutil::contains(e, "aaa-nope")
+    testutil::contains(e, "(uzywane przez: krok a)")
+    testutil::contains(e, "sudo apt install pkg-a pkg-z")
+    testutil::is_true(string_find(e, "aaa-nope") < string_find(e, "zzz-nope"), "posortowane po nazwie binarki")
+end
+
+#[test]
+fn test_deduplication() is
+    let e: string = preflight::check_tools(["nope-x|p|a", "nope-x|p|b"])
+    testutil::contains(e, "brakuje 1 wymaganych narzedzi")
+end
