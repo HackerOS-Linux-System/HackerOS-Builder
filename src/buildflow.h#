@@ -1,0 +1,408 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod strx
+mod config
+mod liveparse
+mod hkgen
+mod buildlock
+mod preflight
+mod cosign
+mod rootfs
+mod oci
+mod isobuild
+mod download
+
+pub fn default_registry_host() -> string is return "ghcr.io" end
+
+pub struct CloudOptions is
+    pub co_project_dir:      string
+    pub co_work_dir:         string
+    pub co_insecure:         bool
+    pub co_skip_preflight:   bool
+    pub co_skip_lock:        bool
+end
+
+pub struct CloudResult is
+    pub cr_repository: string
+    pub cr_tag:        string
+    pub cr_refspec:    string
+    pub cr_err:        string
+end
+
+pub struct IsoOptions is
+    pub io_project_dir:    string
+    pub io_work_dir:       string
+    pub io_output_iso:     string
+    pub io_repository:     string
+    pub io_tag:            string
+    pub io_insecure:       bool
+    pub io_skip_preflight: bool
+    pub io_skip_installer: bool
+end
+
+pub struct AllOptions is
+    pub ao_project_dir:    string
+    pub ao_work_dir:       string
+    pub ao_output_iso:     string
+    pub ao_insecure:       bool
+    pub ao_skip_installer: bool
+end
+
+pub struct ContainerOptions is
+    pub ct_project_dir:    string
+    pub ct_work_dir:       string
+    pub ct_local_only:     bool
+    pub ct_insecure:       bool
+    pub ct_skip_preflight: bool
+    pub ct_skip_lock:      bool
+end
+
+pub struct ContainerResult is
+    pub cn_archive:           string
+    pub cn_repository:        string
+    pub cn_tag:               string
+    pub cn_pushed:            bool
+    pub cn_isolator_version:  string
+    pub cn_isolator_binaries: [string]
+    pub cn_err:               string
+end
+
+fn cloud_fail(msg: string) -> CloudResult is
+    return CloudResult { cr_repository: "", cr_tag: "", cr_refspec: "", cr_err: msg }
+end
+
+fn container_fail(msg: string) -> ContainerResult is
+    return ContainerResult { cn_archive: "", cn_repository: "", cn_tag: "", cn_pushed: false, cn_isolator_version: "", cn_isolator_binaries: [], cn_err: msg }
+end
+
+;; defaultImageName: nazwa katalogu projektu
+fn default_image_name(project_dir: string) -> string is
+    return fsx::basename(fsx::abs(project_dir))
+end
+
+pub struct NameTag is
+    pub nt_name: string
+    pub nt_tag:  string
+end
+
+pub fn resolve_image_name_and_tag(cfg: config::Config, project_dir: string) -> NameTag is
+    let mut name: string = default_image_name(project_dir)
+    if cfg.pj_name != "" is name = cfg.pj_name end
+    return NameTag { nt_name: name, nt_tag: config::image_tag(cfg) }
+end
+
+fn load_and_validate_config(project_dir: string, require_auth: bool) -> config::CfgLoad is
+    let config_path: string = fsx::join(fsx::join(project_dir, "config"), "config.hk")
+    let r: config::CfgLoad = config::load(config_path, require_auth)
+    if r.cl_err != "" is
+        return config::CfgLoad { cl_cfg: config::empty_config(), cl_err: "wczytywanie " + config_path + ": " + r.cl_err }
+    end
+    let cfg: config::Config = r.cl_cfg
+    if !config::is_known_release(cfg) is
+        ui::warn("Release " + ui::quote(cfg.cfg_release) + " nie jest na liscie znanych wersji Debiana (bookworm/trixie/forky/sid/unstable) -- kontynuuje, ale sprawdz czy nazwa suite istnieje w uzywanym mirror.")
+    end
+    if !config::is_known_arch(cfg) is
+        ui::warn("[release] -> arch=" + ui::quote(config::effective_arch(cfg)) + " nie jest na liscie architektur oficjalnie wspieranych przez Debiana (amd64/arm64/armhf/armel/i386/mips64el/mipsel/ppc64el/riscv64/s390x) -- kontynuuje, ale debootstrap prawdopodobnie zawiedzie jesli to literowka.")
+    end
+    return r
+end
+
+fn run_live_build(project_dir: string) -> CloudResult is
+    ui::info("Uruchamianie live-build (lb build) w " + project_dir + "...")
+    ui::info("(hackeros-builder deleguje build do live-build -- wyjscie pochodzi z lb)")
+    ui::info("---")
+    let e: string = proc::run_streaming(project_dir, ["lb", "build"])
+    if e != "" is
+        return cloud_fail("live-build (lb build) nie powiodl sie: " + e + "\nSprawdz logi powyzej. Mozliwe przyczyny:\n  - brak konfiguracji live-build (lb config nie zostal uruchomiony)\n  - blad w hooks lub package-lists\n  - brak dostepu do internetu (apt-get update zawiodlo)\n  - brak uprawnien roota (lb build wymaga sudo lub uruchomienia jako root)")
+    end
+    ui::info("---")
+    ui::info("live-build zakonczony. Wynikowy obraz ISO jest w " + project_dir + "/")
+    ui::info("(live-build nie pushuje obrazu OCI -- to jest zwykly non-atomowy build)")
+    return CloudResult { cr_repository: "", cr_tag: "", cr_refspec: "", cr_err: "" }
+end
+
+fn build_cloud_inner(opts: CloudOptions) -> CloudResult is
+    let cl: config::CfgLoad = load_and_validate_config(opts.co_project_dir, true)
+    if cl.cl_err != "" is return cloud_fail(cl.cl_err) end
+    let cfg: config::Config = cl.cl_cfg
+    if config::is_container_build(cfg) || config::is_containerized(cfg) is
+        return cloud_fail("[project] -> type = " + ui::quote(cfg.pj_type) + " -- uzyj 'hackeros-builder build container' zamiast 'build cloud'/'build all' (kontener roboczy ma WLASNY przeplyw budowy, bez hammer/atomowosci -- patrz buildflow.BuildContainer)")
+    end
+    let pr: liveparse::ParseRes = liveparse::parse(opts.co_project_dir)
+    if pr.pr_err != "" is return cloud_fail("parsowanie struktury projektu: " + pr.pr_err) end
+    let project: liveparse::Project = pr.pr_project
+    ui::info("Projekt zinterpretowany:\n" + liveparse::summary(project))
+    let rootfs_dir: string = fsx::join(opts.co_work_dir, "rootfs")
+    let builder: rootfs::Builder = rootfs::new_builder(project, cfg, rootfs_dir, opts.co_work_dir)
+    let br: rootfs::BuildRes = rootfs::build(builder)
+    if br.bd_err != "" is return cloud_fail("budowa rootfs: " + br.bd_err) end
+    let layer_paths: [string] = br.bd_builder.rb_layer_paths
+    let ve: string = rootfs::validate_rootfs(rootfs_dir, true, 0, 0)
+    if ve != "" is return cloud_fail("walidacja rootfs przed push: " + ve) end
+    let nt: NameTag = resolve_image_name_and_tag(cfg, opts.co_project_dir)
+    if cfg.pj_name != "" is ui::info("Nazwa obrazu OCI z [project] -> name: " + nt.nt_name) end
+    ui::info("Tag obrazu OCI: " + nt.nt_tag)
+    let repository: string = config::image_repository(cfg, default_registry_host(), nt.nt_name)
+    if config::requires_live_build(cfg) is
+        if !proc::tool_exists("lb") is
+            return cloud_fail("[project] -> type=" + cfg.pj_type + " wymaga zainstalowanego live-build na hoscie (komenda 'lb' nie znaleziona w $PATH). Zainstaluj live-build: apt-get install live-build")
+        end
+        ui::info("Typ projektu: " + cfg.pj_type + " -- delegowanie do live-build (lb build)...")
+        return run_live_build(opts.co_project_dir)
+    end
+    if cfg.pj_type == "independent" is
+        ui::info("Typ projektu: independent -- build bez OCI i bez deb-ostree")
+    end
+    let tag: string = nt.nt_tag
+    ui::info("Pakowanie (warstwy przyrostowe) i wypychanie obrazu OCI do " + repository + ":" + tag + "...")
+    let pu: oci::PushRes = oci::build_and_push_layers(layer_paths, repository, tag, cfg.cfg_token, opts.co_insecure)
+    if pu.pu_err != "" is return cloud_fail("build cloud: " + pu.pu_err) end
+    if cfg.pj_sign is
+        let se: string = cosign::sign(pu.pu_ref, cfg.pj_cosign_key)
+        if se != "" is return cloud_fail("podpisywanie obrazu ([project] -> sign=true): " + se) end
+    end
+    ui::info("Build cloud zakonczony: " + pu.pu_ref)
+    return CloudResult { cr_repository: repository, cr_tag: tag, cr_refspec: "docker://" + pu.pu_ref, cr_err: "" }
+end
+
+pub fn build_cloud(opts: CloudOptions) -> CloudResult is
+    if !opts.co_skip_preflight is
+        let pe: string = preflight::check_cloud()
+        if pe != "" is return cloud_fail("preflight: " + pe) end
+    end
+    let mut lock: buildlock::Lock = buildlock::Lock { lk_fd: -1, lk_path: "" }
+    if !opts.co_skip_lock is
+        let lr: buildlock::LockRes = buildlock::acquire(opts.co_work_dir)
+        if lr.lr_err != "" is return cloud_fail(lr.lr_err) end
+        lock = lr.lr_lock
+    end
+    let res: CloudResult = build_cloud_inner(opts)
+    buildlock::release(lock)
+    return res
+end
+
+;; ---------------------------------- ISO ----------------------------------
+pub fn build_iso(opts: IsoOptions) -> string is
+    if !opts.io_skip_preflight is
+        let pe: string = preflight::check_iso()
+        if pe != "" is return "preflight: " + pe end
+    end
+    let cl: config::CfgLoad = load_and_validate_config(opts.io_project_dir, true)
+    if cl.cl_err != "" is return cl.cl_err end
+    let cfg: config::Config = cl.cl_cfg
+    if config::is_container_build(cfg) || config::is_containerized(cfg) is
+        let extra: string = if config::is_containerized(cfg) then " + Isolator wbudowany w /usr/bin/" else ""
+        return "[project] -> type = " + ui::quote(cfg.pj_type) + " nie produkuje obrazu ISO -- to jest kontener roboczy (podman/docker" + extra + "), nie system instalowalny na dysk przez Calamares. Uzyj 'hackeros-builder build container' zamiast 'build iso'/'build all'"
+    end
+    let mut repository: string = opts.io_repository
+    let mut tag: string = opts.io_tag
+    if repository == "" || tag == "" is
+        let nt: NameTag = resolve_image_name_and_tag(cfg, opts.io_project_dir)
+        if repository == "" is
+            if cfg.pj_name != "" is ui::info("Nazwa obrazu OCI z [project] -> name: " + nt.nt_name) end
+            repository = config::image_repository(cfg, default_registry_host(), nt.nt_name)
+        end
+        if tag == "" is
+            tag = nt.nt_tag
+            ui::info("Tag obrazu OCI z [project] -> tag: " + tag)
+        end
+    end
+    let rootfs_dir: string = fsx::join(opts.io_work_dir, "rootfs-from-cloud")
+    if cfg.pj_verify_signature is
+        let ve: string = cosign::verify(repository + ":" + tag, cfg.pj_cosign_key)
+        if ve != "" is return "weryfikacja podpisu ([project] -> verify_signature=true): " + ve end
+    end
+    let pe2: string = oci::pull_and_unpack(repository, tag, cfg.cfg_token, rootfs_dir, opts.io_insecure)
+    if pe2 != "" is return "sciaganie obrazu z registry: " + pe2 end
+    let origin: string = "docker://" + repository + ":" + tag
+    let hammer_path: string = fsx::join(fsx::join(fsx::join(rootfs_dir, "etc"), "hammer"), "oci.hk")
+    ui::info("Aktualizacja [origin] w " + hammer_path + " -> " + origin)
+    let mut hp: hkgen::HammerConfigParams = hkgen::empty_params()
+    hp.hc_os_name = "debian"
+    hp.hc_require_gpg = true
+    hp.hc_origin = origin
+    let we: string = hkgen::write_hammer_config(hammer_path, hp)
+    if we != "" is return "aktualizacja /etc/hammer/oci.hk: " + we end
+    let volume_name: string = "HACKEROS"
+    let mut menu_title: string = "HackerOS"
+    if config::uses_cybersecurity_installer(cfg) is menu_title = "HackerOS Cybersecurity Edition" end
+    let iso_work_dir: string = fsx::join(opts.io_work_dir, "iso-build")
+    let mut skip_installer: bool = opts.io_skip_installer
+    if !config::use_builtin_installer(cfg) is
+        skip_installer = true
+        ui::info("Instalator pominiety ([project] -> installer = none)")
+    end
+    let mut variant: string = "default"
+    if config::uses_cybersecurity_installer(cfg) is
+        variant = "cybersecurity"
+        ui::info("Instalator: wariant Cybersecurity Edition ([project] -> installer = cybersecurity)")
+    end
+    let mut hooks: [liveparse::HookScript] = []
+    if !skip_installer is
+        hooks = liveparse::parse_installer_hooks(opts.io_project_dir)
+        if array_len(hooks) > 0 is
+            ui::info("Hooki instalatora znalezione: " + to_string(array_len(hooks)) + " (config/hooks/installer/)")
+        end
+    end
+    let mut bp: isobuild::BuildParams = isobuild::empty_params()
+    bp.ib_rootfs = rootfs_dir
+    bp.ib_output_iso = opts.io_output_iso
+    bp.ib_work_dir = iso_work_dir
+    bp.ib_volume_name = volume_name
+    bp.ib_menu_title = menu_title
+    bp.ib_project_dir = opts.io_project_dir
+    bp.ib_skip_installer = skip_installer
+    bp.ib_variant = variant
+    bp.ib_installer_hooks = hooks
+    bp.ib_arch = config::effective_arch(cfg)
+    let be: string = isobuild::build(bp)
+    if be != "" is return "budowa ISO: " + be end
+    return ""
+end
+
+;; ---------------------------------- ALL ----------------------------------
+pub fn build_all(opts: AllOptions) -> string is
+    let pe: string = preflight::check_all()
+    if pe != "" is return "preflight: " + pe end
+    let lr: buildlock::LockRes = buildlock::acquire(opts.ao_work_dir)
+    if lr.lr_err != "" is return lr.lr_err end
+    let lock: buildlock::Lock = lr.lr_lock
+    ui::info("=== build all: krok 1/2 -- build cloud ===")
+    let cr: CloudResult = build_cloud_inner(CloudOptions { co_project_dir: opts.ao_project_dir, co_work_dir: opts.ao_work_dir, co_insecure: opts.ao_insecure, co_skip_preflight: true, co_skip_lock: true })
+    if cr.cr_err != "" is
+        buildlock::release(lock)
+        return cr.cr_err
+    end
+    ui::info("=== build all: krok 2/2 -- build iso ===")
+    let ie: string = build_iso(IsoOptions { io_project_dir: opts.ao_project_dir, io_work_dir: opts.ao_work_dir, io_output_iso: opts.ao_output_iso, io_repository: cr.cr_repository, io_tag: cr.cr_tag, io_insecure: opts.ao_insecure, io_skip_preflight: true, io_skip_installer: opts.ao_skip_installer })
+    buildlock::release(lock)
+    return ie
+end
+
+;; ------------------------------- CONTAINER -------------------------------
+fn isolator_first_boot_unit() -> string is
+    return "[Unit]\nDescription=Isolator first-boot setup\nConditionPathExists=!/etc/isolator-first-boot-done\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/isolator init\nExecStartPost=/usr/bin/touch /etc/isolator-first-boot-done\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+end
+
+fn write_isolator_first_boot_unit(rootfs_dir: string) -> string is
+    let local_bin: string = fsx::join(fsx::join(fsx::join(rootfs_dir, "usr"), "local"), "bin")
+    let e: string = fsx::mkdir_p(local_bin)
+    if e != "" is return e end
+    let link: string = fsx::join(local_bin, "isolator")
+    fsx::remove(link)
+    let se: string = fsx::symlink_force("/usr/bin/isolator", link)
+    if se != "" is return "symlink /usr/local/bin/isolator -> /usr/bin/isolator: " + se end
+    let unit_dir: string = fsx::join(fsx::join(fsx::join(rootfs_dir, "etc"), "systemd"), "system")
+    let ue: string = fsx::mkdir_p(unit_dir)
+    if ue != "" is return ue end
+    let we: string = fsx::write_file(fsx::join(unit_dir, "isolator-first-boot.service"), isolator_first_boot_unit(), 420)
+    if we != "" is return we end
+    let wants: string = fsx::join(unit_dir, "multi-user.target.wants")
+    let me: string = fsx::mkdir_p(wants)
+    if me != "" is return me end
+    let wl: string = fsx::join(wants, "isolator-first-boot.service")
+    fsx::remove(wl)
+    return fsx::symlink_force("../isolator-first-boot.service", wl)
+end
+
+struct IsoEmbed is
+    ie_version:  string
+    ie_binaries: [string]
+    ie_err:      string
+end
+
+fn embed_isolator_into_rootfs(cfg: config::Config, rootfs_dir: string) -> IsoEmbed is
+    let mut version: string = cfg.pj_isolator_version
+    if version == "" is
+        version = download::latest_isolator_version()
+    else is
+        ui::info("[project] -> isolator_version=" + version + " (pomijam automatyczne wykrywanie)")
+    end
+    let nr: download::NamesRes = download::download_and_embed_isolator(version, rootfs_dir)
+    if nr.nr_err != "" is return IsoEmbed { ie_version: "", ie_binaries: [], ie_err: nr.nr_err } end
+    let ue: string = write_isolator_first_boot_unit(rootfs_dir)
+    if ue != "" is ui::warn("Nie udalo sie zapisac isolator-first-boot.service: " + ue) end
+    return IsoEmbed { ie_version: version, ie_binaries: nr.nr_names, ie_err: "" }
+end
+
+fn build_container_inner(opts: ContainerOptions) -> ContainerResult is
+    let cl: config::CfgLoad = load_and_validate_config(opts.ct_project_dir, false)
+    if cl.cl_err != "" is return container_fail(cl.cl_err) end
+    let cfg: config::Config = cl.cl_cfg
+    if !config::is_container_build(cfg) && !config::is_containerized(cfg) is
+        ui::warn("[project] -> type = " + ui::quote(cfg.pj_type) + " (nie \"container\"/\"containerized\") -- 'build container' zawsze buduje kontener roboczy niezaleznie od [project] -> type, ale rozwaz ustawienie [project] -> type = container w config.hk, zeby jasno udokumentowac przeznaczenie projektu.")
+    end
+    let pr: liveparse::ParseRes = liveparse::parse(opts.ct_project_dir)
+    if pr.pr_err != "" is return container_fail("parsowanie struktury projektu: " + pr.pr_err) end
+    let mut project: liveparse::Project = pr.pr_project
+    if config::is_containerized(cfg) is
+        project.lp_packages = strx::concat(project.lp_packages, ["podman", "ca-certificates"])
+        ui::info("[project] -> type=containerized: dopisano podman, ca-certificates do pakietow (wymagane przez Isolator)")
+    end
+    ui::info("Projekt zinterpretowany:\n" + liveparse::summary(project))
+    let rootfs_dir: string = fsx::join(opts.ct_work_dir, "rootfs-container")
+    let mut builder: rootfs::Builder = rootfs::new_builder(project, cfg, rootfs_dir, opts.ct_work_dir)
+    builder.rb_container_mode = true
+    let br: rootfs::BuildRes = rootfs::build(builder)
+    if br.bd_err != "" is return container_fail("budowa rootfs kontenera: " + br.bd_err) end
+    let mut iso_ver: string = ""
+    let mut iso_bins: [string] = []
+    if config::is_containerized(cfg) is
+        let em: IsoEmbed = embed_isolator_into_rootfs(cfg, rootfs_dir)
+        if em.ie_err != "" is return container_fail("wbudowywanie Isolatora ([project] -> type=containerized): " + em.ie_err) end
+        iso_ver = em.ie_version
+        iso_bins = em.ie_binaries
+    end
+    let ve: string = rootfs::validate_rootfs(rootfs_dir, false, 0, 0)
+    if ve != "" is return container_fail("walidacja kontenera przed pakowaniem: " + ve) end
+    let nt: NameTag = resolve_image_name_and_tag(cfg, opts.ct_project_dir)
+    if cfg.pj_name != "" is ui::info("Nazwa kontenera z [project] -> name: " + nt.nt_name) end
+    let repository: string = config::image_repository(cfg, default_registry_host(), nt.nt_name)
+    let archive_dir: string = fsx::join(opts.ct_work_dir, "container")
+    let ae: string = fsx::mkdir_p(archive_dir)
+    if ae != "" is return container_fail("tworzenie katalogu archiwum kontenera: " + ae) end
+    let archive_path: string = fsx::join(archive_dir, nt.nt_name + "-" + nt.nt_tag + ".tar")
+    let se: string = oci::save_local_archive(rootfs_dir, repository, nt.nt_tag, fsx::join(opts.ct_work_dir, "container-pack"), archive_path)
+    if se != "" is return container_fail("zapis lokalnego archiwum kontenera: " + se) end
+    let mut pushed: bool = false
+    let should_push: bool = !opts.ct_local_only && cfg.cfg_account_name != "" && cfg.cfg_token != ""
+    if should_push is
+        ui::info("Wypychanie kontenera rowniez do registry " + repository + ":" + nt.nt_tag + "...")
+        let push_work: string = fsx::join(opts.ct_work_dir, "oci-push-container")
+        let pe: string = fsx::mkdir_p(push_work)
+        if pe != "" is return container_fail("tworzenie katalogu roboczego push: " + pe) end
+        let pu: oci::PushRes = oci::build_and_push(rootfs_dir, repository, nt.nt_tag, cfg.cfg_token, push_work, opts.ct_insecure)
+        if pu.pu_err != "" is return container_fail("push kontenera do registry: " + pu.pu_err) end
+        pushed = true
+    else if opts.ct_local_only is
+        ui::info("--local-only: pomijam push do registry -- kontener dostepny WYLACZNIE lokalnie")
+    end
+    ui::info("Kontener roboczy gotowy: " + archive_path)
+    ui::info("  Zaladuj:   podman load -i " + archive_path + "   (albo: docker load -i " + archive_path + ")")
+    ui::info("  Uruchom:   podman run -it --rm " + repository + ":" + nt.nt_tag + "   (albo: docker run -it --rm " + repository + ":" + nt.nt_tag + ")")
+    if pushed is ui::info("  Lub sciagnij z registry: podman pull " + repository + ":" + nt.nt_tag) end
+    if config::is_containerized(cfg) is
+        ui::info("  Isolator " + iso_ver + " wbudowany: " + array_join(iso_bins, ", ") + " -- w kontenerze dostepne od razu:")
+        ui::info("    isolator init")
+        ui::info("    isolator install <pakiet>")
+    end
+    return ContainerResult { cn_archive: archive_path, cn_repository: repository, cn_tag: nt.nt_tag, cn_pushed: pushed, cn_isolator_version: iso_ver, cn_isolator_binaries: iso_bins, cn_err: "" }
+end
+
+pub fn build_container(opts: ContainerOptions) -> ContainerResult is
+    if !opts.ct_skip_preflight is
+        let pe: string = preflight::check_cloud()
+        if pe != "" is return container_fail("preflight: " + pe) end
+    end
+    let mut lock: buildlock::Lock = buildlock::Lock { lk_fd: -1, lk_path: "" }
+    if !opts.ct_skip_lock is
+        let lr: buildlock::LockRes = buildlock::acquire(opts.ct_work_dir)
+        if lr.lr_err != "" is return container_fail(lr.lr_err) end
+        lock = lr.lr_lock
+    end
+    let res: ContainerResult = build_container_inner(opts)
+    buildlock::release(lock)
+    return res
+end
