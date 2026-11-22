@@ -1,0 +1,143 @@
+mod rootfs
+mod config
+mod liveparse
+mod testutil
+mod fsx
+mod sysc
+mod proc
+
+fn make_valid_tree(size_mb: int, pkgs: int) -> string is
+    let root: string = testutil::tmpdir()
+    shell("mkdir -p '" + root + "/etc' '" + root + "/usr/bin' '" + root + "/var/lib/dpkg'")
+    let mut status: string = ""
+    let mut i: int = 0
+    while i < pkgs is
+        status = status + "Package: p" + to_string(i) + "\nStatus: ok\n\n"
+        i += 1
+    end
+    testutil::put(root + "/var/lib/dpkg/status", status)
+    if size_mb > 0 is
+        shell("dd if=/dev/zero of='" + root + "/usr/bin/big' bs=1M count=" + to_string(size_mb) + " 2>/dev/null")
+    end
+    return root
+end
+
+#[test]
+fn test_validate_accepts_minimal_valid_tree() is
+    let root: string = make_valid_tree(60, 12)
+    testutil::eq_s(rootfs::validate_rootfs(root, false, 0, 0), "")
+end
+
+#[test]
+fn test_validate_rejects_missing_required_paths() is
+    let root: string = make_valid_tree(60, 12)
+    shell("rm -rf '" + root + "/etc'")
+    testutil::contains(rootfs::validate_rootfs(root, false, 0, 0), "brak etc")
+end
+
+#[test]
+fn test_validate_rejects_too_few_packages() is
+    let root: string = make_valid_tree(60, 3)
+    testutil::contains(rootfs::validate_rootfs(root, false, 0, 0), "tylko 3 pakiet")
+end
+
+#[test]
+fn test_validate_rejects_too_small() is
+    let root: string = make_valid_tree(1, 12)
+    testutil::contains(rootfs::validate_rootfs(root, false, 0, 0), "niekompletny")
+end
+
+#[test]
+fn test_validate_require_hammer_config() is
+    let root: string = make_valid_tree(60, 12)
+    testutil::contains(rootfs::validate_rootfs(root, true, 0, 0), "oci.hk")
+    testutil::put(root + "/etc/hammer/oci.hk", "[sysroot]\n")
+    testutil::eq_s(rootfs::validate_rootfs(root, true, 0, 0), "")
+end
+
+#[test]
+fn test_validate_missing_dir() is
+    testutil::contains(rootfs::validate_rootfs("/nonexistent-hosb", false, 0, 0), "nie istnieje")
+end
+
+#[test]
+fn test_copy_dir_overwrites_existing_symlink() is
+    let src: string = testutil::tmpdir()
+    let dst: string = testutil::tmpdir()
+    testutil::put(src + "/etc/motd", "nowy")
+    shell("mkdir -p '" + dst + "/etc' && ln -s /etc/passwd '" + dst + "/etc/motd'")
+    testutil::eq_s(rootfs::copy_dir_to_dir(src, dst), "")
+    testutil::is_true(!fsx::is_symlink(dst + "/etc/motd"), "symlink zastapiony plikiem")
+    testutil::eq_s(fs_read(dst + "/etc/motd"), "nowy")
+end
+
+#[test]
+fn test_copy_dir_overwrites_existing_file() is
+    let src: string = testutil::tmpdir()
+    let dst: string = testutil::tmpdir()
+    testutil::put(src + "/f", "nowy")
+    testutil::put(dst + "/f", "stary")
+    testutil::eq_s(rootfs::copy_dir_to_dir(src, dst), "")
+    testutil::eq_s(fs_read(dst + "/f"), "nowy")
+end
+
+#[test]
+fn test_copy_dir_conflict_with_existing_dir_is_error() is
+    let src: string = testutil::tmpdir()
+    let dst: string = testutil::tmpdir()
+    testutil::put(src + "/thing", "plik")
+    shell("mkdir -p '" + dst + "/thing'")
+    testutil::contains(rootfs::copy_dir_to_dir(src, dst), "jest juz katalogiem w rootfs")
+end
+
+#[test]
+fn test_copy_dir_preserves_modes_and_links() is
+    let src: string = testutil::tmpdir()
+    let dst: string = testutil::tmpdir()
+    testutil::put(src + "/bin/run", "x")
+    shell("chmod 4755 '" + src + "/bin/run' && ln -s run '" + src + "/bin/lnk' && mkdir -p '" + src + "/priv' && chmod 700 '" + src + "/priv'")
+    testutil::eq_s(rootfs::copy_dir_to_dir(src, dst), "")
+    testutil::eq_s(fsx::stat_mode_octal(dst + "/bin/run"), "4755")
+    testutil::eq_s(fsx::readlink(dst + "/bin/lnk"), "run")
+    testutil::eq_s(fsx::stat_mode_octal(dst + "/priv"), "700")
+end
+
+fn proj(pkgs: [string], excluded: [string]) -> liveparse::Project is
+    let mut p: liveparse::Project = liveparse::empty_project()
+    p.lp_packages = pkgs
+    p.lp_excluded = excluded
+    return p
+end
+
+#[test]
+fn test_packages_with_live_boot_appends_both() is
+    let b: rootfs::Builder = rootfs::new_builder(proj(["vim"], []), config::empty_config(), "/x", "/y")
+    let pk: [string] = rootfs::packages_with_live_boot(b)
+    testutil::eq_s(array_join(pk, ","), "vim,live-boot,live-boot-initramfs-tools")
+end
+
+#[test]
+fn test_packages_with_live_boot_respects_exclusion() is
+    let b: rootfs::Builder = rootfs::new_builder(proj(["vim"], ["live-boot"]), config::empty_config(), "/x", "/y")
+    testutil::eq_s(array_join(rootfs::packages_with_live_boot(b), ","), "vim,live-boot-initramfs-tools")
+end
+
+#[test]
+fn test_packages_with_live_boot_skipped_in_container_mode() is
+    let mut b: rootfs::Builder = rootfs::new_builder(proj(["vim"], []), config::empty_config(), "/x", "/y")
+    b.rb_container_mode = true
+    testutil::eq_s(array_join(rootfs::packages_with_live_boot(b), ","), "vim")
+end
+
+#[test]
+fn test_remove_apt_tooling_keeps_dpkg() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/usr/bin/apt-get", "x")
+    testutil::put(root + "/usr/bin/apt", "x")
+    testutil::put(root + "/usr/lib/apt/methods/http", "x")
+    testutil::put(root + "/var/lib/dpkg/status", "Package: a\n")
+    testutil::eq_s(rootfs::remove_apt_tooling(root), "")
+    testutil::is_true(!fsx::lexists(root + "/usr/bin/apt-get"), "apt-get usuniety")
+    testutil::is_true(!fsx::exists(root + "/usr/lib/apt"), "usr/lib/apt usuniety")
+    testutil::is_true(fsx::exists(root + "/var/lib/dpkg/status"), "baza dpkg zostaje")
+end
