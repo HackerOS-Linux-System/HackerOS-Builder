@@ -8,6 +8,17 @@ Jeśli masz już projekt `live-build`, możesz go wkleić do `hackeros-builder`
 i dodać jeden plik — `config/config.hk` — żeby zbudować z niego obraz
 niemutowalny zamiast klasycznego, instalowalnego ISO.
 
+> ## Wersja H# (0.10.0) -- przepisane z Go na H# + Bit.hk + colors + progress-bar
+>
+> Narzędzie zostało w całości przepisane z Go na **H#**. Budowa projektu idzie przez **Bit.hk** (`bit build`),
+> kolorowe logi używają biblioteki **colors**, a paski postępu biblioteki **progress-bar** (obie w `libs/`,
+> podpięte jako zależności `path`, więc build działa offline). Zachowanie CLI, formatu `config.hk`,
+> struktury projektu i wynikowych obrazów (OCI/ISO/kontener) jest takie samo jak w wersji Go --
+> szczegóły, mapowanie plików i uczciwa lista tego, co zweryfikowano, a co nie: **`docs/MIGRATION-GO-TO-HSHARP.md`**.
+>
+> Ścieżki `internal/...` w opisach poniżej to historia wersji Go; ich odpowiedniki w `src/*.h#` znajdziesz
+> w tabeli w dokumencie migracji.
+
 ## Poprawka: `verifyInstaller` wymagal binarek GRUB w zlych sciezkach
 
 W forky `grub-mkconfig` i `efibootmgr` leza w innym katalogu (`/usr/bin` vs `/usr/sbin`) niz zakladala
@@ -415,7 +426,7 @@ szkieletu" do narzędzia z podstawowym hardeningiem produkcyjnym:
   transferów registry) zamiast `http.DefaultClient`, który mógł zawiesić
   cały build w nieskończoność przy martwym połączeniu.
 - **Weryfikacja SHA256** pobranego archiwum `oci-mode.tar.gz` (hammer) —
-  `download.DownloadHammer` sprawdza sumę kontrolną z `checksums.txt`
+  `download::download_hammer` sprawdza sumę kontrolną z `checksums.txt`
   opublikowanego przy wydaniu (jeśli wydanie go publikuje; w przeciwnym
   razie wypisuje wyraźne ostrzeżenie i kontynuuje, nie blokując starszych
   tagów).
@@ -572,53 +583,31 @@ Jedyny plik, którego `live-build` nie ma. Format to `.hk`
 
 ## Wymagania
 
+Na hoście, na którym **uruchamiasz** `hackeros-builder` (dodatkowo do narzędzi z wersji Go pojawiły się
+`curl`, `tar`, `gzip`, `sha256sum`, `find` -- zastępują wbudowane biblioteki Go; `preflight` sprawdza je za Ciebie):
+
 ```bash
-sudo apt install debootstrap squashfs-tools grub-pc-bin grub-efi-amd64-bin xorriso mtools
+sudo apt install debootstrap squashfs-tools grub-pc-bin grub-efi-amd64-bin xorriso mtools \
+                 curl tar gzip coreutils findutils util-linux dpkg
 ```
 
-Go 1.22+ do budowania samego `hackeros-builder` (binarka końcowa nie
-wymaga Go w runtime).
+Do **budowania samego** `hackeros-builder`: toolchain H# (`h#`, `bit`, biblioteka standardowa w
+`/usr/lib/HackerOS/H#/std`) oraz `g++` (H# generuje C++). Binarka końcowa jest statyczna i nie wymaga
+H# w runtime.
 
 ## Budowanie
 
-> **Uwaga o `go.mod`:** przy okazji tej rundy zmian poprawiono literówkę w
-> deklaracji modułu — było `module .../HackerOS-Builder` (wielka litera),
-> a WSZYSTKIE importy wewnętrzne w calym kodzie od poczatku uzywaly
-> `.../hackeros-builder` (mala litera) -- przez co `go build` nie
-> uruchamial sie w ogole (Go nie rozwiazywalby importow wzgledem
-> zadeklarowanej sciezki modulu). Poprawiono na `hackeros-builder`
-> (male litery), zgodnie z rzeczywistymi importami. **Cały projekt,
-> łącznie z tą zmianą i migracją deb-ostree → hammer, został faktycznie
-> skompilowany (`go build ./...`), sprawdzony (`go vet ./...`) i
-> przetestowany (`go test ./...`) lokalnie** (z tymczasowymi `replace` na
-> `golang.org/x/sys`/`golang.org/x/sync` -> mirrory na `github.com`, bo
-> środowisko w którym to pisano miało dostęp tylko do `github.com`, nie do
-> `golang.org`; w normalnym środowisku z pełnym dostępem do internetu te
-> `replace` nie są potrzebne i nie są częścią tego repo) — wszystko
-> przechodzi bez błędów.
-
-> **Uwaga o `go.sum`:** ten plik (lockfile z hashami zależności) nie jest
-> commitowany w repozytorium — środowisko, w którym ten kod został
-> napisany, nie miało dostępu do internetu, więc nie dało się obliczyć
-> prawdziwych hashy modułów (a commitowanie fałszywych/pustych hashy
-> psowałoby build identycznie jak ich brak). To **nie są zewnętrzne
-> ścieżki czy literówki w imporcie** — `internal/ociimage` poprawnie
-> importuje pakiety z `go-containerregistry`, którego wersja jest podana
-> w `go.mod`; brakuje tylko samego lockfile. Wygeneruj go jednym poleceniem
-> przed pierwszym budowaniem:
-
 ```bash
-go mod tidy
-# lub: make setup
+bit build                                   # release, statycznie -> cache/build/release/hackeros-builder
+sudo install -Dm755 cache/build/release/hackeros-builder /usr/local/bin/hackeros-builder
+# albo: hl build.hl build / hl build.hl install   (cele: build, install, uninstall, clean, test, check)
+
+bit test                                    # 150 testów jednostkowych (src/*_test.h#)
+sudo hackeros-builder build all -p ./moj-projekt -o ./moj-system.iso
 ```
 
-To ściągnie `go-containerregistry` i policzy jego hashe do `go.sum`.
-Po tym `go build ./...` zadziała normalnie.
-
-```bash
-go build -o hackeros-builder .
-sudo ./hackeros-builder build all -p ./moj-projekt -o ./moj-system.iso
-```
+Zależności (`colors`, `progress-bar`) leżą w `libs/` i są wskazane w `Bit.hk` jako `path`, więc nic nie jest
+pobierane z sieci podczas budowania.
 
 ---
 
@@ -627,41 +616,41 @@ sudo ./hackeros-builder build all -p ./moj-projekt -o ./moj-system.iso
 ```
 config/config.hk ──────┐
                         ▼
-              internal/config (parsuje .hk)
+              src/config.h# + src/hk.h# (parsuje .hk)
                         │
 config/{package-lists,  ▼
- hooks,includes.chroot} internal/liveparse (interpretuje strukture live-build)
+ hooks,includes.chroot} src/liveparse.h# (interpretuje strukture live-build)
                         │
                         ▼
-              internal/rootfs.Builder
+              src/rootfs.h# (rootfs::build)
               ├─ debootstrap                         (pasek postepu)
               ├─ mount /proc,/sys,/dev
               ├─ apt-get install <package-lists>      (pasek postepu)
               ├─ copy includes.chroot
               ├─ ensureHookInterpreters (python3/ruby/lua/...)
               ├─ exec hooks/normal|live/*.hook.chroot (w chroot, dowolny jezyk)
-              ├─ download.DownloadHammer -> /usr/bin/hammer
-              └─ hkgen.WriteHammerConfig -> /etc/hammer/oci.hk
+              ├─ download::download_hammer -> /usr/bin/hammer
+              └─ hkgen::write_hammer_config -> /etc/hammer/oci.hk
                         │
          ┌──────────────┴───────────────┐
          ▼                              ▼
-  internal/ociimage.BuildAndPush   (build cloud)
-  (tar.gz warstwa -> v1.Image ->
-   remote.Write do registry)
+  src/oci.h# build_and_push_layers   (build cloud)
+  (warstwy tar.gz -> obraz OCI ->
+   push przez API registry v2, curl)
          │
          ▼
    Registry OCI (np. ghcr.io)
          │
          ▼ (build iso sciaga TEN SAM obraz z powrotem)
-  internal/ociimage.PullAndUnpack
-  (remote.Image -> warstwy -> rootfs
+  oci::pull_and_unpack
+  (manifest -> warstwy -> rootfs
    z obsluga whiteoutow OCI)
          │
          ▼
-  internal/isobuild.Build
+  src/isobuild.h# (isobuild::build)
   ├─ InjectInstaller: apt-get install calamares + xorg (w rootfs z registry)
   ├─ exec hooks/installer/*.hook.chroot (customizacja Calamares, dowolny jezyk)
-  ├─ rootfs.RemoveAptTooling -> usuwa apt/apt-get (baza dpkg zostaje)
+  ├─ rootfs::remove_apt_tooling -> usuwa apt/apt-get (baza dpkg zostaje)
   ├─ mksquashfs rootfs -> filesystem.squashfs   (JUZ bez apt/apt-get)
   ├─ copy vmlinuz + initrd.img
   ├─ generuj grub.cfg
@@ -726,7 +715,7 @@ Odpowiednik bez Makefile: `go build -mod=vendor ./... && go test -mod=vendor ./.
    pchnięciem zepsutego obrazu do registry.
 
 4. **`checksums.txt` musi zostać opublikowany przez wydania `hammer`**
-   Weryfikacja SHA256 w `download.DownloadHammer` jest *gotowa po stronie
+   Weryfikacja SHA256 w `download::download_hammer` jest *gotowa po stronie
    `hackeros-builder`*, ale działa tylko jeśli wydania `hammer` na
    GitHub Releases publikują plik `checksums.txt` w formacie `sha256sum`
    (`<hex>  oci-mode.tar.gz`). Bez tego pliku weryfikacja jest pomijana z
