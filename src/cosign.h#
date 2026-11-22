@@ -1,0 +1,37 @@
+mod proc
+mod ui
+
+fn check_available() -> string is
+    if !proc::tool_exists("cosign") is
+        return "narzedzie 'cosign' nie zostalo znalezione w $PATH -- wymagane przez [project] -> sign/verify_signature w config.hk. Zainstaluj cosign: https://docs.sigstore.dev/cosign/system_config/installation/ (exec: \"cosign\": executable file not found in $PATH)"
+    end
+    return ""
+end
+
+pub fn sign(image_ref: string, key_path: string) -> string is
+    if key_path == "" is
+        return "[project] -> sign = true, ale [project] -> cosign_key jest puste -- podaj sciezke do klucza prywatnego cosign (wygenerowanego przez 'cosign generate-key-pair')"
+    end
+    let e: string = check_available()
+    if e != "" is return e end
+    ui::info("Podpisywanie obrazu OCI (cosign): " + image_ref)
+    let r: string = proc::run_streaming("", ["cosign", "sign", "--key", key_path, "--yes", image_ref])
+    if r != "" is return "cosign sign " + image_ref + ": " + r end
+    ui::info("Obraz podpisany: " + image_ref)
+    return ""
+end
+
+pub fn verify(image_ref: string, key_path: string) -> string is
+    if key_path == "" is
+        return "[project] -> verify_signature = true, ale [project] -> cosign_key jest puste -- podaj sciezke do klucza publicznego cosign odpowiadajacego kluczowi ktorym obraz zostal podpisany"
+    end
+    let e: string = check_available()
+    if e != "" is return e end
+    ui::info("Weryfikacja podpisu OCI (cosign): " + image_ref)
+    let r: string = proc::run_streaming("", ["cosign", "verify", "--key", key_path, image_ref])
+    if r != "" is
+        return "weryfikacja podpisu " + image_ref + " nie powiodla sie: " + r + " -- obraz jest NIEPODPISANY, podpisany INNYM kluczem, albo zostal zmodyfikowany po podpisaniu; build iso PRZERWANY, nie uzywamy tego obrazu"
+    end
+    ui::info("Podpis zweryfikowany poprawnie: " + image_ref)
+    return ""
+end
