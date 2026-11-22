@@ -1,0 +1,276 @@
+mod fsx
+mod strx
+
+pub struct HookScript is
+    pub hs_name:   string
+    pub hs_path:   string
+    pub hs_interp: string
+end
+
+pub struct Project is
+    pub lp_root:           string
+    pub lp_packages:       [string]
+    pub lp_excluded:       [string]
+    pub lp_hooks:          [HookScript]
+    pub lp_installer_hooks: [HookScript]
+    pub lp_includes_chroot: string
+    pub lp_includes_before: string
+    pub lp_includes_after:  string
+    pub lp_extra_sources:  [string]
+    pub lp_extra_keys:     [string]
+end
+
+pub struct ParseRes is
+    pub pr_project: Project
+    pub pr_err:     string
+end
+
+pub fn empty_project() -> Project is
+    return Project { lp_root: "", lp_packages: [], lp_excluded: [], lp_hooks: [], lp_installer_hooks: [], lp_includes_chroot: "", lp_includes_before: "", lp_includes_after: "", lp_extra_sources: [], lp_extra_keys: [] }
+end
+
+fn is_name_char(c: string) -> bool is
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    if c >= "0" && c <= "9" is return true end
+    return c == "_" || c == "." || c == "+" || c == "-"
+end
+
+fn leading_name(s: string) -> string is
+    let mut i: int = 0
+    while i < string_len(s) && is_name_char(string_at(s, i)) is i += 1 end
+    return string_slice(s, 0, i)
+end
+
+;; (\S*/)?([A-Za-z0-9_.+-]+) zakotwiczone na poczatku t
+fn match_path_name(t: string) -> string is
+    let mut tok_end: int = 0
+    while tok_end < string_len(t) && !strx::is_space(string_at(t, tok_end)) is tok_end += 1 end
+    let mut i: int = tok_end - 1
+    while i >= 0 is
+        if string_at(t, i) == "/" is
+            let n: string = leading_name(string_slice(t, i + 1, string_len(t)))
+            if n != "" is return n end
+        end
+        i -= 1
+    end
+    return leading_name(t)
+end
+
+fn skip_spaces(s: string, from: int) -> int is
+    let mut i: int = from
+    while i < string_len(s) && strx::is_space(string_at(s, i)) is i += 1 end
+    return i
+end
+
+;; Interpreter z shebang pierwszej linii ("" gdy brak).
+pub fn interpreter_from_first_line(first: string) -> string is
+    if !string_starts_with(first, "#!") is return "" end
+    let t: string = string_slice(first, skip_spaces(first, 2), string_len(first))
+    if string_starts_with(t, "/usr/bin/env") && string_len(t) > 12 && strx::is_space(string_at(t, 12)) is
+        let t2: string = string_slice(t, skip_spaces(t, 12), string_len(t))
+        let n: string = match_path_name(t2)
+        if n != "" is return n end
+    end
+    return match_path_name(t)
+end
+
+pub fn detect_hook_interpreter(path: string) -> string is
+    if !file_exists(path) is return "" end
+    let content: string = fs_read(path)
+    let nl: int = string_find(content, "\n")
+    let mut first: string = if nl < 0 then content else string_slice(content, 0, nl)
+    if string_ends_with(first, "\r") is first = string_slice(first, 0, string_len(first) - 1) end
+    if string_len(first) >= 4096 is return "" end
+    return interpreter_from_first_line(first)
+end
+
+fn read_package_list(path: string) -> [string] is
+    let mut names: [string] = []
+    let lines: [string] = string_split(fs_read(path), "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = string_trim(lines[i])
+        i += 1
+        if line != "" && !string_starts_with(line, "#") is
+            names = strx::concat(names, strx::fields(line))
+        end
+    end
+    return names
+end
+
+fn read_lines(path: string) -> [string] is
+    let mut out: [string] = []
+    let lines: [string] = string_split(fs_read(path), "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = string_trim(lines[i])
+        i += 1
+        if line != "" && !string_starts_with(line, "#") is out = array_push(out, line) end
+    end
+    return out
+end
+
+fn read_hook_dirs(config_dir: string, subdirs: [string]) -> [HookScript] is
+    let mut hooks: [HookScript] = []
+    let mut si: int = 0
+    while si < array_len(subdirs) is
+        let dir: string = fsx::join(fsx::join(config_dir, "hooks"), subdirs[si])
+        si += 1
+        let names: [string] = fsx::list_dir_sorted(dir)
+        let mut ni: int = 0
+        while ni < array_len(names) is
+            let nm: string = names[ni]
+            ni += 1
+            let path: string = fsx::join(dir, nm)
+            if !fsx::is_dir(path) && string_ends_with(nm, ".hook.chroot") is
+                hooks = array_push(hooks, HookScript { hs_name: nm, hs_path: path, hs_interp: detect_hook_interpreter(path) })
+            end
+        end
+    end
+    return hooks
+end
+
+fn dir_or_empty(config_dir: string, name: string) -> string is
+    let d: string = fsx::join(config_dir, name)
+    if fsx::is_dir(d) is return d end
+    return ""
+end
+
+pub fn parse(root: string) -> ParseRes is
+    let config_dir: string = fsx::join(root, "config")
+    if !fsx::is_dir(config_dir) is
+        return ParseRes { pr_project: empty_project(), pr_err: "katalog \"" + config_dir + "\" nie istnieje -- to nie jest poprawny projekt live-build/hackeros-builder (oczekiwano podkatalogu 'config/')" }
+    end
+    let mut p: Project = empty_project()
+    p.lp_root = root
+    ;; package-lists
+    let pl_dir: string = fsx::join(config_dir, "package-lists")
+    if fsx::is_dir(pl_dir) is
+        let mut seen: [string] = []
+        let mut excluded: [string] = []
+        let mut packages: [string] = []
+        let entries: [string] = fsx::list_dir_sorted(pl_dir)
+        let mut ei: int = 0
+        while ei < array_len(entries) is
+            let nm: string = entries[ei]
+            ei += 1
+            let path: string = fsx::join(pl_dir, nm)
+            if !fsx::is_dir(path) && string_ends_with(nm, ".list.chroot") is
+                let names: [string] = read_package_list(path)
+                let mut k: int = 0
+                while k < array_len(names) is
+                    let n: string = names[k]
+                    k += 1
+                    if string_starts_with(n, "-") is
+                        let ex: string = strx::trim_prefix(n, "-")
+                        if ex != "" && !strx::contains(excluded, ex) is excluded = array_push(excluded, ex) end
+                    else if !strx::contains(seen, n) is
+                        seen = array_push(seen, n)
+                        packages = array_push(packages, n)
+                    end
+                end
+            end
+        end
+        if strx::contains(seen, "live-boot") && !strx::contains(seen, "live-boot-initramfs-tools") is
+            packages = array_push(packages, "live-boot-initramfs-tools")
+        end
+        if array_len(excluded) > 0 is
+            let mut filtered: [string] = []
+            let mut f: int = 0
+            while f < array_len(packages) is
+                if !strx::contains(excluded, packages[f]) is filtered = array_push(filtered, packages[f]) end
+                f += 1
+            end
+            packages = filtered
+        end
+        p.lp_packages = strx::sort_strings(packages)
+        p.lp_excluded = excluded
+    end
+    p.lp_hooks = read_hook_dirs(config_dir, ["normal", "live"])
+    p.lp_installer_hooks = read_hook_dirs(config_dir, ["installer"])
+    p.lp_includes_chroot = dir_or_empty(config_dir, "includes.chroot")
+    p.lp_includes_before = dir_or_empty(config_dir, "includes.chroot_before_packages")
+    p.lp_includes_after = dir_or_empty(config_dir, "includes.chroot_after_packages")
+    ;; archives
+    let ar_dir: string = fsx::join(config_dir, "archives")
+    if fsx::is_dir(ar_dir) is
+        let entries: [string] = fsx::list_dir_sorted(ar_dir)
+        let mut ai: int = 0
+        while ai < array_len(entries) is
+            let nm: string = entries[ai]
+            ai += 1
+            let path: string = fsx::join(ar_dir, nm)
+            if !fsx::is_dir(path) is
+                if string_ends_with(nm, ".list.chroot") is
+                    p.lp_extra_sources = strx::concat(p.lp_extra_sources, read_lines(path))
+                else if string_ends_with(nm, ".key.chroot") is
+                    p.lp_extra_keys = array_push(p.lp_extra_keys, path)
+                end
+            end
+        end
+    end
+    return ParseRes { pr_project: p, pr_err: "" }
+end
+
+;; ParseInstallerHooks: sam podkatalog hooks/installer (brak config/ => pusta lista)
+pub fn parse_installer_hooks(root: string) -> [HookScript] is
+    let config_dir: string = fsx::join(root, "config")
+    if !fsx::is_dir(config_dir) is return [] end
+    return read_hook_dirs(config_dir, ["installer"])
+end
+
+fn language_breakdown(hooks: [HookScript]) -> string is
+    if array_len(hooks) == 0 is return "" end
+    let mut order: [string] = []
+    let mut counts: [int] = []
+    let mut i: int = 0
+    while i < array_len(hooks) is
+        let mut lang: string = hooks[i].hs_interp
+        if lang == "" is lang = "brak shebang" end
+        let mut found: int = -1
+        let mut j: int = 0
+        while j < array_len(order) is
+            if order[j] == lang is found = j end
+            j += 1
+        end
+        if found < 0 is
+            order = array_push(order, lang)
+            counts = array_push(counts, 1)
+        else is
+            counts = array_set(counts, found, counts[found] + 1)
+        end
+        i += 1
+    end
+    let sorted: [string] = strx::sort_strings(order)
+    let mut parts: [string] = []
+    let mut k: int = 0
+    while k < array_len(sorted) is
+        let mut c: int = 0
+        let mut m: int = 0
+        while m < array_len(order) is
+            if order[m] == sorted[k] is c = counts[m] end
+            m += 1
+        end
+        parts = array_push(parts, sorted[k] + ": " + to_string(c))
+        k += 1
+    end
+    return " (" + array_join(parts, ", ") + ")"
+end
+
+pub fn summary(p: Project) -> string is
+    let mut b: string = "Pakietow do instalacji:  " + to_string(array_len(p.lp_packages)) + "\n"
+    b = b + "Hookow do wykonania:     " + to_string(array_len(p.lp_hooks)) + language_breakdown(p.lp_hooks) + "\n"
+    if array_len(p.lp_installer_hooks) > 0 is
+        b = b + "Hookow instalatora:      " + to_string(array_len(p.lp_installer_hooks)) + language_breakdown(p.lp_installer_hooks) + " (config/hooks/installer/)\n"
+    end
+    if p.lp_includes_before != "" is b = b + "includes.chroot_before_packages: " + p.lp_includes_before + "\n" end
+    if p.lp_includes_chroot != "" is b = b + "includes.chroot:         " + p.lp_includes_chroot + "\n" end
+    if p.lp_includes_after != "" is b = b + "includes.chroot_after_packages: " + p.lp_includes_after + "\n" end
+    if p.lp_includes_chroot == "" && p.lp_includes_before == "" && p.lp_includes_after == "" is
+        b = b + "includes.chroot:         (brak)\n"
+    end
+    b = b + "Dodatkowych zrodel apt:  " + to_string(array_len(p.lp_extra_sources)) + "\n"
+    b = b + "Dodatkowych kluczy GPG:  " + to_string(array_len(p.lp_extra_keys)) + "\n"
+    return b
+end
