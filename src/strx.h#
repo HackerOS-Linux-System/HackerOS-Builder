@@ -1,0 +1,80 @@
+pub fn sort_strings(a: [string]) -> [string] is
+    let n: int = array_len(a)
+    if n <= 1 is return a end
+    let mid: int = n / 2
+    let l: [string] = sort_strings(array_slice(a, 0, mid))
+    let r: [string] = sort_strings(array_slice(a, mid, n))
+    let mut out: [string] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < array_len(l) && j < array_len(r) is
+        if r[j] < l[i] is
+            out = array_push(out, r[j])
+            j += 1
+        else is
+            out = array_push(out, l[i])
+            i += 1
+        end
+    end
+    while i < array_len(l) is
+        out = array_push(out, l[i])
+        i += 1
+    end
+    while j < array_len(r) is
+        out = array_push(out, r[j])
+        j += 1
+    end
+    return out
+end
+
+pub fn contains(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn concat(a: [string], b: [string]) -> [string] is
+    let mut out: [string] = a
+    let mut i: int = 0
+    while i < array_len(b) is
+        out = array_push(out, b[i])
+        i += 1
+    end
+    return out
+end
+
+;; strings.Join
+pub fn join(items: [string], sep: string) -> string is
+    return array_join(items, sep)
+end
+
+;; strings.TrimPrefix / TrimSuffix
+pub fn trim_prefix(s: string, p: string) -> string is
+    if string_starts_with(s, p) is return string_slice(s, string_len(p), string_len(s)) end
+    return s
+end
+
+pub fn trim_suffix(s: string, p: string) -> string is
+    if string_ends_with(s, p) is return string_slice(s, 0, string_len(s) - string_len(p)) end
+    return s
+end
+
+;; strings.Fields
+pub fn fields(s: string) -> [string] is
+    let norm: string = string_replace(string_replace(string_replace(s, "\t", " "), "\r", " "), "\n", " ")
+    let parts: [string] = string_split(norm, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is out = array_push(out, parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn is_space(c: string) -> bool is
+    return c == " " || c == "\t" || c == "\n" || c == "\r"
+end
