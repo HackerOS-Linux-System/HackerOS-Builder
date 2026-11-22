@@ -1,0 +1,217 @@
+mod oci
+mod registry
+mod testutil
+mod fsx
+mod proc
+mod ui
+
+fn make_layer(dir: string, out: string) is
+    shell("cd '" + dir + "' && tar --format=gnu -czf '" + out + "' $(LC_ALL=C ls -A) 2>/dev/null")
+end
+
+#[test]
+fn test_retryable_errors() is
+    testutil::is_true(oci::is_retryable_transfer_err("read tcp: unexpected EOF"), "eof")
+    testutil::is_true(oci::is_retryable_transfer_err("connection reset by peer"), "reset")
+    testutil::is_true(oci::is_retryable_transfer_err("net/http: TLS handshake timeout"), "tls handshake")
+    testutil::is_true(oci::is_retryable_transfer_err("GET x: unexpected status code 503 oops"), "503")
+    testutil::is_true(!oci::is_retryable_transfer_err("GET x: unexpected status code 401 UNAUTHORIZED"), "401 nie jest retryable")
+    testutil::is_true(!oci::is_retryable_transfer_err("suma sha256 warstwy nie zgadza sie"), "sha mismatch nie jest retryable")
+end
+
+#[test]
+fn test_parse_reference() is
+    let r: registry::RegRef = registry::parse_reference("ghcr.io/michal/x:v2")
+    testutil::eq_s(r.rf_host, "ghcr.io")
+    testutil::eq_s(r.rf_repo, "michal/x")
+    testutil::eq_s(r.rf_ref, "v2")
+    testutil::eq_s(r.rf_scheme, "https")
+    testutil::eq_s(registry::parse_reference("ghcr.io/michal/x").rf_ref, "latest")
+    testutil::eq_s(registry::parse_reference("localhost:5000/a/b:1").rf_scheme, "http")
+    testutil::eq_s(registry::parse_reference("alpine").rf_repo, "library/alpine")
+    testutil::contains(registry::parse_reference("ghcr.io/Michal/x:1").rf_err, "repository can only contain")
+    testutil::contains(registry::parse_reference("ghcr.io/m/x:bad tag").rf_err, "tag can only contain")
+end
+
+#[test]
+fn test_layer_validate() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/src/a", "x")
+    make_layer(d + "/src", d + "/ok.tar.gz")
+    testutil::eq_s(oci::validate_layer(d + "/ok.tar.gz"), "")
+    testutil::contains(oci::validate_layer(d + "/nope.tar.gz"), "no such file")
+    testutil::put(d + "/garbage.tar.gz", "this is not gzip")
+    testutil::contains(oci::validate_layer(d + "/garbage.tar.gz"), "naglowek gzip")
+    shell("head -c 10240 /dev/zero | gzip > '" + d + "/empty.tar.gz'")
+    testutil::contains(oci::validate_layer(d + "/empty.tar.gz"), "warstwa jest pusta")
+    shell("head -c 30 '" + d + "/ok.tar.gz' > '" + d + "/trunc.tar.gz'")
+    testutil::is_true(oci::validate_layer(d + "/trunc.tar.gz") != "", "ucieta warstwa jest odrzucona")
+end
+
+#[test]
+fn test_create_layer_tarball_round_trip() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/etc/hello", "hi")
+    shell("ln -s /etc/hello '" + root + "/etc/lnk' && chmod 4755 '" + root + "/etc/hello' && mkdir -p '" + root + "/priv' && chmod 700 '" + root + "/priv'")
+    let layer: string = testutil::tmpdir() + "/l.tar.gz"
+    testutil::eq_s(oci::create_layer_tarball(root, layer), "")
+    testutil::eq_s(oci::validate_layer(layer), "")
+    let names: string = shell("tar -tzf '" + layer + "'")
+    testutil::is_true(!string_contains(names, "./"), "wpisy bez prefiksu ./")
+    testutil::contains(names, "etc/")
+    let dest: string = testutil::tmpdir()
+    testutil::eq_s(oci::apply_layer(layer, dest), "")
+    testutil::eq_s(fs_read(dest + "/etc/hello"), "hi")
+    testutil::eq_s(fsx::readlink(dest + "/etc/lnk"), "/etc/hello")
+    testutil::eq_s(fsx::stat_mode_octal(dest + "/etc/hello"), "4755")
+    testutil::eq_s(fsx::stat_mode_octal(dest + "/priv"), "700")
+end
+
+#[test]
+fn test_apply_layer_whiteout_and_opaque() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/l1/etc/a", "1")
+    testutil::put(d + "/l1/etc/b", "1")
+    testutil::put(d + "/l1/opt/x", "1")
+    testutil::put(d + "/l1/opt/y", "1")
+    testutil::put(d + "/l1/keep", "1")
+    make_layer(d + "/l1", d + "/l1.tar.gz")
+    testutil::put(d + "/l2/etc/.wh.a", "")
+    testutil::put(d + "/l2/opt/.wh..wh..opq", "")
+    testutil::put(d + "/l2/opt/z", "new")
+    make_layer(d + "/l2", d + "/l2.tar.gz")
+    let dest: string = d + "/dest"
+    fsx::mkdir_p(dest)
+    testutil::eq_s(oci::apply_layer(d + "/l1.tar.gz", dest), "")
+    testutil::eq_s(oci::apply_layer(d + "/l2.tar.gz", dest), "")
+    testutil::is_true(!fsx::exists(dest + "/etc/a"), "a usuniety whiteoutem")
+    testutil::is_true(fsx::exists(dest + "/etc/b"), "b zostaje")
+    testutil::is_true(!fsx::exists(dest + "/opt/x") && !fsx::exists(dest + "/opt/y"), "opaque czysci katalog")
+    testutil::eq_s(fs_read(dest + "/opt/z"), "new")
+    testutil::is_true(!fsx::lexists(dest + "/etc/.wh.a") && !fsx::lexists(dest + "/opt/.wh..wh..opq"), "pliki whiteout nie sa tworzone")
+    testutil::is_true(fsx::exists(dest + "/keep"), "keep zostaje")
+end
+
+#[test]
+fn test_build_image_metadata() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/src/a", "x")
+    make_layer(d + "/src", d + "/l.tar.gz")
+    let r: oci::ImageRes = oci::build_image([d + "/l.tar.gz"], false)
+    testutil::eq_s(r.ir_err, "")
+    let man: string = fs_read(r.ir_img.im_man_path)
+    testutil::contains(man, "\"schemaVersion\":2")
+    testutil::contains(man, "application/vnd.docker.distribution.manifest.v2+json")
+    testutil::contains(man, r.ir_img.im_digests[0])
+    let cfg: string = fs_read(r.ir_img.im_cfg_path)
+    testutil::contains(cfg, "\"os\":\"linux\"")
+    testutil::contains(cfg, r.ir_img.im_diffids[0])
+    testutil::eq_s("sha256:" + string_split(string_trim(shell("sha256sum '" + r.ir_img.im_cfg_path + "'")), " ")[0], r.ir_img.im_cfg_digest)
+    oci::image_free(r.ir_img)
+end
+
+#[test]
+fn test_container_defaults_in_config() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/src/a", "x")
+    make_layer(d + "/src", d + "/l.tar.gz")
+    let r: oci::ImageRes = oci::build_image([d + "/l.tar.gz"], true)
+    let cfg: string = fs_read(r.ir_img.im_cfg_path)
+    testutil::contains(cfg, "\"Cmd\":[\"/bin/bash\"]")
+    testutil::contains(cfg, "\"WorkingDir\":\"/root\"")
+end
+
+#[test]
+fn test_push_without_layers_is_error() is
+    let r: oci::PushRes = oci::build_and_push_layers([], "ghcr.io/a/b", "t", "tok", false)
+    testutil::contains(r.pu_err, "brak warstw OCI")
+end
+
+#[test]
+fn test_push_refuses_corrupt_layer() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/bad.tar.gz", "nie gzip")
+    let r: oci::PushRes = oci::build_and_push_layers([d + "/bad.tar.gz"], "ghcr.io/a/b", "t", "tok", false)
+    testutil::contains(r.pu_err, "jest uszkodzona")
+    testutil::contains(r.pu_err, "NIE wypychamy ZADNEJ warstwy")
+end
+
+#[test]
+fn test_local_archive_is_docker_save_format() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/etc/hello", "hi")
+    let out: string = testutil::tmpdir() + "/c.tar"
+    testutil::eq_s(oci::save_local_archive(root, "ghcr.io/michal/x", "t1", testutil::tmpdir(), out), "")
+    let names: string = shell("tar --force-local -tf '" + out + "'")
+    testutil::contains(names, "manifest.json")
+    testutil::contains(names, ".tar.gz")
+    testutil::contains(names, "sha256:")
+    let man: string = shell("tar --force-local -xOf '" + out + "' manifest.json")
+    testutil::contains(man, "\"RepoTags\":[\"ghcr.io/michal/x:t1\"]")
+end
+
+fn start_mock(port: int, mode: string) -> string is
+    let pidf: string = testutil::tmpdir() + "/pid"
+    shell("(python3 tests/mock_registry.py " + to_string(port) + " " + mode + " >/dev/null 2>&1 & echo $! > '" + pidf + "') ; sleep 1")
+    return pidf
+end
+
+fn stop_mock(pidf: string) is
+    shell("kill $(cat '" + pidf + "') 2>/dev/null; true")
+end
+
+fn push_pull_round_trip(port: int, mode: string) is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/etc/hello", "round-trip")
+    testutil::put(root + "/usr/bin/tool", "t")
+    shell("chmod 4755 '" + root + "/usr/bin/tool' && ln -s /etc/hello '" + root + "/etc/lnk' && dd if=/dev/urandom of='" + root + "/big' bs=1M count=18 2>/dev/null")
+    let layer: string = testutil::tmpdir() + "/l.tar.gz"
+    oci::create_layer_tarball(root, layer)
+    let pidf: string = start_mock(port, mode)
+    let repo: string = "127.0.0.1:" + to_string(port) + "/acme/test"
+    let pu: oci::PushRes = oci::build_and_push_layers([layer], repo, "v1", "tok", false)
+    testutil::eq_s(pu.pu_err, "")
+    let dest: string = testutil::tmpdir() + "/pulled"
+    let pe: string = oci::pull_and_unpack(repo, "v1", "tok", dest, false)
+    stop_mock(pidf)
+    testutil::eq_s(pe, "")
+    testutil::eq_s(fs_read(dest + "/etc/hello"), "round-trip")
+    testutil::eq_s(fsx::readlink(dest + "/etc/lnk"), "/etc/hello")
+    testutil::eq_s(fsx::stat_mode_octal(dest + "/usr/bin/tool"), "4755")
+    testutil::eq_s(string_trim(shell("cmp '" + root + "/big' '" + dest + "/big' && echo same")), "same")
+end
+
+#[test]
+fn test_push_pull_round_trip_bearer_auth() is
+    push_pull_round_trip(5171, "bearer")
+end
+
+#[test]
+fn test_push_pull_round_trip_basic_auth() is
+    push_pull_round_trip(5172, "basic")
+end
+
+#[test]
+fn test_pull_unknown_tag_fails_without_retry() is
+    let pidf: string = start_mock(5173, "bearer")
+    env_set("HACKEROS_PULL_BACKOFF_MS", "10")
+    let e: string = oci::pull_and_unpack("127.0.0.1:5173/acme/none", "zz", "tok", testutil::tmpdir() + "/d", false)
+    stop_mock(pidf)
+    testutil::contains(e, "unexpected status code 404")
+    testutil::is_true(!string_contains(e, "po 4 probach"), "404 nie jest ponawiane")
+end
+
+#[test]
+fn test_pull_unreachable_registry_retries_then_fails() is
+    env_set("HACKEROS_PULL_BACKOFF_MS", "10")
+    let e: string = oci::pull_and_unpack("127.0.0.1:5199/acme/x", "t", "tok", testutil::tmpdir() + "/d", false)
+    testutil::is_true(e != "", "blad polaczenia")
+end
+
+#[test]
+fn test_wrong_token_is_rejected() is
+    let pidf: string = start_mock(5174, "basic")
+    let e: string = oci::pull_and_unpack("127.0.0.1:5174/acme/x", "t", "zly-token", testutil::tmpdir() + "/d", false)
+    stop_mock(pidf)
+    testutil::contains(e, "unexpected status code 401")
+end
