@@ -1,0 +1,52 @@
+mod strx
+
+;; Pakiet apt dla interpretera z shebang albo "" gdy interpreter jest wbudowany / nieznany.
+pub fn interpreter_package(i: string) -> string is
+    if i == "python3" is return "python3" end
+    if i == "python" || i == "python2" is return "python-is-python3" end
+    if i == "ruby" || i == "ruby3" || i == "ruby3.1" || i == "ruby3.2" is return "ruby" end
+    if i == "lua" || i == "lua5.4" is return "lua5.4" end
+    if i == "lua5.1" is return "lua5.1" end
+    if i == "lua5.3" is return "lua5.3" end
+    if i == "perl" is return "perl" end
+    if i == "node" || i == "nodejs" is return "nodejs" end
+    if i == "php" || i == "php-cli" || i == "php8" is return "php-cli" end
+    if i == "tclsh" || i == "tcl" is return "tcl" end
+    if i == "Rscript" || i == "R" is return "r-base-core" end
+    if i == "gawk" || i == "awk" is return "gawk" end
+    if i == "fish" is return "fish" end
+    if i == "zsh" is return "zsh" end
+    if i == "ksh" is return "ksh" end
+    return ""
+end
+
+pub fn always_present(i: string) -> bool is
+    return i == "" || i == "sh" || i == "bash" || i == "dash" || i == "ash"
+end
+
+;; Czy buildera stac na obsluge tego interpretera?
+pub fn is_recognized(i: string) -> bool is
+    if always_present(i) is return true end
+    return interpreter_package(i) != ""
+end
+
+pub fn label(i: string) -> string is
+    if i == "" is return "brak shebang/binarny" end
+    return i
+end
+
+pub fn supported_languages() -> [string] is
+    return [
+        "sh / bash / dash (wbudowane w kazdy system Debian)",
+        "python3 (oraz \"python\" -> python-is-python3)",
+        "ruby",
+        "lua5.1 / lua5.3 / lua5.4",
+        "perl",
+        "nodejs (\"node\")",
+        "php-cli (\"php\")",
+        "tcl",
+        "r-base-core (\"Rscript\")",
+        "gawk",
+        "fish / zsh / ksh",
+    ]
+end
