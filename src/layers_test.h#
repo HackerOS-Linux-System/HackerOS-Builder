@@ -1,0 +1,98 @@
+mod layers
+mod testutil
+mod fsx
+mod proc
+
+fn layer_listing(path: string) -> string is
+    return shell("tar -tzf '" + path + "' 2>/dev/null")
+end
+
+#[test]
+fn test_snapshot_captures_files_and_dirs() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/etc/hello", "x")
+    testutil::put(root + "/usr/bin/tool", "y")
+    layers::snapshot_tree(root, root + ".snap")
+    let s: string = fs_read(root + ".snap")
+    testutil::contains(s, "etc\x1fd\x1f")
+    testutil::contains(s, "etc/hello\x1ff\x1f")
+    testutil::contains(s, "usr/bin/tool\x1ff\x1f")
+end
+
+#[test]
+fn test_diff_detects_added_changed_removed() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/keep", "1")
+    testutil::put(root + "/change", "1")
+    testutil::put(root + "/gone", "1")
+    layers::snapshot_tree(root, root + ".s1")
+    shell("sleep 1; cd '" + root + "' && echo 22 > change && rm gone && echo n > added")
+    layers::snapshot_tree(root, root + ".s2")
+    let d: layers::Diff = layers::diff_snapshots(root + ".s1", root + ".s2", "t1")
+    let changed: string = fs_read(d.df_changed_file)
+    testutil::contains(changed, "added")
+    testutil::contains(changed, "change")
+    testutil::is_true(!string_contains(changed, "keep"), "keep bez zmian")
+    testutil::eq_s(string_trim(fs_read(d.df_removed_file)), "gone")
+    layers::diff_free(d)
+end
+
+#[test]
+fn test_removals_pruned_to_parent() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/usr/share/doc/pkg/README", "1")
+    testutil::put(root + "/usr/share/doc/pkg/changelog.gz", "1")
+    testutil::put(root + "/var/log/apt.log", "1")
+    testutil::put(root + "/usr/share/other", "1")
+    layers::snapshot_tree(root, root + ".s1")
+    shell("rm -rf '" + root + "/usr/share/doc' '" + root + "/var/log/apt.log'")
+    layers::snapshot_tree(root, root + ".s2")
+    let d: layers::Diff = layers::diff_snapshots(root + ".s1", root + ".s2", "t2")
+    let removed: string = string_trim(fs_read(d.df_removed_file))
+    testutil::eq_s(removed, "usr/share/doc\nvar/log/apt.log")
+    layers::diff_free(d)
+end
+
+#[test]
+fn test_empty_diff_writes_nothing() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/a", "1")
+    layers::snapshot_tree(root, root + ".s1")
+    let d: layers::Diff = layers::diff_snapshots(root + ".s1", root + ".s1", "t3")
+    let r: layers::LayerRes = layers::write_incremental_layer(root, d, root + ".tar.gz")
+    testutil::is_true(!r.ly_wrote, "pusty diff nie tworzy warstwy")
+    testutil::is_true(!fsx::exists(root + ".tar.gz"), "brak pliku")
+end
+
+#[test]
+fn test_incremental_layer_changed_and_removed() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/etc/keep", "1")
+    testutil::put(root + "/etc/old", "1")
+    testutil::put(root + "/top", "1")
+    layers::snapshot_tree(root, root + ".s1")
+    shell("sleep 1; cd '" + root + "' && echo new > etc/new && rm etc/old top")
+    layers::snapshot_tree(root, root + ".s2")
+    let d: layers::Diff = layers::diff_snapshots(root + ".s1", root + ".s2", "t4")
+    let r: layers::LayerRes = layers::write_incremental_layer(root, d, root + ".tar.gz")
+    testutil::eq_s(r.ly_err, "")
+    testutil::is_true(r.ly_wrote, "warstwa zapisana")
+    let l: string = layer_listing(root + ".tar.gz")
+    testutil::contains(l, "etc/new")
+    testutil::contains(l, "etc/.wh.old")
+    testutil::contains(l, ".wh.top")
+    testutil::is_true(!string_contains(l, "etc/keep"), "niezmieniony plik nie trafia do warstwy")
+    layers::diff_free(d)
+end
+
+#[test]
+fn test_mtime_change_detected() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/f", "same")
+    layers::snapshot_tree(root, root + ".s1")
+    shell("touch -d '2001-01-01' '" + root + "/f'")
+    layers::snapshot_tree(root, root + ".s2")
+    let d: layers::Diff = layers::diff_snapshots(root + ".s1", root + ".s2", "t5")
+    testutil::eq_i(d.df_changed_n, 1)
+    layers::diff_free(d)
+end
