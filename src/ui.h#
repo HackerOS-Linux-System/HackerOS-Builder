@@ -1,0 +1,204 @@
+use "bit -> colors"
+mod sysc
+
+;; Wywolaj raz na starcie: ustawia poziom kolorow (1 = 16 kolorow, 0 = brak).
+pub fn init() is
+    if sysc::stdout_is_tty() is
+        colors::support::set_level(1)
+    else is
+        colors::support::set_level(0)
+    end
+end
+
+pub fn set_verbose(v: bool) is
+    if v is env_set("HACKEROS_BUILDER_VERBOSE", "1") else is env_set("HACKEROS_BUILDER_VERBOSE", "") end
+end
+
+pub fn is_verbose() -> bool is
+    return env_get("HACKEROS_BUILDER_VERBOSE") != ""
+end
+
+;; --- Colorize / Bold / Dim / Underline ---
+pub fn bold(s: string) -> string is return colors::bold(s) end
+pub fn dim(s: string) -> string is return colors::dim(s) end
+pub fn underline(s: string) -> string is return colors::underline(s) end
+pub fn cyan(s: string) -> string is return colors::cyan(s) end
+pub fn yellow(s: string) -> string is return colors::yellow(s) end
+pub fn magenta(s: string) -> string is return colors::magenta(s) end
+pub fn blue(s: string) -> string is return colors::blue(s) end
+pub fn green(s: string) -> string is return colors::bold(colors::green(s)) end
+pub fn red(s: string) -> string is return colors::bold(colors::red(s)) end
+pub fn bold_cyan(s: string) -> string is return colors::bold(colors::cyan(s)) end
+pub fn bold_white(s: string) -> string is return colors::bold(colors::white(s)) end
+
+;; --- poziomy logow ---
+pub fn debug(msg: string) is
+    if !is_verbose() is return end
+    write(dim("  · " + msg))
+end
+
+pub fn info(msg: string) is
+    write(bold_cyan("  ➜ ") + " " + msg)
+end
+
+pub fn warn(msg: string) is
+    sysc::eprint(yellow("  ⚠ OSTRZEZENIE:") + " " + msg)
+end
+
+pub fn error(msg: string) is
+    sysc::eprint(red("  ✗ BLAD:") + " " + msg)
+end
+
+pub fn section(title: string) is
+    let line: string = string_repeat("─", 62)
+    write("")
+    write(bold_cyan("┌" + line))
+    write(bold_cyan("│") + " " + bold(title))
+    write(bold_cyan("└" + line))
+end
+
+;; Krok N/M (current/total) - pogrubiony i kolorowy.
+pub fn step(current: int, total: int, msg: string) is
+    let prefix: string = "[" + to_string(current) + "/" + to_string(total) + "]"
+    write(bold_white(prefix) + " " + bold_cyan("➜") + " " + bold(msg))
+end
+
+pub fn substep(msg: string) is
+    write("      " + cyan("·") + " " + msg)
+end
+
+;; --- ramka bledu ---
+fn max_int(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+;; Lamie tekst po spacjach na linie o dlugosci <= width (jak wrapText z Go).
+pub fn wrap_text(text: string, width: int) -> [string] is
+    let mut lines: [string] = []
+    let paragraphs: [string] = string_split(text, "\n")
+    let mut pi: int = 0
+    while pi < array_len(paragraphs) is
+        let para: string = paragraphs[pi]
+        pi += 1
+        if para == "" is
+            lines = array_push(lines, "")
+        else is
+            let words: [string] = fields(para)
+            if array_len(words) == 0 is
+                lines = array_push(lines, "")
+            else is
+                let mut cur: string = words[0]
+                let mut wi: int = 1
+                while wi < array_len(words) is
+                    let w: string = words[wi]
+                    wi += 1
+                    if string_len(cur) + 1 + string_len(w) > width is
+                        lines = array_push(lines, cur)
+                        cur = w
+                    else is
+                        cur = cur + " " + w
+                    end
+                end
+                lines = array_push(lines, cur)
+            end
+        end
+    end
+    return lines
+end
+
+;; strings.Fields: dzieli po bialych znakach, pomija puste.
+pub fn fields(s: string) -> [string] is
+    let norm: string = string_replace(string_replace(string_replace(s, "\t", " "), "\r", " "), "\n", " ")
+    let parts: [string] = string_split(norm, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is out = array_push(out, parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn pad_right(s: string, width: int) -> string is
+    let n: int = string_len(s)
+    if n >= width is return s end
+    return s + string_repeat(" ", width - n)
+end
+
+pub fn error_box(title: string, detail: string) is
+    let width: int = 78
+    let line: string = string_repeat("═", width)
+    sysc::eprint("")
+    sysc::eprint(red("╔" + line + "╗"))
+    let title_text: string = "BUDOWA PRZERWANA: " + title
+    sysc::eprint(red("║") + " " + red(bold(title_text)) + string_repeat(" ", max_int(0, width - 2 - string_len(title_text))) + red("║"))
+    sysc::eprint(red("╠" + line + "╣"))
+    let wrapped: [string] = wrap_text(detail, width - 2)
+    let mut i: int = 0
+    while i < array_len(wrapped) is
+        sysc::eprint(red("║") + " " + pad_right(wrapped[i], width - 1) + red("║"))
+        i += 1
+    end
+    sysc::eprint(red("╚" + line + "╝"))
+    sysc::eprint("")
+end
+
+;; 1536000 -> "1.5 MB"
+pub fn format_bytes(n: int) -> string is
+    if n < 1024 is return to_string(n) + " B" end
+    let mut div: int = 1024
+    let mut exp: int = 0
+    let mut n2: int = n / 1024
+    while n2 >= 1024 is
+        div = div * 1024
+        exp += 1
+        n2 = n2 / 1024
+    end
+    let tenths: int = (n * 10 + div / 2) / div
+    let units: string = "KMGTPE"
+    return to_string(tenths / 10) + "." + to_string(tenths % 10) + " " + string_at(units, exp) + "B"
+end
+
+;; Czas jako "12s" / "3m05s" (formatElapsed z Go)
+pub fn format_elapsed(ms: int) -> string is
+    let secs: int = (ms + 500) / 1000
+    if secs < 60 is return to_string(secs) + "s" end
+    let m: int = secs / 60
+    let s: int = secs - m * 60
+    let pad: string = if s < 10 then "0" else ""
+    return to_string(m) + "m" + pad + to_string(s) + "s"
+end
+
+;; Odpowiednik %q z Go (dla typowych, drukowalnych napisow).
+pub fn quote(s: string) -> string is
+    let a: string = string_replace(s, "\\", "\\\\")
+    let b: string = string_replace(a, "\"", "\\\"")
+    let c: string = string_replace(string_replace(string_replace(b, "\n", "\\n"), "\t", "\\t"), "\r", "\\r")
+    return "\"" + c + "\""
+end
+
+pub fn pad_left(s: string, width: int) -> string is
+    let n: int = string_len(s)
+    if n >= width is return s end
+    return string_repeat(" ", width - n) + s
+end
+
+;; Dlugosc tekstu bez sekwencji ANSI ESC[...m (liczona w znakach UTF-8 nie-ciaglych bajtach).
+pub fn visible_len(s: string) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    let total: int = string_len(s)
+    while i < total is
+        let c: string = string_at(s, i)
+        if c == "\x1b" is
+            while i < total && string_at(s, i) != "m" is i += 1 end
+            i += 1
+        else is
+            let b: int = byte_at(s, i)
+            if b < 128 || b >= 192 is n += 1 end
+            i += 1
+        end
+    end
+    return n
+end
