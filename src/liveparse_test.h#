@@ -1,0 +1,145 @@
+mod liveparse
+mod testutil
+mod strx
+
+fn project_with_lists(files: [string]) -> string is
+    let root: string = testutil::tmpdir()
+    let mut i: int = 0
+    while i < array_len(files) is
+        testutil::put(root + "/config/package-lists/" + files[i], files[i + 1])
+        i += 2
+    end
+    return root
+end
+
+fn parse_ok(root: string) -> liveparse::Project is
+    let r: liveparse::ParseRes = liveparse::parse(root)
+    testutil::eq_s(r.pr_err, "")
+    return r.pr_project
+end
+
+#[test]
+fn test_simple_list() is
+    let p: liveparse::Project = parse_ok(project_with_lists(["a.list.chroot", "vim\n# komentarz\n\ncurl git\n"]))
+    testutil::eq_s(array_join(p.lp_packages, ","), "curl,git,vim")
+end
+
+#[test]
+fn test_exclusion_prefix() is
+    let p: liveparse::Project = parse_ok(project_with_lists(["a.list.chroot", "vim\ncurl\n-vim\n"]))
+    testutil::eq_s(array_join(p.lp_packages, ","), "curl")
+    testutil::eq_s(array_join(p.lp_excluded, ","), "vim")
+end
+
+#[test]
+fn test_exclusion_order_independent() is
+    let p: liveparse::Project = parse_ok(project_with_lists(["a.list.chroot", "-vim\n", "b.list.chroot", "vim\ncurl\n"]))
+    testutil::eq_s(array_join(p.lp_packages, ","), "curl")
+end
+
+#[test]
+fn test_missing_package_lists_dir_is_not_error() is
+    let root: string = testutil::tmpdir()
+    fsx_mkdir(root + "/config")
+    let p: liveparse::Project = parse_ok(root)
+    testutil::eq_i(array_len(p.lp_packages), 0)
+end
+
+fn fsx_mkdir(p: string) is
+    shell("mkdir -p '" + p + "'")
+end
+
+#[test]
+fn test_missing_config_dir_is_error() is
+    let r: liveparse::ParseRes = liveparse::parse(testutil::tmpdir())
+    testutil::contains(r.pr_err, "oczekiwano podkatalogu 'config/'")
+end
+
+#[test]
+fn test_deduplicates_across_files() is
+    let p: liveparse::Project = parse_ok(project_with_lists(["a.list.chroot", "vim\ncurl\n", "b.list.chroot", "vim\nnano\n"]))
+    testutil::eq_s(array_join(p.lp_packages, ","), "curl,nano,vim")
+end
+
+#[test]
+fn test_live_boot_gets_initramfs_tools() is
+    let p: liveparse::Project = parse_ok(project_with_lists(["a.list.chroot", "live-boot\n"]))
+    testutil::is_true(strx::contains(p.lp_packages, "live-boot-initramfs-tools"), "dopisane live-boot-initramfs-tools")
+end
+
+#[test]
+fn test_hooks_normal_and_live() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/config/hooks/normal/0100-a.hook.chroot", "#!/bin/sh\n")
+    testutil::put(root + "/config/hooks/live/0200-b.hook.chroot", "#!/usr/bin/env python3\n")
+    testutil::put(root + "/config/hooks/normal/readme.txt", "ignore")
+    let p: liveparse::Project = parse_ok(root)
+    testutil::eq_i(array_len(p.lp_hooks), 2)
+    testutil::eq_s(p.lp_hooks[0].hs_name, "0100-a.hook.chroot")
+    testutil::eq_s(p.lp_hooks[1].hs_interp, "python3")
+end
+
+#[test]
+fn test_hooks_missing_dirs() is
+    let root: string = testutil::tmpdir()
+    fsx_mkdir(root + "/config")
+    testutil::eq_i(array_len(parse_ok(root).lp_hooks), 0)
+end
+
+#[test]
+fn test_shebang_variants() is
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/bin/sh"), "sh")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/bin/bash"), "bash")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/usr/bin/env python3"), "python3")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/usr/bin/python3"), "python3")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/usr/bin/env ruby"), "ruby")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/usr/bin/env lua5.4"), "lua5.4")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#!/usr/bin/perl"), "perl")
+    testutil::eq_s(liveparse::interpreter_from_first_line("#! /bin/sh"), "sh")
+    testutil::eq_s(liveparse::interpreter_from_first_line("no shebang here"), "")
+end
+
+#[test]
+fn test_detect_from_file() is
+    let d: string = testutil::tmpdir()
+    testutil::put(d + "/h.hook.chroot", "#!/usr/bin/env python3\nprint('hi')\n")
+    testutil::eq_s(liveparse::detect_hook_interpreter(d + "/h.hook.chroot"), "python3")
+    testutil::put(d + "/n.hook.chroot", "no shebang here\njust text\n")
+    testutil::eq_s(liveparse::detect_hook_interpreter(d + "/n.hook.chroot"), "")
+end
+
+#[test]
+fn test_installer_hooks_separate() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/config/hooks/normal/0100-a.hook.chroot", "#!/bin/sh\n")
+    testutil::put(root + "/config/hooks/installer/0100-i.hook.chroot", "#!/bin/sh\n")
+    let p: liveparse::Project = parse_ok(root)
+    testutil::eq_i(array_len(p.lp_hooks), 1)
+    testutil::eq_i(array_len(p.lp_installer_hooks), 1)
+    testutil::eq_i(array_len(liveparse::parse_installer_hooks(root)), 1)
+end
+
+#[test]
+fn test_installer_hooks_missing_root_is_empty() is
+    testutil::eq_i(array_len(liveparse::parse_installer_hooks("/nonexistent-hosb-root")), 0)
+end
+
+#[test]
+fn test_archives() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/config/archives/x.list.chroot", "deb http://x/ y main\n# c\n")
+    testutil::put(root + "/config/archives/x.key.chroot", "KEY")
+    let p: liveparse::Project = parse_ok(root)
+    testutil::eq_i(array_len(p.lp_extra_sources), 1)
+    testutil::eq_i(array_len(p.lp_extra_keys), 1)
+end
+
+#[test]
+fn test_summary_format() is
+    let root: string = testutil::tmpdir()
+    testutil::put(root + "/config/hooks/normal/0100-a.hook.chroot", "#!/bin/sh\n")
+    testutil::put(root + "/config/hooks/normal/0200-b.hook.chroot", "#!/usr/bin/env python3\n")
+    let s: string = liveparse::summary(parse_ok(root))
+    testutil::contains(s, "Hookow do wykonania:     2 (python3: 1, sh: 1)")
+    testutil::contains(s, "includes.chroot:         (brak)")
+end
