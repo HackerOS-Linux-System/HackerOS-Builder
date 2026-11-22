@@ -1,0 +1,220 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod net
+
+fn hammer_releases_url() -> string is return "https://github.com/HackerOS-Linux-System/hammer/releases" end
+fn isolator_releases_url() -> string is return "https://github.com/HackerOS-Linux-System/Isolator/releases" end
+pub fn hammer_fallback_version() -> string is return "v0.6.0" end
+pub fn isolator_fallback_version() -> string is return "v0.1.0" end
+
+pub struct VerRes is
+    pub vr_version: string
+    pub vr_err:     string
+end
+
+pub struct NamesRes is
+    pub nr_names: [string]
+    pub nr_err:   string
+end
+
+fn release_asset_url(repo: string, version: string, asset: string) -> string is
+    return "https://github.com/HackerOS-Linux-System/" + repo + "/releases/download/" + version + "/" + asset
+end
+
+;; Pierwszy tag v<cyfra>... ze strony wydan (jak reReleaseTag w Go) albo "".
+pub fn find_release_tag(page_file: string, repo: string) -> string is
+    let pat: string = "/HackerOS-Linux-System/" + repo + "/releases/tag/v[0-9][^\"'[:space:]]*"
+    let hit: string = string_trim(shell("grep -o " + proc::sq(pat) + " " + proc::sq(page_file) + " 2>/dev/null | head -n 1"))
+    if hit == "" is return "" end
+    let idx: int = string_find(hit, "/tag/")
+    return string_slice(hit, idx + 5, string_len(hit))
+end
+
+fn scrape_latest_tag(repo: string, url: string, ua: string, nice: string, no_release_hint: string) -> VerRes is
+    let tmp: string = proc::tmp_path("rel")
+    let r: net::FetchRes = net::fetch_to_file(url, tmp, ua)
+    if r.fr_err != "" is
+        fsx::remove(tmp)
+        return VerRes { vr_version: "", vr_err: "pobieranie " + url + ": " + r.fr_err }
+    end
+    if r.fr_status != 200 is
+        fsx::remove(tmp)
+        return VerRes { vr_version: "", vr_err: "GitHub zwrocilo status " + to_string(r.fr_status) + " dla " + url }
+    end
+    let tag: string = find_release_tag(tmp, repo)
+    fsx::remove(tmp)
+    if tag == "" is
+        return VerRes { vr_version: "", vr_err: "nie znaleziono zadnego tagu wydania na stronie " + url + " -- " + no_release_hint }
+    end
+    ui::info("Wykryto najnowsza wersje " + nice + ": " + tag)
+    return VerRes { vr_version: tag, vr_err: "" }
+end
+
+pub fn latest_hammer_version() -> string is
+    let r: VerRes = scrape_latest_tag("hammer", hammer_releases_url(), net::user_agent_03(), "hammer", "sprawdz czy repo ma co najmniej jedno wydanie")
+    if r.vr_err != "" is
+        ui::warn("Nie udalo sie automatycznie wykryc najnowszej wersji hammer (" + r.vr_err + ") -- uzywam wersji fallback " + hammer_fallback_version() + ". Jesli ta wersja jest nieaktualna, zaktualizuj pole 'hammer_version' w config/config.hk projektu.")
+        return hammer_fallback_version()
+    end
+    return r.vr_version
+end
+
+pub fn latest_isolator_version() -> string is
+    let r: VerRes = scrape_latest_tag("Isolator", isolator_releases_url(), net::user_agent_09(), "Isolatora", "sprawdz czy repo Isolator ma co najmniej jedno wydanie")
+    if r.vr_err != "" is
+        ui::warn("Nie udalo sie automatycznie wykryc najnowszej wersji Isolatora (" + r.vr_err + ") -- uzywam wersji fallback " + isolator_fallback_version() + ". Jesli ta wersja nie istnieje albo jest nieaktualna, ustaw [project] -> isolator_version w config.hk.")
+        return isolator_fallback_version()
+    end
+    return r.vr_version
+end
+
+;; Zwraca [hash, "1"] gdy znaleziono wpis, ["", "0"] w przeciwnym razie. (parseChecksumsFile)
+pub fn parse_checksums_file(content: string, wanted: string) -> [string] is
+    let lines: [string] = string_split(content, "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = string_trim(lines[i])
+        i += 1
+        if line != "" is
+            let f: [string] = ui::fields(line)
+            if array_len(f) == 2 is
+                let name: string = if string_starts_with(f[1], "*") then string_slice(f[1], 1, string_len(f[1])) else f[1]
+                if name == wanted is return [f[0], "1"] end
+            end
+        end
+    end
+    return ["", "0"]
+end
+
+;; Weryfikacja sha256 wzgledem checksums.txt wydania. Zwraca "" gdy OK lub gdy sum brak (z ostrzezeniem).
+fn verify_checksum(repo: string, nice: string, version: string, asset: string, data_file: string, ua: string, mismatch_tail: string) -> string is
+    let sums_url: string = release_asset_url(repo, version, "checksums.txt")
+    let sums_file: string = proc::tmp_path("sums")
+    let fe: string = net::fetch_ok(sums_url, sums_file, ua)
+    if fe != "" is
+        fsx::remove(sums_file)
+        ui::warn("Brak pliku checksums.txt dla wydania " + nice + " " + version + " -- KONTYNUUJE BEZ WERYFIKACJI SHA256. To jest normalne dla wydania " + version + " ktore nie publikuje sum kontrolnych.")
+        return ""
+    end
+    let content: string = proc::read_file_or_empty(sums_file)
+    fsx::remove(sums_file)
+    let ent: [string] = parse_checksums_file(content, asset)
+    if ent[1] != "1" is
+        ui::warn("Plik checksums.txt dla wydania " + nice + " " + version + " nie zawiera wpisu dla " + ui::quote(asset) + " -- KONTYNUUJE BEZ WERYFIKACJI.")
+        return ""
+    end
+    let actual: string = net::sha256_file(data_file)
+    if string_lower(actual) != string_lower(ent[0]) is
+        return "SUMA KONTROLNA SIE NIE ZGADZA dla " + asset + " " + version + ":\n  oczekiwano: " + ent[0] + "\n  otrzymano:  " + actual + "\n" + mismatch_tail
+    end
+    return "ok"
+end
+
+;; Pierwszy zwykly plik o nazwie bazowej == name z archiwum tar.gz; kopiuje do dest. Zwraca "" lub blad.
+fn extract_first_regular(archive: string, name: string, dest: string) -> string is
+    let tmp: string = proc::tmp_path("ex")
+    let e: string = fsx::mkdir_p(tmp)
+    if e != "" is return e end
+    let xe: string = proc::run_or_error(["tar", "-xzf", archive, "-C", tmp, "--no-same-owner"])
+    if xe != "" is
+        fsx::remove_all(tmp)
+        return "czytanie tar: " + xe
+    end
+    let listing: [string] = fsx::non_empty_lines(shell("tar -tzf " + proc::sq(archive) + " 2>/dev/null"))
+    let mut i: int = 0
+    while i < array_len(listing) is
+        let p: string = listing[i]
+        i += 1
+        if fsx::basename(p) == name is
+            let full: string = fsx::join(tmp, p)
+            if file_exists(full) && !fsx::is_symlink(full) is
+                let ce: string = fsx::copy_file(full, dest, 493)
+                fsx::remove_all(tmp)
+                return ce
+            end
+        end
+    end
+    fsx::remove_all(tmp)
+    return "archiwum nie zawiera pliku '" + name + "' -- sprawdz czy layout wydania sie nie zmienil"
+end
+
+pub fn download_hammer(version: string, dest_path: string) -> string is
+    let url: string = release_asset_url("hammer", version, "oci-mode.tar.gz")
+    ui::info("Pobieranie hammer " + version + " (oci-mode) z " + url + " ...")
+    let arch: string = proc::tmp_path("hammer") + ".tar.gz"
+    let fe: string = net::fetch_ok(url, arch, net::user_agent_03())
+    if fe != "" is
+        fsx::remove(arch)
+        return "pobieranie hammer (oci-mode) z " + url + ": " + fe
+    end
+    let tail: string = "Moze to byc uszkodzony transfer lub podmieniony artefakt -- build przerwany. Sprobuj ponownie; jesli problem sie powtarza, zglos go w repozytorium hammer."
+    let vc: string = verify_checksum("hammer", "hammer", version, "oci-mode.tar.gz", arch, net::user_agent_03(), tail)
+    if vc != "" && vc != "ok" is
+        fsx::remove(arch)
+        return "weryfikacja integralnosci hammer " + version + ": " + vc
+    end
+    if vc == "ok" is ui::info("SHA256 dla hammer " + version + " (oci-mode.tar.gz): OK") end
+    let ee: string = extract_first_regular(arch, "hammer", dest_path)
+    fsx::remove(arch)
+    if ee != "" is return "rozpakowanie binarki hammer z oci-mode.tar.gz: " + ee end
+    ui::info("hammer " + version + " pobrano, rozpakowano i zapisano do " + dest_path)
+    return ""
+end
+
+pub fn download_and_embed_isolator(version: string, rootfs_dir: string) -> NamesRes is
+    let url: string = release_asset_url("Isolator", version, "isolator.tar.gz")
+    ui::info("Pobieranie Isolator " + version + " z " + url + " ...")
+    let arch: string = proc::tmp_path("isolator") + ".tar.gz"
+    let fe: string = net::fetch_ok(url, arch, net::user_agent_09())
+    if fe != "" is
+        fsx::remove(arch)
+        return NamesRes { nr_names: [], nr_err: "pobieranie Isolator z " + url + ": " + fe }
+    end
+    let tail: string = "NIE uzywamy tego archiwum."
+    let vc: string = verify_checksum("Isolator", "Isolator", version, "isolator.tar.gz", arch, net::user_agent_03(), tail)
+    if vc != "" && vc != "ok" is
+        fsx::remove(arch)
+        return NamesRes { nr_names: [], nr_err: "weryfikacja integralnosci Isolator " + version + ": " + vc }
+    end
+    let dest_dir: string = fsx::join(fsx::join(rootfs_dir, "usr"), "bin")
+    let me: string = fsx::mkdir_p(dest_dir)
+    if me != "" is
+        fsx::remove(arch)
+        return NamesRes { nr_names: [], nr_err: "tworzenie " + dest_dir + ": " + me }
+    end
+    let tmp: string = proc::tmp_path("iso")
+    fsx::mkdir_p(tmp)
+    let xe: string = proc::run_or_error(["tar", "-xzf", arch, "-C", tmp, "--no-same-owner"])
+    if xe != "" is
+        fsx::remove_all(tmp)
+        fsx::remove(arch)
+        return NamesRes { nr_names: [], nr_err: "rozpakowanie isolator.tar.gz do " + dest_dir + ": czytanie tar: " + xe }
+    end
+    let listing: [string] = fsx::non_empty_lines(shell("tar -tzf " + proc::sq(arch) + " 2>/dev/null"))
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(listing) is
+        let p: string = listing[i]
+        i += 1
+        let full: string = fsx::join(tmp, p)
+        let nm: string = fsx::basename(p)
+        if file_exists(full) && !fsx::is_symlink(full) && nm != "" && nm != "." is
+            let ce: string = fsx::copy_file(full, fsx::join(dest_dir, nm), 493)
+            if ce != "" is
+                fsx::remove_all(tmp)
+                fsx::remove(arch)
+                return NamesRes { nr_names: [], nr_err: "rozpakowanie isolator.tar.gz do " + dest_dir + ": " + ce }
+            end
+            names = array_push(names, nm)
+        end
+    end
+    fsx::remove_all(tmp)
+    fsx::remove(arch)
+    if array_len(names) == 0 is
+        return NamesRes { nr_names: [], nr_err: "archiwum isolator.tar.gz nie zawiera zadnego zwyklego pliku -- sprawdz czy layout wydania Isolatora sie nie zmienil" }
+    end
+    ui::info("Isolator " + version + " wbudowany do " + dest_dir + ": " + array_join(names, ", "))
+    return NamesRes { nr_names: names, nr_err: "" }
+end
