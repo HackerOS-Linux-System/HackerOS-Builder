@@ -1,0 +1,137 @@
+mod hk
+mod testutil
+
+fn parse_ok(s: string) -> hk::HkDoc is
+    let r: hk::HkParse = hk::parse_string(s)
+    testutil::eq_s(r.hp_err, "")
+    return r.hp_doc
+end
+
+#[test]
+fn test_basic_section() is
+    let d: hk::HkDoc = parse_ok("[account]\n-> type => user\n-> name => michal\n")
+    testutil::eq_s(hk::as_string(hk::get_path(d, "account.type")), "user")
+end
+
+#[test]
+fn test_comments() is
+    let d: hk::HkDoc = parse_ok("! to jest komentarz\n\n[a]\n! kolejny\n-> x => 1\n")
+    let v: hk::HkVal = hk::get_path(d, "a.x")
+    testutil::eq_s(v.hv_kind, "n")
+    testutil::eq_s(hk::as_string(v), "1")
+end
+
+#[test]
+fn test_nested_keys() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> sub\n--> x => 1\n--> y => 2\n")
+    testutil::eq_s(hk::as_string(hk::get_path(d, "a.sub.x")), "1")
+    testutil::eq_s(hk::as_string(hk::get_path(d, "a.sub.y")), "2")
+end
+
+#[test]
+fn test_dotted_key() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> b.c => wartosc\n")
+    testutil::eq_s(hk::as_string(hk::get_path(d, "a.b.c")), "wartosc")
+end
+
+#[test]
+fn test_array() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> items => [1, 2, 3]\n")
+    let v: hk::HkVal = hk::get_path(d, "a.items")
+    testutil::eq_s(v.hv_kind, "a")
+    testutil::eq_i(array_len(hk::array_items(v)), 3)
+    testutil::eq_s(hk::as_string(hk::get_path(d, "a.items[1]")), "2")
+end
+
+#[test]
+fn test_quoted_string_with_escapes() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> s => \"linia1\\nlinia2\"\n")
+    testutil::eq_s(hk::as_string(hk::get_path(d, "a.s")), "linia1\nlinia2")
+end
+
+#[test]
+fn test_error_key_before_section() is
+    testutil::is_true(hk::parse_string("-> klucz => wartosc\n").hp_err != "", "oczekiwano bledu")
+end
+
+#[test]
+fn test_error_unclosed_section() is
+    testutil::is_true(hk::parse_string("[niezamknieta\n-> x => 1\n").hp_err != "", "oczekiwano bledu")
+end
+
+#[test]
+fn test_error_junk_line() is
+    testutil::contains(hk::parse_string("smieci\n").hp_err, "Nieoczekiwana linia")
+end
+
+#[test]
+fn test_interpolation_simple() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> base => /opt\n-> full => \"${{a.base}}/bin\"\n")
+    let r: hk::HkParse = hk::resolve_interpolations(d)
+    testutil::eq_s(r.hp_err, "")
+    testutil::eq_s(hk::as_string(hk::get_path(r.hp_doc, "a.full")), "/opt/bin")
+end
+
+#[test]
+fn test_interpolation_env() is
+    env_set("HOSB_TEST_VAR", "abc")
+    let d: hk::HkDoc = parse_ok("[a]\n-> v => \"x-${{env:HOSB_TEST_VAR}}-y\"\n")
+    let r: hk::HkParse = hk::resolve_interpolations(d)
+    testutil::eq_s(hk::as_string(hk::get_path(r.hp_doc, "a.v")), "x-abc-y")
+end
+
+#[test]
+fn test_interpolation_cycle() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> x => \"${{a.y}}\"\n-> y => \"${{a.x}}\"\n")
+    testutil::contains(hk::resolve_interpolations(d).hp_err, "CyclicReference")
+end
+
+#[test]
+fn test_interpolation_invalid_reference() is
+    let d: hk::HkDoc = parse_ok("[a]\n-> x => \"${{a.nope}}\"\n")
+    testutil::contains(hk::resolve_interpolations(d).hp_err, "InvalidReference")
+end
+
+#[test]
+fn test_serialize_round_trip() is
+    let d: hk::HkDoc = parse_ok("[account]\n-> type => user\n-> name => michal\n\n")
+    let out: string = hk::serialize(d)
+    let d2: hk::HkDoc = parse_ok(out)
+    testutil::eq_s(hk::as_string(hk::get_path(d2, "account.type")), "user")
+end
+
+#[test]
+fn test_builder() is
+    let mut d: hk::HkDoc = hk::doc_new()
+    d = hk::set_string(d, "account", "type", "user")
+    d = hk::set_string(d, "account", "name", "michal")
+    d = hk::set_bool(d, "release", "pinned", true)
+    let out: string = hk::serialize(d)
+    testutil::eq_s(out, "[account]\n-> type => user\n-> name => michal\n\n[release]\n-> pinned => true\n")
+end
+
+#[test]
+fn test_number_formatting_like_go() is
+    testutil::eq_s(hk::format_number("1.0"), "1")
+    testutil::eq_s(hk::format_number("2024.10"), "2024.1")
+    testutil::eq_s(hk::format_number("-007"), "-7")
+    testutil::eq_s(hk::format_number("1e3"), "1000")
+    testutil::eq_s(hk::format_number("0.00001"), "1e-05")
+end
+
+#[test]
+fn test_serialize_quotes_ambiguous_strings() is
+    let mut d: hk::HkDoc = hk::doc_new()
+    d = hk::set_string(d, "a", "n", "123")
+    d = hk::set_string(d, "a", "b", "true")
+    d = hk::set_string(d, "a", "e", "")
+    let out: string = hk::serialize(d)
+    testutil::contains(out, "-> n => \"123\"")
+    testutil::contains(out, "-> b => \"true\"")
+    testutil::contains(out, "-> e => \"\"")
+end
+
+#[test]
+fn test_key_conflict() is
+    testutil::contains(hk::parse_string("[a]\n-> x => 1\n-> x.y => 2\n").hp_err, "KeyConflict")
+end
