@@ -1,0 +1,856 @@
+pub fn calamares_bootloader_conf() -> string is
+    return "---
+efiBootLoader:        \"grub\"
+kernel: \"/boot/vmlinuz\"
+img:    \"/boot/initrd.img\"
+grubInstall:          \"grub-install\"
+grubMkconfig:         \"grub-mkconfig\"
+grubCfg:              \"/boot/grub/grub.cfg\"
+grubProbe:            \"grub-probe\"
+efiBootMgr:           \"efibootmgr\"
+installEFIFallback:   true
+timeout: \"10\"
+"
+end
+
+pub fn calamares_branding_desc() -> string is
+    return "---
+componentName:  hackeros
+
+welcomeStyleCalamares: true
+welcomeExpandingLogo:  true
+
+strings:
+    productName:         \"HackerOS\"
+    shortProductName:    \"HackerOS\"
+    version:              \"\"
+    shortVersion:         \"\"
+    versionedName:        \"HackerOS\"
+    shortVersionedName:   \"HackerOS\"
+    bootloaderEntryName:  \"HackerOS\"
+    productUrl:           \"https://github.com/HackerOS-Linux-System\"
+    supportUrl:           \"https://github.com/HackerOS-Linux-System\"
+    releaseNotesUrl:      \"https://github.com/HackerOS-Linux-System\"
+    knownIssuesUrl:       \"https://github.com/HackerOS-Linux-System\"
+    donateUrl:            \"https://github.com/HackerOS-Linux-System\"
+
+images:
+    productLogo:         \"logo.png\"
+    productIcon:         \"logo.png\"
+    productWelcome:      \"welcome.png\"
+
+slideshow: \"show.qml\"
+
+style:
+   sidebarBackground:       \"#1d2023\"
+   sidebarText:             \"#ffffff\"
+   sidebarTextSelect:       \"#3daee9\"
+   sidebarTextHighlight:    \"#3daee9\"
+"
+end
+
+pub fn calamares_branding_desc_cybersecurity() -> string is
+    return "---
+componentName:  hackeros
+
+welcomeStyleCalamares: true
+welcomeExpandingLogo:  true
+
+strings:
+    productName:         \"HackerOS Cybersecurity Edition\"
+    shortProductName:    \"HackerOS CyberSec\"
+    version:              \"\"
+    shortVersion:         \"\"
+    versionedName:        \"HackerOS Cybersecurity Edition\"
+    shortVersionedName:   \"HackerOS CyberSec\"
+    bootloaderEntryName:  \"HackerOS Cybersecurity Edition\"
+    productUrl:           \"https://github.com/HackerOS-Linux-System\"
+    supportUrl:           \"https://github.com/HackerOS-Linux-System\"
+    releaseNotesUrl:      \"https://github.com/HackerOS-Linux-System\"
+    knownIssuesUrl:       \"https://github.com/HackerOS-Linux-System\"
+    donateUrl:            \"https://github.com/HackerOS-Linux-System\"
+
+images:
+    productLogo:         \"logo.png\"
+    productIcon:         \"logo.png\"
+    productWelcome:      \"welcome.png\"
+
+slideshow: \"show.qml\"
+
+style:
+   sidebarBackground:       \"#170a0a\"
+   sidebarText:             \"#ffffff\"
+   sidebarTextSelect:       \"#ff3b30\"
+   sidebarTextHighlight:    \"#ff3b30\"
+"
+end
+
+pub fn calamares_display_manager_conf() -> string is
+    return "---
+displaymanagers:
+    - @DM@
+basicSetup: false
+"
+end
+
+pub fn calamares_finished_conf() -> string is
+    return "---
+restartNowEnabled: true
+restartNowChecked: true
+restartNowCommand: \"systemctl -i reboot\"
+notifyOnFinished: false
+"
+end
+
+pub fn calamares_fstab_conf() -> string is
+    return "---
+efiMountPoint: \"/boot/efi\"
+crypttabOptions: [ \"luks\", \"keyscript=/bin/cat\" ]
+"
+end
+
+pub fn calamares_keyboard_conf() -> string is
+    return "---
+defaultLayout: us
+defaultVariant: \"\"
+"
+end
+
+pub fn calamares_locale_conf() -> string is
+    return "---
+region: \"Etc\"
+zone: \"UTC\"
+"
+end
+
+pub fn calamares_machineid_conf() -> string is
+    return "---
+systemd: true
+dbus: true
+symlink: false
+"
+end
+
+pub fn calamares_mount_conf() -> string is
+    return "---
+extraMounts:
+    - device: proc
+      fs: proc
+      mountPoint: /proc
+    - device: sys
+      fs: sysfs
+      mountPoint: /sys
+    - device: /dev
+      mountPoint: /dev
+      options: [ bind ]
+    - device: tmpfs
+      fs: tmpfs
+      mountPoint: /run
+    - device: /run/udev
+      mountPoint: /run/udev
+      options: [ bind ]
+extraMountsEfi:
+    - device: \"efivarfs\"
+      fs: \"efivarfs\"
+      mountPoint: \"/sys/firmware/efi/efivars\"
+"
+end
+
+pub fn calamares_partition_conf() -> string is
+    return "---
+efiSystemPartition: \"/boot/efi\"
+userSwapChoices:
+    - none
+    - small
+    - suspend
+defaultFileSystemType: \"ext4\"
+availableFileSystemTypes:  [ \"ext4\", \"btrfs\", \"xfs\" ]
+enableLuksAutomatedPartitioning: true
+drawNestedPartitions: false
+alwaysShowPartitionLabels: true
+allowManualPartitioning: true
+"
+end
+
+pub fn calamares_settings_conf() -> string is
+    return "# Wygenerowane przez hackeros-builder -- NIE edytuj recznie w obrazie,
+# zmiany rob w config/hooks/normal/*.hook.chroot wlasnego projektu.
+modules-search: [ local ]
+instances:
+  - id:       done
+    module:   shellprocess
+    config:   shellprocess_done.conf
+sequence:
+  - show:
+      - welcome
+      - locale
+      - keyboard
+      - partition
+      - users
+      - summary
+  - exec:
+      - partition
+      - mount
+      - unpackfs
+      - machineid
+      - fstab
+      - locale
+      - localecfg
+      - keyboard
+      - users
+      # @DISPLAYMANAGER@
+      - bootloader
+      - shellprocess
+      - umount
+      - shellprocess@done
+  - show:
+      - finished
+branding: hackeros
+prompt-install: false
+dont-chroot: false
+oem-setup: false
+disable-cancel: false
+disable-cancel-during-exec: true
+quit-at-end: false
+"
+end
+
+pub fn calamares_shellprocess_conf() -> string is
+    return "---
+dontChroot: false
+timeout: 600
+script:
+    - command: \"mkdir -p /etc/hammer\"
+    - command: \"/usr/local/sbin/hackeros-bootfix\"
+    - command: \"if [ -x /usr/share/HackerOS/Scripts/remove-live-user.sh ]; then /bin/sh /usr/share/HackerOS/Scripts/remove-live-user.sh; else /bin/sh /usr/local/sbin/hackeros-remove-live-user; fi\"
+    - command: \"rm -f /usr/local/sbin/hackeros-remove-live-user\"
+    - command: \"rm -f /usr/local/sbin/hackeros-bootfix\"
+    - command: \"rm -f /etc/systemd/system/multi-user.target.wants/hackeros-installer.service\"
+    - command: \"rm -f /etc/systemd/system/hackeros-installer.service\"
+    - command: \"rm -f /usr/local/sbin/hackeros-installer-session /usr/local/sbin/hackeros-installer-xinit /usr/local/sbin/hackeros-installer-diag\"
+    - command: \"rm -f /etc/X11/xorg.conf.d/40-hackeros-input.conf\"
+    - command: \"rm -rf /etc/hackeros-installer\"
+    - command: \"rm -f /var/log/hackeros-installer.log /var/log/hackeros-installer-calamares.log\"
+    - command: \"rm -rf /etc/calamares\"
+"
+end
+
+pub fn calamares_shellprocess_done_conf() -> string is
+    return "---
+dontChroot: true
+timeout: 30
+script:
+    - command: \"touch /run/hackeros-install-done\"
+"
+end
+
+pub fn calamares_show_q_m_l() -> string is
+    return "import QtQuick 2.0
+import calamares.slideshow 1.0
+
+Presentation {{
+    id: presentation
+
+    Slide {{
+        Text {{
+            anchors.centerIn: parent
+            text: \"Instalowanie systemu...\"
+            color: \"#ffffff\"
+            font.pixelSize: 28
+        }}
+    }}
+}}
+"
+end
+
+pub fn calamares_umount_conf() -> string is
+    return "---
+"
+end
+
+pub fn calamares_unpackfs_conf() -> string is
+    return "---
+unpack:
+    - source: \"/run/live/medium/live/filesystem.squashfs\"
+      sourcefs: \"squashfs\"
+      destination: \"\"
+"
+end
+
+pub fn calamares_users_conf() -> string is
+    return "---
+defaultGroups:
+    - users
+    - sudo
+    - audio
+    - video
+    - network
+    - storage
+autologinGroup:  autologin
+sudoersGroup:    sudo
+setRootPassword: true
+doAutologin:     false
+passwordRequirements:
+    nonempty: true
+"
+end
+
+pub fn calamares_welcome_conf() -> string is
+    return "---
+showSupportUrl:       false
+showKnownIssuesUrl:   false
+showReleaseNotesUrl:  false
+requirements:
+  requiredStorage:    4.0
+  requiredRam:        1.0
+  internetCheckUrl:   \"https://deb.debian.org\"
+  check:
+    - storage
+    - ram
+    - power
+  required:
+    - storage
+    - ram
+"
+end
+
+pub fn immutable_script() -> string is
+    return "#!/bin/sh
+# Wygenerowane przez hackeros-builder.
+# hackeros-immutable status | lock | unlock | run -- polecenie...
+# Lista zgodna z hammer (system/immutable.h# -> ro_paths_all). Symlinki
+# (usrmerge: /bin /sbin /lib) i nieistniejace katalogi sa pomijane.
+PROTECTED=\"${{HACKEROS_PROTECTED:-/usr /bin /sbin /lib /lib64 /lib32 /libx32 /opt /srv /boot /hammer/store /hammer/profiles /snap}}\"
+
+usage() {{
+    echo \"uzycie: hackeros-immutable status|lock|unlock|run -- polecenie...\" >&2
+    exit 2
+}}
+
+[ \"$(id -u)\" -eq 0 ] || [ \"$1\" = \"status\" ] || {{ echo \"wymagany root\" >&2; exit 1; }}
+
+lock_one() {{
+    d=\"$1\"
+    [ -d \"$d\" ] && [ ! -L \"$d\" ] || return 0
+    mountpoint -q \"$d\" || mount --rbind \"$d\" \"$d\" || return 1
+    mount -o remount,bind,ro \"$d\"
+}}
+
+unlock_one() {{
+    d=\"$1\"
+    mountpoint -q \"$d\" || return 0
+    mount -o remount,bind,rw \"$d\"
+}}
+
+# /usr/local ma zostac zapisywalny (wlasne programy uzytkownika).
+local_rw() {{
+    [ -d /usr/local ] && [ ! -L /usr/local ] || return 0
+    mountpoint -q /usr/local || mount --bind /usr/local /usr/local || return 0
+    mount -o remount,bind,rw /usr/local
+}}
+
+is_ro() {{
+    mountpoint -q \"$1\" && findmnt -no OPTIONS \"$1\" 2>/dev/null | tr ',' '\\n' | grep -qx ro
+}}
+
+do_lock() {{
+    for d in $PROTECTED; do lock_one \"$d\" || echo \"hackeros-immutable: nie udalo sie zablokowac $d\" >&2; done
+    local_rw
+}}
+
+do_unlock() {{
+    for d in $PROTECTED; do unlock_one \"$d\"; done
+}}
+
+case \"$1\" in
+    lock) do_lock ;;
+    unlock) do_unlock ;;
+    status)
+        rc=0
+        for d in $PROTECTED; do
+            if is_ro \"$d\"; then echo \"$d: tylko do odczytu\"; else echo \"$d: ZAPISYWALNY\"; rc=1; fi
+        done
+        exit $rc ;;
+    run)
+        shift
+        [ \"$1\" = \"--\" ] && shift
+        [ $# -gt 0 ] || usage
+        was_locked=0
+        for d in $PROTECTED; do is_ro \"$d\" && was_locked=1; done
+        do_unlock
+        \"$@\"; rc=$?
+        [ \"$was_locked\" -eq 1 ] && do_lock
+        exit $rc ;;
+    *) usage ;;
+esac
+"
+end
+
+pub fn immutable_service_unit() -> string is
+    return "[Unit]
+Description=HackerOS: system plikow tylko do odczytu (/usr, /boot, /opt ...)
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+ConditionVirtualization=!container
+ConditionKernelCommandLine=!hackeros.mutable
+ConditionPathExists=!/etc/hackeros/mutable
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/hackeros-immutable lock
+ExecStartPost=-/usr/sbin/hackeros-immutable status
+
+[Install]
+WantedBy=sysinit.target
+"
+end
+
+pub fn installer_bootfix_script() -> string is
+    return "#!/bin/sh
+LOG=/var/log/hackeros-bootfix.log
+exec >>\"$LOG\" 2>&1
+echo \"== hackeros-bootfix $(date)\"
+CFG=/boot/grub/grub.cfg
+mkdir -p /boot/grub
+
+if [ ! -f /etc/default/grub ]; then
+    cat > /etc/default/grub <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=\"HackerOS\"
+GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"
+GRUB_CMDLINE_LINUX=\"\"
+EOF
+fi
+if grep -q '^GRUB_DISTRIBUTOR=' /etc/default/grub; then
+    sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR=\"HackerOS\"/' /etc/default/grub
+else
+    echo 'GRUB_DISTRIBUTOR=\"HackerOS\"' >> /etc/default/grub
+fi
+# Parametry live nie moga trafic do zainstalowanego systemu.
+sed -i 's/ *boot=live//; s/ *live-media-path=[^ \"]*//' /etc/default/grub
+
+has_entry() {{ [ -s \"$CFG\" ] && grep -q '^[[:space:]]*menuentry ' \"$CFG\" && grep -q '^[[:space:]]*linux' \"$CFG\"; }}
+
+KVER=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -1)
+echo \"jadro: ${{KVER:-BRAK}}\"
+if [ -n \"$KVER\" ] && [ ! -e \"/boot/initrd.img-$KVER\" ]; then
+    echo \"brak initrd dla $KVER -- update-initramfs\"
+    update-initramfs -c -k \"$KVER\"
+fi
+
+has_entry || grub-mkconfig -o \"$CFG\"
+has_entry || GRUB_DISABLE_OS_PROBER=true grub-mkconfig -o \"$CFG\"
+
+ROOT_UUID=$(grub-probe --target=fs_uuid / 2>/dev/null)
+[ -n \"$ROOT_UUID\" ] || ROOT_UUID=$(awk '$2==\"/\" && $1 ~ /^UUID=/ {{sub(\"UUID=\",\"\",$1); print $1; exit}}' /etc/fstab)
+echo \"root uuid: ${{ROOT_UUID:-BRAK}}\"
+
+if ! has_entry && [ -n \"$KVER\" ] && [ -n \"$ROOT_UUID\" ]; then
+    echo \"grub-mkconfig nie dal wpisu -- generuje grub.cfg recznie\"
+    INITRD=\"\"
+    [ -e \"/boot/initrd.img-$KVER\" ] && INITRD=\"    initrd /boot/initrd.img-$KVER\"
+    cat > \"$CFG\" <<EOF
+set default=0
+set timeout=5
+menuentry \"HackerOS\" {{
+    insmod part_gpt
+    insmod part_msdos
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root $ROOT_UUID
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet
+$INITRD
+}}
+EOF
+fi
+
+# Zapasowe grub.cfg na ESP (gdy obraz EFI szuka konfiguracji obok siebie).
+if [ -d /boot/efi/EFI ] && [ -n \"$ROOT_UUID\" ]; then
+    for d in /boot/efi/EFI/*; do
+        [ -d \"$d\" ] || continue
+        if [ ! -f \"$d/grub.cfg\" ]; then
+            printf 'search.fs_uuid %s root\\nset prefix=($root)/boot/grub\\nconfigfile $prefix/grub.cfg\\n' \"$ROOT_UUID\" > \"$d/grub.cfg\"
+            echo \"stub ESP: $d/grub.cfg\"
+        fi
+    done
+fi
+
+if has_entry; then
+    echo \"OK: $CFG ma wpis z jadrem\"
+    exit 0
+fi
+echo \"BLAD: nie udalo sie wygenerowac grub.cfg z wpisem jadra\"
+exit 1
+"
+end
+
+pub fn installer_diag_script() -> string is
+    return "#!/bin/sh
+OUT=/root/installer-diag.txt
+{{
+echo \"### czas: $(date)  cmdline: $(cat /proc/cmdline)\"
+echo
+echo \"### procesy (Xorg/openbox/calamares/xinit/dbus)\"
+ps -eo pid,etime,stat,args | grep -E 'Xorg|openbox|calamares|xinit|dbus-launch|kpmcore' | grep -v grep
+echo
+echo \"### stan uslugi\"
+systemctl is-active hackeros-installer 2>&1
+systemctl status hackeros-installer --no-pager -l 2>&1 | tail -n 15
+echo
+echo \"### log sesji (bez halasu xkbcomp)\"
+grep -v -E 'xkbcomp|Warning:|^> |^>$|Using F23|Using last definition|AIGLX' /var/log/hackeros-installer.log 2>&1 | tail -n 40
+echo
+echo \"### Calamares: bledy/ostrzezenia (ostatnie 40)\"
+grep -n -i -E 'error|fatal|fail|cannot|could not|missing|not found|bad config|abort|crash|segfault|warning' /var/log/hackeros-installer-calamares.log 2>&1 | tail -n 40
+echo
+echo \"### Calamares: ostatnie 40 linii logu\"
+tail -n 40 /var/log/hackeros-installer-calamares.log 2>&1
+echo
+echo \"### urzadzenia wejscia: jadro i X\"
+grep -E '^N: Name|^H: Handlers' /proc/bus/input/devices 2>&1
+grep -E 'Using input driver|input device|libinput|evdev|XINPUT|No input driver' /var/log/Xorg.0.log 2>&1 | tail -n 25
+udevadm info --export-db 2>/dev/null | grep -c 'ID_INPUT_MOUSE=1\\|ID_INPUT_TOUCHPAD=1' | sed 's/^/urzadzen mysz\\/touchpad w udev: /'
+echo
+echo \"### Xorg: (EE) i istotne (WW)\"
+grep -E '\\(EE\\)|\\(WW\\)' /var/log/Xorg.0.log 2>&1 | grep -v -i -E 'xkb|firmware|fbdev|vesa' | tail -n 25
+echo
+echo \"### branding / konfiguracja\"
+ls -la /etc/calamares/branding/hackeros/ /etc/calamares/modules/ 2>&1
+echo
+echo \"### dziennik uslugi (ostatnie 25)\"
+journalctl -b -u hackeros-installer --no-pager 2>&1 | tail -n 25
+}} 2>&1 | tee \"$OUT\"
+echo
+echo \"[diag] zapisano w $OUT\"
+"
+end
+
+pub fn installer_openbox_r_c() -> string is
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<openbox_config xmlns=\"http://openbox.org/3.4/rc\">
+  <theme><name>Clearlooks</name></theme>
+  <applications>
+    <application class=\"calamares\"><decor>no</decor><maximized>true</maximized><fullscreen>yes</fullscreen></application>
+    <application class=\"Calamares\"><decor>no</decor><maximized>true</maximized><fullscreen>yes</fullscreen></application>
+  </applications>
+</openbox_config>
+"
+end
+
+pub fn installer_service_unit() -> string is
+    return "[Unit]
+Description=HackerOS installer (Openbox + Calamares)
+ConditionKernelCommandLine=boot=live
+# udev MUSI skonczyc koldplug przed startem X: Xorg dodaje klawiature/mysz/
+# touchpad z udev (tag ID_INPUT_*). Gdy X wystartuje za wczesnie, urzadzenia
+# wejscia nie sa jeszcze otagowane -> kursor jest, ale nie reaguje na ruch.
+After=systemd-user-sessions.service systemd-logind.service dbus.service plymouth-quit-wait.service getty@tty1.service systemd-udevd.service systemd-udev-trigger.service
+Conflicts=getty@tty1.service
+Wants=dbus.service systemd-logind.service systemd-udevd.service systemd-udev-trigger.service
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+WorkingDirectory=/root
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+# Plymouth (parametr \"splash\") trzyma tty1/DRM i maluje niebieski ekran
+# startowy -- X nie przejmie wtedy ekranu (obiaw: \"niebieski gradient i
+# nic wiecej, a na tty2 wszystko dziala\"). Zamykamy go jawnie przed startem.
+ExecStartPre=-/usr/bin/plymouth quit
+ExecStartPre=-/usr/bin/chvt 1
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+ExecStart=/usr/local/sbin/hackeros-installer-session
+ExecStopPost=-/usr/bin/systemctl --no-block start getty@tty1.service
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+"
+end
+
+pub fn installer_session_script() -> string is
+    return "#!/bin/sh
+# Wygenerowane przez hackeros-builder.
+LOG=/var/log/hackeros-installer.log
+exec >>\"$LOG\" 2>&1
+echo \"=== hackeros-installer-session: $(date) ===\"
+rm -f /run/hackeros-installer-x-ok
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 700 \"$XDG_RUNTIME_DIR\"
+plymouth quit 2>/dev/null || true
+
+# Urzadzenia wejscia (kursor, ktory sie nie rusza = X wystartowal, zanim
+# udev otagowal mysz/touchpad): doladuj sterowniki, ponow zdarzenia \"add\" dla
+# podsystemu input i poczekaj az udev skonczy.
+modprobe -a evdev usbhid hid_generic psmouse i2c_hid_acpi hid_multitouch 2>/dev/null || true
+udevadm trigger --subsystem-match=input --action=add 2>/dev/null || true
+udevadm settle --timeout=30 2>/dev/null || true
+echo \"--- urzadzenia wejscia (/proc/bus/input/devices):\"
+grep -E '^N: Name|^H: Handlers' /proc/bus/input/devices
+
+XRC=1
+try_x() {{
+    label=\"$1\"; shift
+    echo \"--- proba X: $label\"
+    xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1 \"$@\"
+    XRC=$?
+    echo \"--- xinit ($label) zakonczyl sie kodem $XRC\"
+    [ -e /run/hackeros-installer-x-ok ]
+}}
+
+fallback_console() {{
+    printf '\\n[hackeros] %s\\n[hackeros] Logi: /var/log/hackeros-installer.log, /var/log/hackeros-installer-calamares.log, /var/log/Xorg.0.log\\n[hackeros] Diagnostyka: hackeros-installer-diag\\n[hackeros] Reczny start: xinit /usr/local/sbin/hackeros-installer-xinit -- :0 vt1\\n\\n' \"$1\" >/dev/tty1 2>/dev/null
+    exec /sbin/agetty --autologin root --noclear tty1 linux
+}}
+
+# Po zamknieciu Calamares: gdy instalacja sie POWIODLA (znacznik z modulu
+# shellprocess@done) i NIE zazadano restartu -- komunikat na tty1 i
+# wylaczenie komputera po 10 s.
+finish_after_install() {{
+    [ -e /run/hackeros-install-done ] || return 0
+    sleep 3
+    # Restart zlecony przez Calamares (\"Uruchom ponownie teraz\") -- nie przeszkadzamy.
+    if systemctl list-jobs 2>/dev/null | grep -Eq 'reboot|poweroff|halt'; then
+        while :; do sleep 60; done
+    fi
+    chvt 1 2>/dev/null
+    {{
+        printf '\\033[2J\\033[H'
+        printf '\\n  HackerOS zostal poprawnie zainstalowany.\\n'
+        printf '  Wyjmij nosnik instalacyjny (pendrive/ISO).\\n\\n'
+        n=10
+        while [ \"$n\" -gt 0 ]; do
+            printf '\\r  Komputer wylaczy sie za %2d s...  ' \"$n\"
+            sleep 1
+            n=$((n-1))
+        done
+        printf '\\r  Wylaczanie...                         \\n'
+    }} >/dev/tty1 2>&1
+    systemctl poweroff
+    while :; do sleep 60; done
+}}
+
+for attempt in \"autodetekcja:\" \"fbdev:-config /etc/hackeros-installer/xorg-fbdev.conf\" \"vesa:-config /etc/hackeros-installer/xorg-vesa.conf\"; do
+    label=\"${{attempt%%:*}}\"; args=\"${{attempt#*:}}\"
+    # shellcheck disable=SC2086
+    if try_x \"$label\" $args; then
+        # X wstal i uruchomil Calamares. Kod 0 = normalne zakonczenie
+        # (instalacja/anulowanie); inny = Calamares sie wywalil.
+        # NIE konczymy tu usluga (getty@tty1 jest wylaczony -> czarny ekran):
+        # zostawiamy konsole z podpowiedzia. Gdy w Calamares zaznaczono
+        # \"Uruchom ponownie\", reboot wystartowal juz wczesniej.
+        if [ \"$XRC\" -eq 0 ]; then
+            finish_after_install
+            fallback_console \"Instalator zostal zamkniety. Wpisz: reboot  (aby uruchomic ponownie komputer).\"
+        fi
+        fallback_console \"Instalator (Calamares) zakonczyl sie bledem (kod $XRC).\"
+    fi
+done
+
+echo \"!!! Nie udalo sie uruchomic X\"
+fallback_console \"Nie udalo sie uruchomic graficznego instalatora (X).\"
+"
+end
+
+pub fn installer_xinit_script() -> string is
+    return "#!/bin/sh
+# Wygenerowane przez hackeros-builder.
+# Instalator nie potrzebuje akceleracji GL -- renderowanie programowe omija
+# problemy ze sterownikami (puste/niebieskie okno Qt Quick na starszym sprzecie).
+export QT_QUICK_BACKEND=software
+export QT_XCB_GL_INTEGRATION=none
+export LIBGL_ALWAYS_SOFTWARE=1
+export QT_QPA_PLATFORM=xcb
+export XDG_RUNTIME_DIR=/run/user/0
+export NO_AT_BRIDGE=1
+# Kursor: bez \"-nocursor\" i z motywem (inaczej Qt/X nie pokazuja wskaznika).
+[ -d /usr/share/icons/DMZ-White ] && export XCURSOR_THEME=DMZ-White
+export XCURSOR_SIZE=24
+xsetroot -solid '#1d2023' -cursor_name left_ptr 2>/dev/null || true
+# Zadnych autostartow XDG (np. KDE \"Welcome Center\"/plasma-welcome) w sesji
+# instalatora: puste katalogi konfiguracji + pilnowanie procesu.
+export XDG_CONFIG_HOME=/etc/hackeros-installer/xdg-home
+export XDG_CONFIG_DIRS=/etc/hackeros-installer/xdg
+unset XDG_CURRENT_DESKTOP KDE_FULL_SESSION
+openbox --config-file /etc/hackeros-installer/openbox-rc.xml &
+(
+    while kill -0 $$ 2>/dev/null; do
+        pkill -x plasma-welcome 2>/dev/null
+        pkill -f org.kde.plasma-welcome 2>/dev/null
+        sleep 1
+    done
+) &
+sleep 1
+touch /run/hackeros-installer-x-ok
+# Calamares na starszym sprzecie (HDD, skan partycji/os-prober) potrzebuje
+# do ~1 min zanim pokaze okno -- w tym czasie ekran bylby pusty. Pokazujemy
+# komunikat i zamykamy go, gdy tylko pojawi sie okno Calamares.
+if command -v xmessage >/dev/null 2>&1; then
+    xmessage -center -buttons \"\" \"HackerOS - uruchamianie instalatora, prosze czekac (do ok. minuty)...\" &
+    SPLASH_PID=$!
+    (
+        i=0
+        while [ \"$i\" -lt 240 ]; do
+            if xwininfo -root -tree 2>/dev/null | grep -qi 'calamares'; then break; fi
+            i=$((i+1)); sleep 1
+        done
+        kill \"$SPLASH_PID\" 2>/dev/null
+    ) &
+fi
+CALA_LOG=/var/log/hackeros-installer-calamares.log
+echo \"=== calamares: $(date) ===\" >>\"$CALA_LOG\"
+if command -v dbus-launch >/dev/null 2>&1; then
+    exec dbus-launch --exit-with-session calamares -d >>\"$CALA_LOG\" 2>&1
+fi
+exec calamares -d >>\"$CALA_LOG\" 2>&1
+"
+end
+
+pub fn installer_xorg_fbdev() -> string is
+    return "Section \"Device\"
+    Identifier \"hackeros-fbdev\"
+    Driver \"fbdev\"
+EndSection
+"
+end
+
+pub fn installer_xorg_input() -> string is
+    return "Section \"InputClass\"
+    Identifier \"hackeros libinput pointer\"
+    MatchIsPointer \"on\"
+    MatchDevicePath \"/dev/input/event*\"
+    Driver \"libinput\"
+EndSection
+
+Section \"InputClass\"
+    Identifier \"hackeros libinput keyboard\"
+    MatchIsKeyboard \"on\"
+    MatchDevicePath \"/dev/input/event*\"
+    Driver \"libinput\"
+EndSection
+
+Section \"InputClass\"
+    Identifier \"hackeros libinput touchpad\"
+    MatchIsTouchpad \"on\"
+    MatchDevicePath \"/dev/input/event*\"
+    Driver \"libinput\"
+    Option \"Tapping\" \"on\"
+EndSection
+"
+end
+
+pub fn installer_xorg_vesa() -> string is
+    return "Section \"Device\"
+    Identifier \"hackeros-vesa\"
+    Driver \"vesa\"
+EndSection
+"
+end
+
+pub fn remove_live_user_script() -> string is
+    return "#!/bin/sh
+# =====================================================================
+# remove-live-user.sh - uruchamiany przez Calamares (modul shellprocess)
+# W CHROOCIE ZAINSTALOWANEGO SYSTEMU, po module \"users\"/\"displaymanager\".
+#
+# Problem, ktory to naprawia: obraz live zawiera konto \"user\" (haslo \"live\",
+# sudo bez hasla, autologin). Calamares kopiuje caly system live na dysk i
+# DODAJE nowego uzytkownika, wiec po instalacji istnialy dwa konta:
+# \"user\" oraz to utworzone w instalatorze.
+#
+# Skrypt jest idempotentny i nigdy nie zostawia systemu bez zadnego
+# zwyklego uzytkownika: konto live jest usuwane tylko wtedy, gdy istnieje
+# inne \"zwykle\" konto (UID >= 1000).
+# =====================================================================
+LIVE_USER=\"${{HACKEROS_LIVE_USER:-user}}\"
+LOG=/var/log/hackeros-remove-live-user.log
+
+log() {{ echo \"[remove-live-user] $*\" | tee -a \"$LOG\" 2>/dev/null; }}
+
+# Inne zwykle konto niz live?
+OTHER_USERS=\"$(awk -F: -v live=\"$LIVE_USER\" '$3>=1000 && $3<65534 && $1!=live {{print $1}}' /etc/passwd)\"
+
+# 1. Sudo bez hasla dla konta live - usuwamy ZAWSZE (w zainstalowanym
+#    systemie nie ma prawa istniec).
+if [ -f /etc/sudoers.d/live-user ]; then
+    rm -f /etc/sudoers.d/live-user && log \"usunieto /etc/sudoers.d/live-user\"
+fi
+
+# 2. Autologin konta live w display managerach.
+for f in /usr/lib/sddm/sddm.conf.d/autologin.conf \\
+         /etc/sddm.conf.d/autologin.conf \\
+         /etc/sddm.conf.d/zz-blue-live-autologin.conf; do
+    if [ -f \"$f\" ] && grep -Eq \"^User=${{LIVE_USER}}\\$\" \"$f\"; then
+        rm -f \"$f\" && log \"usunieto autologin SDDM: $f\"
+    fi
+done
+if [ -f /etc/sddm.conf ] && grep -Eq \"^User=${{LIVE_USER}}\\$\" /etc/sddm.conf; then
+    sed -i '/^\\[Autologin\\]/,/^\\[/{{/^User=/d;/^Session=/d;/^Relogin=/d}}' /etc/sddm.conf
+    log \"wyczyszczono [Autologin] w /etc/sddm.conf\"
+fi
+if [ -f /etc/gdm3/daemon.conf ]; then
+    sed -i \"/^AutomaticLogin\\(Enable\\)\\?=/d\" /etc/gdm3/daemon.conf
+fi
+for f in /etc/lightdm/lightdm.conf.d/*autologin*.conf /etc/lightdm/lightdm.conf; do
+    [ -f \"$f\" ] && sed -i \"/^autologin-user=${{LIVE_USER}}\\$/d\" \"$f\"
+done
+# Jednostka live-only (jesli jest w obrazie)
+systemctl disable blue-live-autologin.service >/dev/null 2>&1 || true
+rm -f /usr/lib/systemd/system/blue-live-autologin.service \\
+      /usr/lib/hackeros/blue-live-autologin.sh
+
+# 3. Znacznik trybu live Blue Environment nie moze trafic do nowego systemu
+#    (inaczej po instalacji Blue znow pokazalby instalator na pelnym ekranie).
+rm -f /etc/skel/.config/Blue-Environment/.live
+for h in /home/*; do
+    [ -d \"$h\" ] && rm -f \"$h/.config/Blue-Environment/.live\"
+done
+
+# 4. Samo konto live.
+if ! id \"$LIVE_USER\" >/dev/null 2>&1; then
+    log \"konto '$LIVE_USER' nie istnieje - nic do usuniecia\"
+    exit 0
+fi
+if [ -z \"$OTHER_USERS\" ]; then
+    log \"UWAGA: brak innego zwyklego uzytkownika - NIE usuwam '$LIVE_USER' (i tak zablokuje haslo tylko jesli to nowe konto z instalatora)\"
+    exit 0
+fi
+
+pkill -u \"$LIVE_USER\" >/dev/null 2>&1 || true
+if userdel -rf \"$LIVE_USER\" >>\"$LOG\" 2>&1; then
+    log \"usunieto konto live '$LIVE_USER' (pozostali: $(echo $OTHER_USERS))\"
+else
+    # awaryjnie: jesli usuniecie sie nie powiodlo, przynajmniej zablokuj konto
+    usermod -L -s /usr/sbin/nologin \"$LIVE_USER\" >>\"$LOG\" 2>&1 || true
+    log \"BLAD: userdel nie powiodl sie - konto '$LIVE_USER' zablokowane (patrz $LOG)\"
+fi
+# grupa o tej samej nazwie moze zostac
+getent group \"$LIVE_USER\" >/dev/null 2>&1 && groupdel \"$LIVE_USER\" >/dev/null 2>&1
+rm -rf \"/home/$LIVE_USER\"
+exit 0
+"
+end
+
+pub fn branding_logo_b64_default() -> string is
+    return "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABGUlEQVR42u3c0QnAIAxAQRcRCp2jK7tXt3AFKdVEPHgL6P1IhJR63QqsuAIAAAQAgAAAUCKAp736MQAAAAAAAADAvgCejOMBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwHkAn3+uZ9/OgpMCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAxA8s0mAAAAAAAAAAAAAAAAAAAAAACzILMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABCAc4JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHYD0IwFIAAAAAAAAACAbABaEwAAAAQAgAAAUEAdbNERKVzUR/EAAAAASUVORK5CYII="
+end
+pub fn branding_welcome_b64_default() -> string is
+    return "iVBORw0KGgoAAAANSUhEUgAAAoAAAADwCAIAAAAfEkKcAAAFaklEQVR42u3VWU4WURSF0ZqEoIIJCtJIJwhIqyLY9xN1Xs5Cnoypejj83tQpc+9K1gR2spOve7C0DAAk6xaXlgGAZAIMAAIMAAIMAAgwAFQV4BUAIJkAA4AAA0ArAX64AgAkE2AAmCbAjwGAZAIMAAIMAAIMAAgwAFQV4FUAIFm3+GgVAEgmwAAgwAAgwADAeAFeAwCSCTAACDAACDAAMFqAl9cAgGQ3AV4HAJIJMAAIMAAIMAAgwABQVYA3AIBk3cLyBgCQTIABYJIAr2wAAMkEGACmCfATACCZAAOAAAOAAAMAAgwAAgwAFAX48SYAkEyAAUCAAUCAAQABBoCqArwFACQTYAAQYABoJcCrWwBAMgEGgGkCvA0AJBNgABBgABBgAECAAaCqAO8AAMm6hbUdACCZAAOAAAOAAAMA4wV4FwBI1t1f2wUAkgkwAAgwAAgwADBagNefAgDJBBgABBgABBj44+Lnr39mLyDAIEj2wv8S4D0gVBYke4E+AQZBshcEGATJXmglwBt7QKgoSPYCAwIMgmQvCDAIkr3QTID3gVBZkOwF+gQYBMleEGAQJHtBgAEBFmAQYBAke6GmAD95BoSKgmQvMCDAIEj2ggCDINkLAgwIsACDAIMg2QtVBfgACJUFyV6gT4BBkOwFAQZBshdaCfDmARAqCpK9wIAAgyDZC9ME+BAIlQXJXqCvu7d5CIRKgmQvMCTAIEj2ggCDINkLAgwIsADDeAE+AkJlQbIX6BNgECR7YZIAbx0BoaIg2QsMCDAIkr0gwCBI9kIzAX4OhMqCZC/QJ8AgSPaCAIMg2QsCDAiwAIMAgyDZCzUFePsYCBUFyV5gQIBBkOwFAYYag9QabwEBBgEWYBBgEGABBv4K8AkQktVZAuwwEBNgEGABBgEGARZgaCXAOydASFZnCLDDwC0IMAiwAIMAgwALMDQT4FMgJKuzBNhhICbAIMACDAIMAizAIMCAAAswCDAIsABDVQE+A0KyOkuAHQZi3d3dMyAkq7fnLXAbAgwCLMAgwCDAAgwCDAiwAMN4AT4HQrI6S4AdBmICDKMH2F5AgEGQ7AUBBkGyF9oN8NNzIFQUJHuBgZsAXwChsiDZC/QJMAiSvSDAIEj2ggADAizAIMAgSPZCVQF+AYTKgmQv0CfAIEj2wiQB3nsBhIqCZC8wIMAgSPaCAIMg2QvNBPglECoLkr1AnwCDINkLAgyCZC8IMCDAAgwCDIJkL9QU4P1XQKgoSPYCAwIMgmQvCDAIkr0gwIAACzAIMAiSvSDAIMACLMBQFuBLIFQWJHuBPgEGQbIXpgjw/P4lECoJkr3AUDf/7BIIFQXJXmBAgEGQ7IVpAvwaCJUFyV6gT4BBkOwFAQZBshcEGBBgAQYBBkGyF6oK8BUQKguSvUBfN39wBYSKgmQvMCDAIEj2ggCDINkLAgwIsADDeAG+BgCSCTAACDAACDAAMFqAD68BgGQ3AX4DACQTYAAQYAAQYABAgAGgqgC/BQCSCTAATBLgo7cAQDIBBgABBoBmAvwOAEgmwAAgwADQSIDnjt4BAMkEGACmCfB7ACBZN/f8PQCQTIABQIABQIABAAEGgKoC/AEASCbAACDAANBKgI8/AADJBBgApgnwRwAgmQADgAADgAADAAIMAFUF+BMAkKybO/kEACQTYAAQYAAQYABgvAB/BgCSCTAACDAACDAAIMAAUFOAT78AAMkEGAAEGAAaCfCd0y8AQDIBBoBpAvwVAEgmwAAgwADQSoDPvgIAyQQYAKYJ8DcAIJkAA4AAA4AAAwACDAACDAAUBfj8OwCQTIABQIABQIABAAEGgKoC/AMASCbAACDAANCG37xE7gZH/ivzAAAAAElFTkSuQmCC"
+end
+
+pub fn branding_logo_b64_cybersecurity() -> string is
+    return "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABGUlEQVR42u3c0QnAIAxAQRcRCl2g/+4/V11BSjURD94Cej8SIaVetwIrrgAAAAEAIAAAlAjgbY9+DAAAAAAAAACwL4An43gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcB7A55/r2bez4KQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAOQfLMJAAAAAAAAAAAAAAAAAAAAAMAsyCwIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIBQgHMCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgN0ANGMBCAAAAAAAAAAgG4DWBAAAAAEAIAAAFFAHjAY19BM8SpgAAAAASUVORK5CYII="
+end
+pub fn branding_welcome_b64_cybersecurity() -> string is
+    return "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"
+end
