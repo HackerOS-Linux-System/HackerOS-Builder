@@ -1,0 +1,229 @@
+mod hk
+mod ui
+
+pub fn default_mirror() -> string is return "http://deb.debian.org/debian" end
+pub fn default_arch() -> string is return "amd64" end
+
+pub struct Config is
+    pub cfg_account_type: string
+    pub cfg_account_name: string
+    pub cfg_token:        string
+    pub cfg_release:      string
+    pub cfg_mirror:       string
+    pub cfg_arch:         string
+    ;; [project]
+    pub pj_name:             string
+    pub pj_tag:              string
+    pub pj_type:             string
+    pub pj_installer:        string
+    pub pj_mac:              string
+    pub pj_cyber_pkgs:       [string]
+    pub pj_sign:             bool
+    pub pj_verify_signature: bool
+    pub pj_cosign_key:       string
+    pub pj_isolator_version: string
+end
+
+pub struct CfgLoad is
+    pub cl_cfg: Config
+    pub cl_err: string
+end
+
+pub fn empty_config() -> Config is
+    return Config {
+        cfg_account_type: "", cfg_account_name: "", cfg_token: "", cfg_release: "", cfg_mirror: "", cfg_arch: "",
+        pj_name: "", pj_tag: "", pj_type: "default", pj_installer: "default", pj_mac: "apparmor",
+        pj_cyber_pkgs: [], pj_sign: false, pj_verify_signature: false, pj_cosign_key: "", pj_isolator_version: "",
+    }
+end
+
+;; --- metody ---
+pub fn effective_mirror(c: Config) -> string is
+    if c.cfg_mirror == "" is return default_mirror() end
+    return c.cfg_mirror
+end
+
+pub fn effective_arch(c: Config) -> string is
+    if c.cfg_arch == "" is return default_arch() end
+    return c.cfg_arch
+end
+
+pub fn is_known_arch(c: Config) -> bool is
+    let known: [string] = ["amd64", "arm64", "armhf", "armel", "i386", "mips64el", "mipsel", "ppc64el", "riscv64", "s390x"]
+    return contains(known, effective_arch(c))
+end
+
+pub fn is_known_release(c: Config) -> bool is
+    return contains(["bookworm", "trixie", "forky", "sid", "unstable"], c.cfg_release)
+end
+
+pub fn contains(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn is_atomic_build(c: Config) -> bool is
+    return !contains(["normal", "official", "independent", "container", "containerized"], c.pj_type)
+end
+
+pub fn requires_live_build(c: Config) -> bool is
+    return c.pj_type == "normal" || c.pj_type == "official"
+end
+
+pub fn use_builtin_installer(c: Config) -> bool is return c.pj_installer != "none" end
+pub fn is_cybersecurity(c: Config) -> bool is return c.pj_type == "cybersecurity" end
+pub fn is_container_build(c: Config) -> bool is return c.pj_type == "container" end
+pub fn is_containerized(c: Config) -> bool is return c.pj_type == "containerized" end
+pub fn uses_cybersecurity_installer(c: Config) -> bool is return c.pj_installer == "cybersecurity" end
+
+pub fn image_tag(c: Config) -> string is
+    if c.pj_tag == "" is return "latest" end
+    return c.pj_tag
+end
+
+;; <host>/<account lowercase>/<image>
+pub fn image_repository(c: Config, registry_host: string, image_name: string) -> string is
+    return registry_host + "/" + string_lower(c.cfg_account_name) + "/" + image_name
+end
+
+;; --- pomocnicze ---
+pub fn is_truthy(s: string) -> bool is
+    let l: string = string_lower(s)
+    return l == "true" || l == "yes" || l == "1" || l == "on"
+end
+
+pub struct ReqStr is
+    pub rq_val: string
+    pub rq_err: string
+end
+
+fn get_required_string(doc: hk::HkDoc, section: string, key: string) -> ReqStr is
+    if !hk::has_section(doc, section) is
+        return ReqStr { rq_val: "", rq_err: "brak wymaganej sekcji [" + section + "] w config.hk (oczekiwano klucza '" + key + "')" }
+    end
+    let v: hk::HkVal = hk::get_child(doc, section, key)
+    if !v.hv_ok is
+        return ReqStr { rq_val: "", rq_err: "brak wymaganego klucza '" + key + "' w sekcji [" + section + "] config.hk" }
+    end
+    if !hk::string_ok(v) is
+        return ReqStr { rq_val: "", rq_err: "klucz '" + key + "' w sekcji [" + section + "] musi byc tekstem: " + hk::type_mismatch_string(v) }
+    end
+    return ReqStr { rq_val: hk::as_string(v), rq_err: "" }
+end
+
+;; Wartosc opcjonalna jako string (AsString), "" + false gdy brak/nie-skalar.
+fn opt_string(doc: hk::HkDoc, section: string, key: string) -> ReqStr is
+    let v: hk::HkVal = hk::get_child(doc, section, key)
+    if !hk::string_ok(v) is return ReqStr { rq_val: "", rq_err: "absent" } end
+    return ReqStr { rq_val: string_trim(hk::as_string(v)), rq_err: "" }
+end
+
+fn parse_project_type(s: string) -> ReqStr is
+    let l: string = string_lower(s)
+    if l == "" || l == "default" is return ReqStr { rq_val: "default", rq_err: "" } end
+    if contains(["cybersecurity", "normal", "official", "independent", "container", "containerized"], l) is
+        return ReqStr { rq_val: l, rq_err: "" }
+    end
+    return ReqStr { rq_val: "", rq_err: "nieznana wartosc " + ui::quote(s) + " -- dozwolone: default, cybersecurity, normal, official, independent, container, containerized" }
+end
+
+fn parse_installer_type(s: string) -> ReqStr is
+    let l: string = string_lower(s)
+    if l == "" || l == "default" is return ReqStr { rq_val: "default", rq_err: "" } end
+    if l == "cybersecurity" || l == "none" is return ReqStr { rq_val: l, rq_err: "" } end
+    return ReqStr { rq_val: "", rq_err: "nieznana wartosc " + ui::quote(s) + " -- dozwolone: default, cybersecurity, none" }
+end
+
+fn load_project_section(doc: hk::HkDoc, base: Config) -> CfgLoad is
+    if !hk::has_section(doc, "project") is return CfgLoad { cl_cfg: base, cl_err: "" } end
+    let mut c: Config = base
+    let name: ReqStr = opt_string(doc, "project", "name")
+    if name.rq_err == "" is c.pj_name = name.rq_val end
+    let tag: ReqStr = opt_string(doc, "project", "tag")
+    if tag.rq_err == "" is c.pj_tag = tag.rq_val end
+    let ty: ReqStr = opt_string(doc, "project", "type")
+    if ty.rq_err == "" is
+        let pt: ReqStr = parse_project_type(ty.rq_val)
+        if pt.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: "config.hk: [project] -> type: " + pt.rq_err } end
+        c.pj_type = pt.rq_val
+    end
+    let ins: ReqStr = opt_string(doc, "project", "installer")
+    if ins.rq_err == "" is
+        let it: ReqStr = parse_installer_type(ins.rq_val)
+        if it.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: "config.hk: [project] -> installer: " + it.rq_err } end
+        c.pj_installer = it.rq_val
+    end
+    let se: ReqStr = opt_string(doc, "project", "selinux")
+    if se.rq_err == "" is
+        if is_truthy(se.rq_val) is c.pj_mac = "selinux" else is c.pj_mac = "apparmor" end
+    end
+    let cp: hk::HkVal = hk::get_child(doc, "project", "cybersecurity_packages")
+    if cp.hv_ok is
+        if cp.hv_kind != "a" is
+            return CfgLoad { cl_cfg: empty_config(), cl_err: "config.hk: [project] -> cybersecurity_packages musi byc tablica, np. [nmap, wireshark, hydra]: hk: TypeMismatch -- oczekiwano array, otrzymano " + hk::kind_name(cp.hv_kind) }
+        end
+        let items: [string] = hk::array_items(cp)
+        let mut pkgs: [string] = []
+        let mut i: int = 0
+        while i < array_len(items) is
+            let t: string = string_trim(hk::item_text(items[i]))
+            if t != "" is pkgs = array_push(pkgs, t) end
+            i += 1
+        end
+        c.pj_cyber_pkgs = pkgs
+    end
+    let sg: ReqStr = opt_string(doc, "project", "sign")
+    if sg.rq_err == "" is c.pj_sign = is_truthy(sg.rq_val) end
+    let vs: ReqStr = opt_string(doc, "project", "verify_signature")
+    if vs.rq_err == "" is c.pj_verify_signature = is_truthy(vs.rq_val) end
+    let ck: ReqStr = opt_string(doc, "project", "cosign_key")
+    if ck.rq_err == "" is c.pj_cosign_key = ck.rq_val end
+    let iv: ReqStr = opt_string(doc, "project", "isolator_version")
+    if iv.rq_err == "" is c.pj_isolator_version = iv.rq_val end
+    return CfgLoad { cl_cfg: c, cl_err: "" }
+end
+
+fn validate(c: Config, require_auth: bool) -> string is
+    if c.cfg_account_type != "user" && c.cfg_account_type != "organisation" is
+        return "config.hk: [account] -> type musi byc 'user' lub 'organisation', otrzymano " + ui::quote(c.cfg_account_type)
+    end
+    if require_auth is
+        if c.cfg_account_name == "" is return "config.hk: [account] -> name nie moze byc puste" end
+        if c.cfg_token == "" is return "config.hk: [auth] -> token nie moze byc puste" end
+    end
+    if c.cfg_release == "" is return "config.hk: [release] -> name nie moze byc puste" end
+    return ""
+end
+
+;; Load: czyta, rozwija interpolacje, waliduje.
+pub fn load(path: string, require_auth: bool) -> CfgLoad is
+    let parsed: hk::HkParse = hk::load_file(path)
+    if parsed.hp_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: "config.hk: " + parsed.hp_err } end
+    let resolved: hk::HkParse = hk::resolve_interpolations(parsed.hp_doc)
+    if resolved.hp_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: "config.hk: interpolacja: " + resolved.hp_err } end
+    let doc: hk::HkDoc = resolved.hp_doc
+    let mut c: Config = empty_config()
+    let at: ReqStr = get_required_string(doc, "account", "type")
+    if at.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: at.rq_err } end
+    c.cfg_account_type = at.rq_val
+    let an: ReqStr = get_required_string(doc, "account", "name")
+    if an.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: an.rq_err } end
+    c.cfg_account_name = an.rq_val
+    let tk: ReqStr = get_required_string(doc, "auth", "token")
+    if tk.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: tk.rq_err } end
+    c.cfg_token = tk.rq_val
+    let rl: ReqStr = get_required_string(doc, "release", "name")
+    if rl.rq_err != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: rl.rq_err } end
+    c.cfg_release = rl.rq_val
+    let mi: ReqStr = opt_string(doc, "release", "mirror")
+    if mi.rq_err == "" is c.cfg_mirror = mi.rq_val end
+    let ar: ReqStr = opt_string(doc, "release", "arch")
+    if ar.rq_err == "" is c.cfg_arch = ar.rq_val end
+    let ve: string = validate(c, require_auth)
+    if ve != "" is return CfgLoad { cl_cfg: empty_config(), cl_err: ve } end
+    return load_project_section(doc, c)
+end
