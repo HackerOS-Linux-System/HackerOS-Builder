@@ -1,0 +1,272 @@
+mod sysc
+mod proc
+mod fsx
+mod ui
+mod jsonx
+mod strx
+
+pub struct RegRef is
+    pub rf_host:   string
+    pub rf_repo:   string
+    pub rf_ref:    string
+    pub rf_scheme: string
+    pub rf_orig:   string
+    pub rf_err:    string
+end
+
+pub struct Reg is
+    pub rg_base:     string
+    pub rg_repo:     string
+    pub rg_cfg:      string
+    pub rg_insecure: bool
+end
+
+pub struct Resp is
+    pub rs_status: int
+    pub rs_err:    string
+    pub rs_body:   string
+    pub rs_hdrs:   string
+end
+
+pub struct LoginRes is
+    pub lg_reg: Reg
+    pub lg_err: string
+end
+
+;; ---------- parsowanie referencji ----------
+fn valid_repo_char(c: string) -> bool is
+    if c >= "a" && c <= "z" is return true end
+    if c >= "0" && c <= "9" is return true end
+    return c == "_" || c == "-" || c == "." || c == "/"
+end
+
+fn valid_tag_char(c: string) -> bool is
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    if c >= "0" && c <= "9" is return true end
+    return c == "_" || c == "-" || c == "."
+end
+
+fn all_chars(s: string, kind: int) -> bool is
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        if kind == 0 && !valid_repo_char(c) is return false end
+        if kind == 1 && !valid_tag_char(c) is return false end
+        i += 1
+    end
+    return true
+end
+
+fn scheme_for(host: string) -> string is
+    let h: string = if string_starts_with(host, "[") then host else (if string_contains(host, ":") then string_slice(host, 0, string_find(host, ":")) else host)
+    if h == "localhost" || string_starts_with(h, "127.") || h == "[::1]" || string_ends_with(h, ".local") || string_ends_with(h, ".localhost") is return "http" end
+    if string_starts_with(h, "10.") || string_starts_with(h, "192.168.") is return "http" end
+    if string_starts_with(h, "172.") is
+        let p: [string] = string_split(h, ".")
+        if array_len(p) > 1 is
+            let n: int = str_to_int(p[1])
+            if n >= 16 && n <= 31 is return "http" end
+        end
+    end
+    return "https"
+end
+
+fn bad_ref(orig: string, why: string) -> RegRef is
+    return RegRef { rf_host: "", rf_repo: "", rf_ref: "", rf_scheme: "", rf_orig: orig, rf_err: why }
+end
+
+;; name.ParseReference: "ghcr.io/owner/img:tag"
+pub fn parse_reference(orig: string) -> RegRef is
+    let mut name: string = orig
+    let mut tag: string = "latest"
+    let at: int = string_find(orig, "@")
+    if at >= 0 is
+        name = string_slice(orig, 0, at)
+        tag = string_slice(orig, at + 1, string_len(orig))
+    else is
+        let mut last_colon: int = -1
+        let mut last_slash: int = -1
+        let mut i: int = 0
+        while i < string_len(orig) is
+            if string_at(orig, i) == ":" is last_colon = i end
+            if string_at(orig, i) == "/" is last_slash = i end
+            i += 1
+        end
+        if last_colon > last_slash is
+            name = string_slice(orig, 0, last_colon)
+            tag = string_slice(orig, last_colon + 1, string_len(orig))
+        end
+    end
+    if name == "" is return bad_ref(orig, "repository must be between 2 and 255 characters in length: ") end
+    let first_slash: int = string_find(name, "/")
+    let mut host: string = "index.docker.io"
+    let mut repo: string = name
+    if first_slash >= 0 is
+        let seg: string = string_slice(name, 0, first_slash)
+        if string_contains(seg, ".") || string_contains(seg, ":") || seg == "localhost" is
+            host = seg
+            repo = string_slice(name, first_slash + 1, string_len(name))
+        end
+    end
+    if host == "index.docker.io" && !string_contains(repo, "/") is repo = "library/" + repo end
+    if repo == "" || !all_chars(repo, 0) is
+        return bad_ref(orig, "repository can only contain the characters `abcdefghijklmnopqrstuvwxyz0123456789_-./`: " + repo)
+    end
+    if tag == "" || (!string_starts_with(tag, "sha256:") && (!all_chars(tag, 1) || string_len(tag) > 128)) is
+        return bad_ref(orig, "tag can only contain the characters `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.`: " + tag)
+    end
+    return RegRef { rf_host: host, rf_repo: repo, rf_ref: tag, rf_scheme: scheme_for(host), rf_orig: orig, rf_err: "" }
+end
+
+;; ---------- curl ----------
+fn curl_base(insecure: bool, tmo: int) -> string is
+    let mut s: string = "curl -sS --connect-timeout 10"
+    if insecure is s = s + " -k" end
+    if tmo > 0 is s = s + " -m " + to_string(tmo) end
+    return s
+end
+
+;; Normalizuje komunikat bledu transportu tak, by slowa kluczowe retry (timeout/eof/...) byly obecne.
+fn transport_error(rc: int, stderr_text: string) -> string is
+    let t: string = string_trim(stderr_text)
+    if rc == 28 is return "i/o timeout: " + t end
+    if rc == 18 is return "unexpected EOF: " + t end
+    if rc == 56 || rc == 52 || rc == 55 is
+        if string_contains(string_lower(t), "reset") is return "connection reset by peer: " + t end
+        return "unexpected EOF: " + t
+    end
+    if rc == 35 || rc == 58 || rc == 60 is return "tls handshake error: " + t end
+    if rc == 6 is return "temporary failure in name resolution: " + t end
+    return t + " (curl " + to_string(rc) + ")"
+end
+
+pub fn resp_free(r: Resp) is
+    fsx::remove(r.rs_body)
+    fsx::remove(r.rs_hdrs)
+end
+
+pub fn read_body(r: Resp) -> string is
+    return proc::read_file_or_empty(r.rs_body)
+end
+
+pub fn header_of(r: Resp, name: string) -> string is
+    let v: string = shell("grep -i '^" + name + ":' " + proc::sq(r.rs_hdrs) + " 2>/dev/null | tail -n 1 | cut -d: -f2- | tr -d '\\r'")
+    return string_trim(v)
+end
+
+;; Zadanie HTTP. method: GET/HEAD/POST/PUT/PATCH. body_file "" = brak. headers: dodatkowe "Nazwa: wartosc".
+pub fn request(reg: Reg, method: string, url: string, headers: [string], body_file: string, follow: bool, tmo: int) -> Resp is
+    let body: string = proc::tmp_path("rb")
+    let hdrs: string = proc::tmp_path("rh")
+    let code: string = proc::tmp_path("rc")
+    let err: string = proc::tmp_path("re")
+    let mut cmd: string = curl_base(reg.rg_insecure, tmo)
+    if follow is cmd = cmd + " -L" end
+    if reg.rg_cfg != "" is cmd = cmd + " -K " + proc::sq(reg.rg_cfg) end
+    if method == "HEAD" is cmd = cmd + " -I" else is cmd = cmd + " -X " + method end
+    let mut i: int = 0
+    while i < array_len(headers) is
+        cmd = cmd + " -H " + proc::sq(headers[i])
+        i += 1
+    end
+    if body_file != "" is cmd = cmd + " --data-binary @" + proc::sq(body_file) end
+    cmd = cmd + " -D " + proc::sq(hdrs) + " -o " + proc::sq(body) + " -w '%{{http_code}}' " + proc::sq(url) + " >" + proc::sq(code) + " 2>" + proc::sq(err)
+    ui::debug("http: " + method + " " + url)
+    let rc: int = sysc::sh(cmd)
+    let status_txt: string = string_trim(proc::read_file_or_empty(code))
+    let err_txt: string = proc::read_file_or_empty(err)
+    sysc::sh("rm -f " + proc::sq(code) + " " + proc::sq(err))
+    if rc != 0 is
+        return Resp { rs_status: 0, rs_err: method + " " + url + ": " + transport_error(rc, err_txt), rs_body: body, rs_hdrs: hdrs }
+    end
+    let st: int = if status_txt == "" then 0 else str_to_int(status_txt)
+    return Resp { rs_status: st, rs_err: "", rs_body: body, rs_hdrs: hdrs }
+end
+
+fn write_cfg(path: string, auth_header: string) -> string is
+    return fsx::write_file(path, "header = \"" + auth_header + "\"\n", 384)
+end
+
+fn param_of(challenge: string, key: string) -> string is
+    let marker: string = key + "=\""
+    let p: int = string_find(challenge, marker)
+    if p < 0 is return "" end
+    let rest: string = string_slice(challenge, p + string_len(marker), string_len(challenge))
+    let q: int = string_find(rest, "\"")
+    if q < 0 is return "" end
+    return string_slice(rest, 0, q)
+end
+
+fn url_enc(s: string) -> string is return url_encode(s) end
+
+;; Logowanie (ping /v2/, wymiana tokena Bearer albo Basic). scopes: "pull" lub "push,pull".
+pub fn login(r: RegRef, token: string, actions: string, insecure: bool) -> LoginRes is
+    let none: Reg = Reg { rg_base: "", rg_repo: "", rg_cfg: "", rg_insecure: insecure }
+    let base: string = r.rf_scheme + "://" + r.rf_host
+    let cfg: string = proc::tmp_path("auth") + ".cfg"
+    let basic: string = "Authorization: Basic " + base64_encode("hackeros-builder:" + token)
+    let mut reg: Reg = Reg { rg_base: base, rg_repo: r.rf_repo, rg_cfg: "", rg_insecure: insecure }
+    let ping: Resp = request(reg, "GET", base + "/v2/", [], "", false, 60)
+    if ping.rs_err != "" is
+        resp_free(ping)
+        return LoginRes { lg_reg: none, lg_err: ping.rs_err }
+    end
+    let challenge: string = header_of(ping, "www-authenticate")
+    resp_free(ping)
+    if ping.rs_status == 401 && string_starts_with(string_lower(challenge), "bearer") is
+        let realm: string = param_of(challenge, "realm")
+        let service: string = param_of(challenge, "service")
+        let basic_cfg: string = cfg + ".basic"
+        let we: string = write_cfg(basic_cfg, basic)
+        if we != "" is return LoginRes { lg_reg: none, lg_err: we } end
+        let mut url: string = realm + "?scope=" + url_enc("repository:" + r.rf_repo + ":" + actions)
+        if service != "" is url = url + "&service=" + url_enc(service) end
+        let treg: Reg = Reg { rg_base: base, rg_repo: r.rf_repo, rg_cfg: basic_cfg, rg_insecure: insecure }
+        let tr: Resp = request(treg, "GET", url, [], "", false, 60)
+        fsx::remove(basic_cfg)
+        if tr.rs_err != "" is
+            resp_free(tr)
+            return LoginRes { lg_reg: none, lg_err: tr.rs_err }
+        end
+        let body: string = read_body(tr)
+        resp_free(tr)
+        if tr.rs_status != 200 is
+            return LoginRes { lg_reg: none, lg_err: "GET " + url + ": unexpected status code " + to_string(tr.rs_status) + " " + string_trim(body) }
+        end
+        let mut tok: string = jsonx::get(body, "token")
+        if tok == "" is tok = jsonx::get(body, "access_token") end
+        if tok == "" is return LoginRes { lg_reg: none, lg_err: "GET " + url + ": odpowiedz bez tokena" } end
+        let we2: string = write_cfg(cfg, "Authorization: Bearer " + tok)
+        if we2 != "" is return LoginRes { lg_reg: none, lg_err: we2 } end
+        reg = Reg { rg_base: base, rg_repo: r.rf_repo, rg_cfg: cfg, rg_insecure: insecure }
+        return LoginRes { lg_reg: reg, lg_err: "" }
+    end
+    let we3: string = write_cfg(cfg, basic)
+    if we3 != "" is return LoginRes { lg_reg: none, lg_err: we3 } end
+    reg = Reg { rg_base: base, rg_repo: r.rf_repo, rg_cfg: cfg, rg_insecure: insecure }
+    return LoginRes { lg_reg: reg, lg_err: "" }
+end
+
+pub fn logout(reg: Reg) is
+    if reg.rg_cfg != "" is fsx::remove(reg.rg_cfg) end
+end
+
+pub fn manifest_url(reg: Reg, ref: string) -> string is
+    return reg.rg_base + "/v2/" + reg.rg_repo + "/manifests/" + ref
+end
+
+pub fn blob_url(reg: Reg, digest: string) -> string is
+    return reg.rg_base + "/v2/" + reg.rg_repo + "/blobs/" + digest
+end
+
+pub fn accept_manifests() -> string is
+    return "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json"
+end
+
+;; Blad statusu w stylu ggcr: "GET url: unexpected status code N <body>"
+pub fn status_error(method: string, url: string, r: Resp) -> string is
+    let body: string = string_trim(read_body(r))
+    let short: string = if string_len(body) > 300 then string_slice(body, 0, 300) else body
+    return method + " " + url + ": unexpected status code " + to_string(r.rs_status) + " " + short
+end
