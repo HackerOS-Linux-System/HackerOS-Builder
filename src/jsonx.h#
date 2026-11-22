@@ -1,0 +1,173 @@
+mod strx
+
+fn ws(s: string, i: int) -> int is
+    let mut k: int = i
+    while k < string_len(s) && strx::is_space(string_at(s, k)) is k += 1 end
+    return k
+end
+
+;; indeks za koncem stringa JSON zaczynajacego sie w s[i] == '"'
+fn skip_string(s: string, i: int) -> int is
+    let mut k: int = i + 1
+    while k < string_len(s) is
+        let c: string = string_at(s, k)
+        if c == "\\" is
+            k += 2
+        else if c == "\"" is
+            return k + 1
+        else is
+            k += 1
+        end
+    end
+    return string_len(s)
+end
+
+;; indeks za koncem wartosci zaczynajacej sie w s[i] (po ws)
+fn skip_value(s: string, i0: int) -> int is
+    let i: int = ws(s, i0)
+    if i >= string_len(s) is return i end
+    let c: string = string_at(s, i)
+    if c == "\"" is return skip_string(s, i) end
+    if c == "{" || c == "[" is
+        let mut depth: int = 0
+        let mut k: int = i
+        while k < string_len(s) is
+            let ch: string = string_at(s, k)
+            if ch == "\"" is
+                k = skip_string(s, k)
+            else is
+                if ch == "{" || ch == "[" is depth += 1 end
+                if ch == "}" || ch == "]" is
+                    depth -= 1
+                    if depth == 0 is return k + 1 end
+                end
+                k += 1
+            end
+        end
+        return string_len(s)
+    end
+    let mut k2: int = i
+    while k2 < string_len(s) is
+        let ch2: string = string_at(s, k2)
+        if ch2 == "," || ch2 == "}" || ch2 == "]" || strx::is_space(ch2) is return k2 end
+        k2 += 1
+    end
+    return k2
+end
+
+pub fn unescape(raw: string) -> string is
+    if !string_contains(raw, "\\") is return raw end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(raw) is
+        let c: string = string_at(raw, i)
+        if c == "\\" && i + 1 < string_len(raw) is
+            let n: string = string_at(raw, i + 1)
+            if n == "n" is out = out + "\n"
+            else if n == "t" is out = out + "\t"
+            else if n == "r" is out = out + "\r"
+            else is out = out + n end
+            i += 2
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+;; wartosc pola obiektu zaczynajacego sie w s[i]: zwraca [start, end] lub [-1, -1]
+fn object_field(s: string, i0: int, key: string) -> [int] is
+    let mut i: int = ws(s, i0)
+    if i >= string_len(s) || string_at(s, i) != "{" is return [-1, -1] end
+    i += 1
+    while i < string_len(s) is
+        i = ws(s, i)
+        if i >= string_len(s) || string_at(s, i) == "}" is return [-1, -1] end
+        if string_at(s, i) == "," is
+            i += 1
+        else is
+            if string_at(s, i) != "\"" is return [-1, -1] end
+            let kend: int = skip_string(s, i)
+            let k: string = unescape(string_slice(s, i + 1, kend - 1))
+            i = ws(s, kend)
+            if i < string_len(s) && string_at(s, i) == ":" is i += 1 end
+            i = ws(s, i)
+            let vend: int = skip_value(s, i)
+            if k == key is return [i, vend] end
+            i = vend
+        end
+    end
+    return [-1, -1]
+end
+
+fn array_elem(s: string, i0: int, n: int) -> [int] is
+    let mut i: int = ws(s, i0)
+    if i >= string_len(s) || string_at(s, i) != "[" is return [-1, -1] end
+    i += 1
+    let mut idx: int = 0
+    while i < string_len(s) is
+        i = ws(s, i)
+        if i >= string_len(s) || string_at(s, i) == "]" is return [-1, -1] end
+        if string_at(s, i) == "," is
+            i += 1
+        else is
+            let vend: int = skip_value(s, i)
+            if idx == n is return [i, vend] end
+            idx += 1
+            i = vend
+        end
+    end
+    return [-1, -1]
+end
+
+;; Surowy tekst wartosci pod sciezka (np. "layers.0.digest") albo "" gdy brak. Stringi sa zdekodowane.
+pub fn get(json: string, path: string) -> string is
+    let segs: [string] = string_split(path, ".")
+    let mut start: int = 0
+    let mut stop: int = string_len(json)
+    let mut i: int = 0
+    while i < array_len(segs) is
+        let seg: string = segs[i]
+        i += 1
+        let isnum: bool = seg != "" && str_to_int(seg) >= 0 && to_string(str_to_int(seg)) == seg
+        let r: [int] = if isnum then array_elem(json, start, str_to_int(seg)) else object_field(json, start, seg)
+        if r[0] < 0 is return "" end
+        start = r[0]
+        stop = r[1]
+    end
+    let raw: string = string_slice(json, start, stop)
+    if string_len(raw) >= 2 && string_starts_with(raw, "\"") && string_ends_with(raw, "\"") is
+        return unescape(string_slice(raw, 1, string_len(raw) - 1))
+    end
+    return raw
+end
+
+;; Liczba elementow tablicy pod sciezka (0 gdy brak).
+pub fn array_len_at(json: string, path: string) -> int is
+    let mut n: int = 0
+    while has(json, path + "." + to_string(n)) is n += 1 end
+    return n
+end
+
+pub fn has(json: string, path: string) -> bool is
+    let segs: [string] = string_split(path, ".")
+    let mut start: int = 0
+    let mut i: int = 0
+    while i < array_len(segs) is
+        let seg: string = segs[i]
+        i += 1
+        let isnum: bool = seg != "" && to_string(str_to_int(seg)) == seg
+        let r: [int] = if isnum then array_elem(json, start, str_to_int(seg)) else object_field(json, start, seg)
+        if r[0] < 0 is return false end
+        start = r[0]
+    end
+    return true
+end
+
+;; Cytowanie napisu do JSON
+pub fn quote(s: string) -> string is
+    let a: string = string_replace(s, "\\", "\\\\")
+    let b: string = string_replace(a, "\"", "\\\"")
+    return "\"" + string_replace(string_replace(string_replace(b, "\n", "\\n"), "\r", "\\r"), "\t", "\\t") + "\""
+end
